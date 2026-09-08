@@ -1,0 +1,9 @@
+.env
+*.log
+__pycache__/
+*.pyc
+.fsm_storage/
+.donor_forms_cache/
+.org_profiles/
+.venv/
+venv/

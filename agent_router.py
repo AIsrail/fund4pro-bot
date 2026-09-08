@@ -1,0 +1,400 @@
+"""Единый агентный роутер (v3 редизайн).
+
+Принимает ЛЮБОЕ сообщение пользователя, нормализует FSM-сессию
+(включая прозрачную миграцию сессий из старой версии FSM без потери
+данных организации, донора и бюджета) и направляет в agent_engine.
+
+Никаких потерянных апдейтов: любые старые состояния (например,
+ProjectFlow:budget_discussion) автоматически мигрируют в Flow.active,
+а устаревшие inline-кнопки перехватываются и преобразуются в осмысленные
+действия для агента.
+"""
+
+import logging
+import os
+import tempfile
+
+from aiogram import Router, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+import agent_engine
+from typing_indicator import show_typing, show_working, show_live_progress
+
+router = Router()
+logger = logging.getLogger("fund4pro.agent_router")
+
+WELCOME = (
+    "Привет! Я помогаю разрабатывать грантовые проекты и бизнес-планы по "
+    "методологии «3 деревьев». Пиши свободно, как консультанту — расскажи "
+    "об организации, доноре, идее, я сам буду спрашивать, чего не хватает. "
+    "Важно: я могу ошибаться — обязательно перепроверяй все данные и цифры "
+    "перед подачей."
+)
+
+import re
+
+START_WORDS = {
+    "начни", "начать", "хочу начать", "давай начнём", "давай начнем",
+    "старт", "/start", "начни заново", "начать заново", "заново",
+    "с начала", "сначала", "restart", "сброс", "новый проект",
+}
+
+
+def is_start_command(text: str) -> bool:
+    """Определяет команды перезапуска проекта с учётом опечаток и вариаций."""
+    t = text.strip().lower()
+    if t in START_WORDS:
+        return True
+    patterns = [
+        r"^/?start\b",
+        r"^старт\b",
+        r"^нач[нч][а-я]*",
+        r".*начать заново.*",
+        r".*новый проект.*",
+        r"^заново$",
+        r"^сначала$",
+        r"^с\s*начала$",
+        r"^сброс$",
+    ]
+    return any(re.search(p, t) for p in patterns)
+
+
+class Flow(StatesGroup):
+    active = State()
+
+
+def start_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Разработать проект", callback_data="agentflow:grant")
+    kb.button(text="💼 Разработать бизнес-план", callback_data="agentflow:bizplan")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def restart_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔄 Начать заново", callback_data="agent:restart")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def quick_reply_keyboard(options: list[str]):
+    """Кнопки-подсказки к вопросу агента (см. agent_tools.suggest_quick_replies).
+    callback_data хранит только индекс (лимит Telegram 64 байта на
+    callback_data) — сам текст варианта читается из FSM-состояния по индексу
+    в обработчике ниже."""
+    kb = InlineKeyboardBuilder()
+    for i, opt in enumerate(options):
+        kb.button(text=opt[:64], callback_data=f"qr:{i}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def _normalize_session(data: dict) -> dict:
+    """Обеспечивает корректную структуру данных для агентного движка.
+    Если пользователь пришёл из старой версии FSM (где поля лежали на
+    верхнем уровне data: org_info, donor_info, budget_text и т.д.),
+    прозрачно собирает их в словарь project_data, чтобы накопленный
+    контекст не терялся при переходе."""
+    if not isinstance(data, dict):
+        data = {}
+
+    project_data = data.setdefault("project_data", {})
+    if not isinstance(project_data, dict):
+        project_data = {}
+        data["project_data"] = project_data
+
+    # Миграция из плоских полей старой FSM
+    field_mappings = {
+        "org_info": "org_info",
+        "donor_info": "donor_info",
+        "donor_template": "donor_template",
+        "selected_idea": "problem_and_idea",
+        "goal_and_objectives": "goal_and_objectives",
+        "budget_text": "activities_and_budget",
+        "concept_text": "other_notes",
+    }
+    for old_k, target_k in field_mappings.items():
+        val = data.get(old_k)
+        if val and isinstance(val, str) and val.strip():
+            if target_k not in project_data or not project_data[target_k]:
+                project_data[target_k] = val.strip()
+
+    if "flow" not in data:
+        data["flow"] = "grant"
+    if "ui_language" not in data:
+        data["ui_language"] = "ru"
+    if "history_openai" not in data or not isinstance(data.get("history_openai"), list):
+        data["history_openai"] = []
+
+    return data
+
+
+@router.channel_post()
+async def handle_channel_post(message: Message):
+    """Слушает новые посты из канала @connect4_pro и обновляет каталог грантов."""
+    text = message.text or message.caption or ""
+    if not text.strip():
+        return
+    post_id = f"connect4_pro/{message.message_id}"
+    date_str = message.date.isoformat() if message.date else ""
+    try:
+        from connect4pro_catalog import register_channel_post
+        grant = register_channel_post(text, post_id=post_id, pub_date=date_str)
+        if grant:
+            logger.info("Saved channel grant announcement: %s", grant.get("title"))
+    except Exception as e:
+        logger.warning("Error processing channel_post: %s", e)
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(WELCOME, reply_markup=start_keyboard())
+
+
+@router.callback_query(F.data.startswith("agentflow:"))
+async def choose_flow(callback: CallbackQuery, state: FSMContext):
+    flow = callback.data.split(":")[1]
+    await state.set_state(Flow.active)
+    await state.set_data({
+        "flow": flow,
+        "ui_language": "ru",
+        "project_data": {},
+        "history_openai": [],
+    })
+    if flow == "grant":
+        msg = (
+            "Отлично! Начинаем разработку грантового проекта по методологии «3 деревьев».\n\n"
+            "📌 **Шаг 1 из 5: Кто заявитель?**\n"
+            "Расскажите о вашей организации или инициативной группе: название, город/регион, сфера деятельности и опыт (можно кратко написать текстом или прислать файл с описанием организации)."
+        )
+        opts = ["1. Опишу текстом", "2. Прикреплю файл", "3. Мы новая группа"]
+    else:
+        msg = (
+            "Отлично! Начинаем разработку бизнес-плана.\n\n"
+            "📌 **Шаг 1 из 5: Кто заявитель/бизнес?**\n"
+            "Расскажите о вашем предприятии, ИП или стартапе: сфера деятельности, город, текущий статус."
+        )
+        opts = ["1. Действующий бизнес", "2. Стартап с нуля", "3. Опишу текстом"]
+
+    await state.update_data(_active_quick_replies=opts)
+    await callback.message.answer(msg, reply_markup=quick_reply_keyboard(opts), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "agent:restart")
+async def restart(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer(WELCOME, reply_markup=start_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("qr:"))
+async def handle_quick_reply(callback: CallbackQuery, state: FSMContext):
+    """Пользователь тапнул одну из кнопок-подсказок (suggest_quick_replies).
+    Отправляем выбранный текст в агента как обычное сообщение — с точки
+    зрения диалога это неотличимо от того, если бы пользователь его напечатал."""
+    await callback.answer()
+    data = await state.get_data()
+    options = data.get("_active_quick_replies") or []
+    try:
+        idx = int(callback.data.split(":", 1)[1])
+        chosen = options[idx]
+    except (ValueError, IndexError):
+        await callback.message.answer("Эта кнопка устарела — напиши ответ текстом 👇")
+        return
+    # Убираем стрелки/пальцы вниз и призывы нажать кнопку, фиксируем выбор в сообщении
+    try:
+        old_text = callback.message.text or callback.message.caption or ""
+        clean_lines = []
+        for line in old_text.split("\n"):
+            line_str = line.strip()
+            if any(marker in line_str for marker in ["👇", "👉", "Нажмите кнопку", "нажмите кнопку", "Жду ваш ответ", "Жду ответ", "Жду выбор"]):
+                continue
+            clean_lines.append(line)
+        cleaned = "\n".join(clean_lines).strip()
+
+        if not cleaned:
+            new_text = f"✅ Выбрано: {chosen}"
+        else:
+            new_text = f"{cleaned}\n\n✅ Выбрано: {chosen}"
+
+        try:
+            await callback.message.edit_text(new_text, reply_markup=None)
+        except Exception:
+            await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _ensure_active(state)
+    await _run_turn_and_reply(callback.message, state, chosen)
+
+
+@router.callback_query()
+async def handle_legacy_or_unknown_callback(callback: CallbackQuery, state: FSMContext):
+    """Обрабатывает нажатия на inline-кнопки старых сообщений (до миграции
+    на агентную архитектуру), чтобы исключить зависания и ошибки
+    'Update is not handled'."""
+    data = callback.data or ""
+    await callback.answer()
+
+    # Если пользователь нажал кнопку согласования бюджета из старой версии
+    if "budget:ready" in data or "budget_approve" in data:
+        await _ensure_active(state)
+        await _run_turn_and_reply(callback.message, state, "Бюджет меня устраивает, давай собирать финальный документ.")
+        return
+
+    # Если пользователь нажал отмену/главное меню
+    if data in ("mm", "cancel"):
+        await state.clear()
+        await callback.message.answer(WELCOME, reply_markup=start_keyboard())
+        return
+
+    # Любая другая старая кнопка — подсказываем продолжить текстом
+    current_state = await state.get_state()
+    if not current_state:
+        await callback.message.answer(WELCOME, reply_markup=start_keyboard())
+    else:
+        await callback.message.answer("Кнопка от предыдущего шага устарела. Напиши свой ответ или пожелание прямо сообщением в чат 👇")
+
+
+async def _ensure_active(state: FSMContext) -> dict:
+    """Гарантирует, что состояние переведено в Flow.active, а данные нормализованы."""
+    raw = await state.get_data()
+    norm = _normalize_session(raw)
+    await state.set_state(Flow.active)
+    await state.set_data(norm)
+    return norm
+
+
+@router.message(F.document)
+async def receive_document(message: Message, state: FSMContext):
+    """Документ (org profile, форма донора и т.п.) — извлекаем текст и
+    отдаём агенту как обычное текстовое сообщение с пометкой источника."""
+    from document_reader import UnsupportedFormatError, extract_text_from_telegram_file
+
+    await _ensure_active(state)
+
+    try:
+        async with show_typing(message.bot, message.chat.id):
+            doc_text = await extract_text_from_telegram_file(message.bot, message.document)
+    except UnsupportedFormatError as e:
+        await message.answer(f"⚠️ {e}")
+        return
+    if not doc_text.strip():
+        await message.answer(
+            f"⚠️ Не смог извлечь текст из {message.document.file_name} "
+            "(файл повреждён, пустой, или это скан без текстового слоя)."
+        )
+        return
+
+    caption = (message.caption or "").strip()
+    user_text = (
+        f"{caption}\n\n" if caption else ""
+    ) + f"[Прислан файл {message.document.file_name}]:\n{doc_text[:12000]}"
+
+    await _run_turn_and_reply(message, state, user_text)
+
+
+@router.message()
+async def receive_any_message(message: Message, state: FSMContext):
+    """Главный обработчик любых текстовых сообщений.
+    Никогда не отбрасывает апдейты: проверяет намерения, подхватывает
+    текущий контекст и передаёт ход агенту."""
+    raw_text = (message.text or message.caption or "").strip()
+    if not raw_text:
+        await message.answer("Не увидел текста в этом сообщении — опиши словами, текстом.")
+        return
+
+    # Проверка на явный перезапуск
+    if is_start_command(raw_text):
+        await state.clear()
+        await message.answer(WELCOME, reply_markup=start_keyboard())
+        return
+
+    # Проверяем, есть ли уже начатый проект
+    current_state = await state.get_state()
+    session_data = await state.get_data()
+
+    # Если состояния нет и данных нет — показываем приветствие и выбор направления
+    if not current_state and not session_data.get("project_data") and not session_data.get("org_info"):
+        await message.answer(WELCOME, reply_markup=start_keyboard())
+        return
+
+    # Проект уже есть или был — активируем и обрабатываем сообщение
+    await _ensure_active(state)
+
+    # Если пользователь прислал цифру ("1", "2", ...), сопоставляем с активными кнопками
+    active_opts = session_data.get("_active_quick_replies") or []
+    if raw_text.isdigit() and active_opts:
+        idx = int(raw_text) - 1
+        if 0 <= idx < len(active_opts):
+            raw_text = f"Выбираю вариант {raw_text}: {active_opts[idx]}"
+
+    await _run_turn_and_reply(message, state, raw_text)
+
+
+async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: str) -> None:
+    session = await state.get_data()
+    try:
+        async with show_live_progress(message, "💭 Думаю..."):
+            result = await agent_engine.run_agent_turn(session, user_text)
+    except Exception as exc:
+        logger.exception("agent turn crashed: %s", exc)
+        await message.answer(
+            "⚠️ Произошла техническая ошибка при обработке твоего сообщения. "
+            "Попробуй повторить его ещё раз — если не поможет, начни заново "
+            "кнопкой ниже.",
+            reply_markup=restart_keyboard(),
+        )
+        return
+
+    await state.set_data(session)  # сохраняем актуализированные данные
+
+    if getattr(result, "file_attachments", None):
+        for att in result.file_attachments:
+            p = att.get("path")
+            if p and os.path.exists(p):
+                try:
+                    await message.answer_document(
+                        FSInputFile(p),
+                        caption=att.get("caption", ""),
+                    )
+                except Exception as e:
+                    logger.warning("Failed to send file attachment %s: %s", p, e)
+
+    if result.document_ready and result.document_text.strip():
+        await _send_docx(message, result.document_text, session)
+
+    if result.reply.strip():
+        from telegram_text import send_long
+        if result.quick_replies:
+            # Сохраняем варианты в FSM, чтобы handle_quick_reply мог достать
+            # текст по индексу из callback_data (там помещается только число).
+            await state.update_data(_active_quick_replies=result.quick_replies)
+            await send_long(message, result.reply, reply_markup=quick_reply_keyboard(result.quick_replies))
+        else:
+            await send_long(message, result.reply)
+
+
+async def _send_docx(message: Message, text: str, session: dict) -> None:
+    from agent_docgen import export_docx
+
+    try:
+        async with show_working(message, "📄 Формирую Word-файл..."):
+            path = await export_docx(text, session)
+        await message.answer_document(FSInputFile(path))
+    except Exception as e:
+        logger.exception("Failed to export/send docx: %s", e)
+        await message.answer("⚠️ Не удалось собрать .docx файл. Попробуй ещё раз написать 'собери документ'.")
+    finally:
+        try:
+            if 'path' in locals() and os.path.exists(path):
+                os.unlink(path)
+                os.rmdir(os.path.dirname(path))
+        except Exception:
+            pass
