@@ -84,6 +84,23 @@ async def main():
         return True
 
     await bot.delete_webhook(drop_pending_updates=True)
+
+    # Простой HTTP healthcheck для облачных платформ (Koyeb, Render, Railway),
+    # чтобы они видели, что контейнер активен и не перезагружали его.
+    port = int(os.environ.get("PORT", "8000"))
+    try:
+        from aiohttp import web
+        health_app = web.Application()
+        health_app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
+        health_app.router.add_get("/health", lambda r: web.Response(text="OK"))
+        runner = web.AppRunner(health_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info("Healthcheck HTTP server started on port %d", port)
+    except Exception as e:
+        logger.warning("Could not start healthcheck HTTP server on port %d: %s", port, e)
+
     await dp.start_polling(bot)
 
 
