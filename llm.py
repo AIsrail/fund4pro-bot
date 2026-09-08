@@ -333,6 +333,20 @@ async def call_claude(
     history: list[dict] | None = None,
     max_tokens: int = 2000,
 ) -> str:
+    # Приоритетно используем DeepSeek (быстро, надежно и с активным балансом)
+    if _deepseek_client:
+        try:
+            res_text = await call_fallback_llm(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                history=history,
+                max_tokens=max_tokens,
+            )
+            if res_text.strip():
+                return res_text
+        except Exception as ds_exc:
+            logger.warning("DeepSeek in call_claude failed: %s, falling back to Anthropic", ds_exc)
+
     try:
         messages = (history or []) + [{"role": "user", "content": user_message}]
         response = await _client.messages.create(

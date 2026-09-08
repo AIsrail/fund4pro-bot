@@ -507,13 +507,14 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
     document_text = ""
 
     for round_i in range(MAX_TOOL_ROUNDS):
-        use_anthropic = bool(config.ANTHROPIC_API_KEY)
+        # Основной провайдер — DeepSeek (быстрый, стабильный и с активным балансом).
+        # Если DeepSeek недоступен — пробуем Anthropic, затем Gemini.
         turn = None
-        if use_anthropic:
+        if _deepseek_client:
+            turn = await _deepseek_turn(system_prompt, history)
+        if turn is None and config.ANTHROPIC_API_KEY:
             anthropic_messages = _openai_history_to_anthropic(history)
             turn = await _anthropic_turn(system_prompt, anthropic_messages)
-        if turn is None and _deepseek_client:
-            turn = await _deepseek_turn(system_prompt, history)
         if turn is None and _fallback_client:
             turn = await _gemini_turn(system_prompt, history)
         if turn is None:
