@@ -488,6 +488,29 @@ FOLLOWUP_TOOLS = {
 }
 
 
+_PROMISE_MARKERS = (
+    "сразу разверну", "сейчас разверну", "сейчас пришлю",
+    "сразу пришлю", "дальше опишу", "далее опишу",
+    "сейчас опишу", "сразу опишу", "сейчас сформулирую",
+    "сразу сформулирую", "сейчас составлю", "сразу составлю",
+    "сейчас подготовлю", "сразу подготовлю", "сейчас предложу",
+    "сразу предложу", "ниже разверну", "ниже опишу",
+    "теперь разверну", "теперь опишу", "теперь сформулирую",
+)
+
+
+def _is_empty_promise(text: str | None) -> bool:
+    """True, если текст — связная фраза-обещание ("сейчас пришлю",
+    "сразу разверну концепцию" и т.п.) без реального развёрнутого
+    содержания следом. Модель иногда пишет такую фразу и останавливается,
+    вместо того чтобы сразу продолжить полным ответом — это создаёт для
+    пользователя ощущение зависшего бота."""
+    if not text:
+        return False
+    _t = text.strip().lower()
+    return any(marker in _t for marker in _PROMISE_MARKERS) and len(_t) < 400
+
+
 async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
     """Главная точка входа — один ход диалога: добавляет сообщение
     пользователя, крутит цикл модель<->инструменты до финального текстового
@@ -533,6 +556,18 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                         if len(c) > 20 and not any(c.startswith(w) for w in ["Жду ваш ответ", "Жду ответ", "Жду выбор"]):
                             reply = c
                             break
+
+            # Защита от "пустых обещалок" без вызова инструментов: модель
+            # написала фразу вида "сейчас пришлю", "сразу разверну концепцию",
+            # но реального содержания не дала. Не отдаём такой ответ
+            # пользователю — просим модель сразу же продолжить в этом ходу.
+            if _is_empty_promise(reply) and round_i < MAX_TOOL_ROUNDS - 1:
+                history.append({"role": "assistant", "content": reply})
+                history.append({
+                    "role": "user",
+                    "content": "Продолжай прямо сейчас — заверши то, что обещал(а) выше, полным содержанием, без новых обещаний.",
+                })
+                continue
 
             # Если модель не вызвала suggest_quick_replies, но перечислила варианты 1, 2, 3... или маркеры в тексте —
             # автоматически создаём кнопки и добавляем понятную новичкам подсказку
@@ -600,6 +635,12 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                 or len(turn["text"].strip()) < 30
             )
         )
+
+        # Защита от "пустых обещалок" в ходе с вызовом инструментов —
+        # см. _is_empty_promise ниже.
+        if not is_incomplete and _is_empty_promise(turn["text"]):
+            is_incomplete = True
+
         if not needs_followup and turn["text"] and not is_incomplete:
             reply = turn["text"]
             quick_replies = session.pop("_pending_quick_replies", [])
