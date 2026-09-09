@@ -297,6 +297,18 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
 
     if name == "suggest_quick_replies":
         options = [str(o).strip() for o in (args.get("options") or []) if str(o).strip()]
+        # Защита от утечки внутренних технических названий полей профиля
+        # организации (например "Заявитель", "Профиль", "Опыт и сильные
+        # стороны", "Команда", "Слабые места") в кнопки для пользователя —
+        # это структура данных для модели, а не понятный пользователю выбор.
+        _internal_field_markers = (
+            "заявитель", "профиль организации", "опыт и сильные стороны",
+            "слабые места", "команда проекта",
+        )
+        options = [
+            o for o in options
+            if not any(marker in o.lower() for marker in _internal_field_markers)
+        ]
         session["_pending_quick_replies"] = options[:4]
         return "Кнопки с вариантами ответа будут показаны под твоим сообщением."
 
