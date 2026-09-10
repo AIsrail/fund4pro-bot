@@ -292,6 +292,21 @@ async def receive_document(message: Message, state: FSMContext):
         )
         return
 
+    # Если пользователь прислал шаблон .docx — сохраняем сам файл на диск,
+    # чтобы при сборке финального документа использовать именно его!
+    if message.document.file_name and message.document.file_name.lower().endswith(".docx"):
+        import os
+        from donor_form_cache import CACHE_DIR
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        local_path = os.path.join(CACHE_DIR, f"user_{message.document.file_unique_id}_{message.document.file_name}")
+        try:
+            await message.bot.download(message.document, destination=local_path)
+            session_data = await state.get_data()
+            session_data["donor_template_file_path"] = local_path
+            await state.set_data(session_data)
+        except Exception as err:
+            logger.warning("Failed to save uploaded docx template: %s", err)
+
     caption = (message.caption or "").strip()
     user_text = (
         f"{caption}\n\n" if caption else ""

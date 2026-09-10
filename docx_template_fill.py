@@ -10,48 +10,74 @@ from docx.shared import Pt
 logger = logging.getLogger("fund4pro.docx_template_fill")
 
 
+def clean_str(s: str) -> str:
+    """Удаляет знаки препинания и нормализует регистр для нечёткого сравнения."""
+    return re.sub(r"[^\w\s]", "", s).lower().strip()
+
+
 def parse_markdown_fields_and_sections(text: str) -> tuple[dict[str, str], dict[str, str]]:
     """Разбивает сгенерированный markdown-документ на:
-    1. sections: {заголовок: развёрнутый текст} для больших текстовых блоков
+    1. sections: {заголовок: развёрнутый текст} для больших текстовых блоков и вопросов анкеты
     2. key_values: {ключ: значение} для полей форм и контактных данных
     """
     sections: dict[str, str] = {}
     key_values: dict[str, str] = {}
-    current_header = None
-    current_lines: list[str] = []
 
-    for line in text.split("\n"):
+    def is_kv_line(line_s: str):
+        # **Ключ:** Значение или **Ключ**: Значение
+        m_bold = re.match(r"^(?:[-*•]\s*)?\*\*([^*]+?):?\*\*\s*:?\s*(.*)$", line_s)
+        if m_bold:
+            k = m_bold.group(1).strip().rstrip(":")
+            v = m_bold.group(2).strip()
+            if 2 < len(k) < 80 and v and not k.endswith("?"):
+                return k, v
+        # - Ключ: Значение или * Ключ: Значение
+        m_bullet = re.match(r"^[-*•]\s*([^*:\n]+?)\s*:\s*(.+)$", line_s)
+        if m_bullet:
+            k = m_bullet.group(1).strip().rstrip(":")
+            v = m_bullet.group(2).strip()
+            if 2 < len(k) < 80 and v:
+                return k, v
+        return None
+
+    lines = text.splitlines()
+    curr_header = None
+    curr_body: list[str] = []
+
+    def save_section(h, body_lines):
+        t = "\n".join(body_lines).strip()
+        if h and t:
+            sections[h] = t
+
+    for line in lines:
         line_s = line.strip()
-        header_match = re.match(r"^#{1,4}\s+(.+)$", line_s)
-        if header_match:
-            if current_header:
-                sections[current_header] = "\n".join(current_lines).strip()
-            current_header = header_match.group(1).strip()
-            current_lines = []
+        if not line_s:
+            if curr_body:
+                curr_body.append("")
             continue
 
-        # Парсим ключ-значение вида '- Поле: Значение' или '* Поле: Значение'
-        if line_s.startswith(("- ", "* ")):
-            raw = line_s[2:].strip()
-            if ":" in raw:
-                k, _, v = raw.partition(":")
-                k = k.strip().strip("*").strip()
-                v = v.strip()
-                if 2 < len(k) < 100 and v:
-                    key_values[k] = v
+        h_match = re.match(r"^#{1,4}\s+(.+)$", line_s)
+        bold_h_match = re.match(r"^\*\*([^*]+)\*\*:?$", line_s)
+        kv = is_kv_line(line_s)
 
-        if current_header:
-            current_lines.append(line)
+        if h_match:
+            save_section(curr_header, curr_body)
+            curr_header = h_match.group(1).strip()
+            curr_body = []
+        elif bold_h_match and (len(bold_h_match.group(1).strip()) > 15 or bold_h_match.group(1).strip().endswith("?")):
+            save_section(curr_header, curr_body)
+            curr_header = bold_h_match.group(1).strip().rstrip(":- ")
+            curr_body = []
+        elif kv:
+            key_values[kv[0]] = kv[1]
+            if curr_header:
+                curr_body.append(line)
+        else:
+            if curr_header:
+                curr_body.append(line)
 
-    if current_header:
-        sections[current_header] = "\n".join(current_lines).strip()
-
+    save_section(curr_header, curr_body)
     return sections, key_values
-
-
-def clean_str(s: str) -> str:
-    """Удаляет знаки препинания и нормализует регистр для нечёткого сравнения."""
-    return re.sub(r"[^\w\s]", "", s).lower().strip()
 
 
 def find_best_kv_match(label: str, key_values: dict[str, str]) -> str | None:
@@ -71,7 +97,6 @@ def find_best_kv_match(label: str, key_values: dict[str, str]) -> str | None:
     for k, v in key_values.items():
         ck = clean_str(k)
         if len(ck) >= 3 and (ck in clbl or clbl in ck):
-            # Если метка или ключ очень короткие (например "где"), требуем точного совпадения
             if len(ck) < 5 or len(clbl) < 5:
                 if ck != clbl:
                     continue
@@ -93,10 +118,54 @@ def find_best_kv_match(label: str, key_values: dict[str, str]) -> str | None:
     return None
 
 
+def find_best_section_match(cell_text: str, sections: dict[str, str]) -> str | None:
+    """Находит развёрнутый ответ для ячейки с вопросом анкеты."""
+    c_clean = clean_str(cell_text)
+    if not c_clean:
+        return None
+
+    # 1. Прямое совпадение заголовка или подстроки
+    for h, content in sections.items():
+        h_clean = clean_str(h)
+        if not h_clean or not content:
+            continue
+        if h_clean in c_clean or c_clean in h_clean:
+            return content
+
+    # 2. Семантическое сопоставление ключевых разделов грантовых форм
+    semantic_mappings = [
+        (["цель и направления", "цели вашей организации", "какова цель"], ["цель", "направления", "история и цели"]),
+        (["достигает своей цели", "результатов удалось добиться", "каким образом ваша", "история и опыт деятельности"], ["достигает", "результат", "история и опыт"]),
+        (["сети или коалиции", "любые сети"], ["сети", "коалиции", "партнеры", "партнёры"]),
+        (["контекст", "социальноэкологической проблемы", "описание проблемы", "проблемы"], ["контекст", "проблем", "обоснование проблемы"]),
+        (["проект кратко", "цель задачи", "предполагаемую деятельность", "ожидаемый результат"], ["проект", "цель и задачи", "деятельность", "план"]),
+        (["подробный бюджет", "бюджет проекта", "в долларах сша"], ["бюджет", "budget"]),
+        (["косвенными благополучателями", "сообщества или области", "благополучатели"], ["благополучател", "сообществ"]),
+        (["руководства и сотрудников", "примут участие"], ["руководств", "сотрудник", "команда"]),
+    ]
+
+    for prompt_triggers, section_triggers in semantic_mappings:
+        if any(pt in c_clean for pt in prompt_triggers):
+            for h, content in sections.items():
+                h_c = clean_str(h)
+                if any(st in h_c for st in section_triggers):
+                    return content
+
+    # 3. Совпадение первых слов
+    w_prompt = c_clean.split()[:3]
+    for h, content in sections.items():
+        w_h = clean_str(h).split()[:3]
+        if len(w_h) >= 2 and len(w_prompt) >= 2 and " ".join(w_h) == " ".join(w_prompt):
+            return content
+
+    return None
+
+
 def fill_donor_docx_template(template_path: str, markdown_text: str, output_path: str, session: dict | None = None) -> bool:
     """Открывает оригинальный docx-файл донора, находит пустые ячейки после
     соответствующих меток или поля ввода и заполняет их, сохраняя 100%
-    оригинальной верстки (таблицы, шрифты, колонтитулы)."""
+    оригинальной верстки (таблицы, шрифты, колонтитулы).
+    Возвращает True ТОЛЬКО если форма реально заполнена содержанием."""
     try:
         doc = docx.Document(template_path)
     except Exception as e:
@@ -132,22 +201,21 @@ def fill_donor_docx_template(template_path: str, markdown_text: str, output_path
             if ("Кыргыз" in org_info or "КР" in org_info) and "Страна" not in key_values:
                 key_values["Страна"] = "Кыргызская Республика"
 
-    # КРИТИЧЕСКИ ВАЖНО: удаляем свойства плавающей таблицы (tblpPr) из всех таблиц!
-    # В Word свойство tblpPr заставляет таблицы обтекать друг друга по бокам,
-    # что приводит к сжатию соседних таблиц в узкие вертикальные колонки шириной в 1 слово!
+    # Удаляем свойства плавающей таблицы (tblpPr) из всех таблиц Word
     for table in doc.tables:
         tblpPr = table._tbl.tblPr.find("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tblpPr")
         if tblpPr is not None:
             table._tbl.tblPr.remove(tblpPr)
 
     filled_count = 0
+    filled_sections_count = 0
 
     for table in doc.tables:
         for row in table.rows:
             # Получаем уникальные ячейки строки (исключаем дубликаты объединённых ячеек)
             unique_cells = []
             for c in row.cells:
-                if c._tc not in [u._tc for u in unique_cells]:
+                if not any(c._tc == u._tc for u in unique_cells):
                     unique_cells.append(c)
 
             # Случай А: Сетка метка -> поле ввода (Таблицы 1, 2, 3, 4 и т.д.)
@@ -168,24 +236,10 @@ def fill_donor_docx_template(template_path: str, markdown_text: str, output_path
                                     r.font.size = Pt(10.5)
                             filled_count += 1
 
-            # Случай Б: 1-ячеечная таблица с развёрнутым вопросом (Таблицы 5, 6, 7, 8, 9, 10, 12)
+            # Случай Б: 1-ячеечная таблица с развёрнутым вопросом (Таблицы 5, 6, 7, 8, 9, 10, 12, 13)
             elif len(unique_cells) == 1:
                 cell = unique_cells[0]
-                clean_prompt = clean_str(cell.text)
-                matched_content = None
-
-                for h, content in sections.items():
-                    ch = clean_str(h)
-                    if not ch or not content:
-                        continue
-                    if ch in clean_prompt or clean_prompt in ch:
-                        matched_content = content
-                        break
-                    hw = ch.split()[:3]
-                    pw = clean_prompt.split()[:3]
-                    if len(hw) >= 2 and len(pw) >= 2 and " ".join(hw) == " ".join(pw):
-                        matched_content = content
-                        break
+                matched_content = find_best_section_match(cell.text, sections)
 
                 if matched_content and matched_content not in cell.text:
                     p = cell.add_paragraph()
@@ -195,8 +249,21 @@ def fill_donor_docx_template(template_path: str, markdown_text: str, output_path
                     run.font.name = "Times New Roman"
                     run.font.size = Pt(11)
                     filled_count += 1
+                    filled_sections_count += 1
 
-    logger.info("fill_donor_docx_template filled %d fields/sections in %s", filled_count, template_path)
+    logger.info("fill_donor_docx_template filled %d fields and %d sections in %s",
+                filled_count, filled_sections_count, template_path)
+
+    # ЖЁСТКАЯ ПРОВЕРКА КАЧЕСТВА: если шаблон имеет много таблиц (> 5),
+    # но заполнено менее 5 полей или 0 развёрнутых секций — считаем, что
+    # шаблон НЕ заполнился! Возвращаем False, чтобы сработал fallback
+    # на markdown_to_docx, который гарантированно выдаст ПОЛНЫЙ документ.
+    if len(doc.tables) >= 5:
+        if filled_count < 5 or filled_sections_count < 1:
+            logger.warning("fill_donor_docx_template: only %d fields and %d sections filled in %s — rejecting partial fill, falling back to markdown_to_docx",
+                           filled_count, filled_sections_count, template_path)
+            return False
+
     if filled_count > 0:
         doc.save(output_path)
         return True
