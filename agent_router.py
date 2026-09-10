@@ -10,6 +10,7 @@ ProjectFlow:budget_discussion) автоматически мигрируют в 
 действия для агента.
 """
 
+import io
 import logging
 import os
 import tempfile
@@ -292,20 +293,29 @@ async def receive_document(message: Message, state: FSMContext):
         )
         return
 
-    # Если пользователь прислал шаблон .docx — сохраняем сам файл на диск,
-    # чтобы при сборке финального документа использовать именно его!
+    # Если пользователь прислал .docx — сохраняем в кэш для доступности
+    # через select_donor_form, но НЕ назначаем автоматически шаблоном.
+    # Выбор шаблона — решение модели через инструмент select_donor_form.
     if message.document.file_name and message.document.file_name.lower().endswith(".docx"):
         import os
-        from donor_form_cache import CACHE_DIR
+        from donor_form_cache import CACHE_DIR, save_donor_form
         os.makedirs(CACHE_DIR, exist_ok=True)
-        local_path = os.path.join(CACHE_DIR, f"user_{message.document.file_unique_id}_{message.document.file_name}")
         try:
-            await message.bot.download(message.document, destination=local_path)
+            # Сохраняем через save_donor_form, чтобы файл попал в кэш с нормальным именем
+            path = save_donor_form(await message.bot.download(message.document, destination=io.BytesIO()), message.document.file_name)
+            # Добавляем в список доступных форм для select_donor_form
             session_data = await state.get_data()
-            session_data["donor_template_file_path"] = local_path
+            saved = session_data.get("saved_donor_files", [])
+            saved.append({
+                "filename": message.document.file_name,
+                "path": path,
+                "text": doc_text,
+                "url": "",
+            })
+            session_data["saved_donor_files"] = saved
             await state.set_data(session_data)
         except Exception as err:
-            logger.warning("Failed to save uploaded docx template: %s", err)
+            logger.warning("Failed to save uploaded docx: %s", err)
 
     caption = (message.caption or "").strip()
     user_text = (

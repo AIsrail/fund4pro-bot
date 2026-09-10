@@ -73,9 +73,9 @@ async def _run_red_flags_gate(text: str, session_data: dict) -> str:
 
 async def export_docx(text: str, session: dict) -> str:
     """Рендерит текст в .docx и возвращает путь к временному файлу.
-    Если в сессии или кэше есть оригинальный файл формы донора (.docx),
-    заполняет поля прямо внутри оригинального файла, сохраняя все 100%
-    таблиц, стилей и логотипов донора без изменений."""
+    Если в сессии выбран конкретный файл формы донора (chosen_donor_form
+    + saved_donor_files) — заполняет поля прямо внутри этого файла,
+    сохраняя все 100% таблиц, стилей и логотипов донора без изменений."""
     import os
     import tempfile
     from docgen import markdown_to_docx
@@ -88,22 +88,23 @@ async def export_docx(text: str, session: dict) -> str:
     tmp_dir = tempfile.mkdtemp()
     path = os.path.join(tmp_dir, "final_version.docx")
 
-    # Ищем путь к оригинальному файлу формы донора
-    donor_doc_path = session.get("donor_template_file_path")
+    # Ищем путь к ВЫБРАННОМУ пользователем/моделью файлу формы донора
+    donor_doc_path = None
+    chosen_fn = session.get("chosen_donor_form")
+    if chosen_fn:
+        for f in session.get("saved_donor_files", []):
+            if f.get("filename") == chosen_fn:
+                donor_doc_path = f.get("path")
+                break
+
+    # Fallback: если выбор не сохранён, но есть donor_template_file_path (старая логика)
     if not donor_doc_path:
-        from donor_form_cache import CACHE_DIR
-        if os.path.exists(CACHE_DIR):
-            cached = [f for f in os.listdir(CACHE_DIR) if f.endswith(".docx")]
-            # Предпочитаем main/заявку
-            main_files = [f for f in cached if "main" in f.lower() or "заявка" in f.lower() or "form" in f.lower()]
-            chosen_fn = main_files[0] if main_files else (cached[0] if cached else None)
-            if chosen_fn:
-                donor_doc_path = os.path.join(CACHE_DIR, chosen_fn)
+        donor_doc_path = session.get("donor_template_file_path")
 
     if donor_doc_path and os.path.exists(donor_doc_path):
         success = fill_donor_docx_template(donor_doc_path, text, path, session=session)
         if success:
-            logger.info("Successfully populated original donor template docx: %s", donor_doc_path)
+            logger.info("Successfully populated chosen donor template docx: %s", donor_doc_path)
             return path
 
     markdown_to_docx(text, title, path)

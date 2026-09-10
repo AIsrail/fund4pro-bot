@@ -227,6 +227,8 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
         if structure:
             project_data["donor_template"] = structure
             session["chosen_donor_form"] = chosen.get("filename")
+            # Сохраняем путь к выбранному файлу для export_docx
+            session["chosen_donor_form_path"] = chosen.get("path")
             return (
                 f"Выбрана форма '{chosen.get('filename')}'. Её официальная структура извлечена и сохранена в donor_template:\n"
                 f"{structure[:1500]}\n\n"
@@ -680,6 +682,24 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                 "tool_call_id": tc["id"],
                 "content": result_str,
             })
+
+        # ЗАЩИТА ОТ ГАЛЛЮЦИНАЦИЙ: если модель НЕ вызвала generate_document,
+        # но в своём тексте утверждает, что документ «готов», «собран», «отправлен» —
+        # это ложное обещание. Принудительно считаем ход незаконченным, чтобы
+        # модель за siguiente витке вызовала инструмент, и не отдаём такой текст пользователю.
+        if not document_ready:
+            text_lower = (turn["text"] or "").lower()
+            false_ready_markers = (
+                "документ готов", "документ собран", "документ сформирован",
+                "файл готов", "файл собран", "word-файл готов",
+                "отправил документ", "отправлен файл", "прикреплен файл",
+                "готов к отправке", "собрался документ", "сгенерировал документ",
+                "заполнил шаблон", "заполнил форму", "документ по шаблону",
+            )
+            if any(marker in text_lower for marker in false_ready_markers):
+                is_incomplete = True
+                # Перезаписываем ответ модели на честное продолжение
+                turn["text"] = "Собираю финальный документ..."
 
         # Если вызовы были чисто локальными (сохранение данных, прикрепление кнопок, отправка файлов)
         # И модель УЖЕ вернула содержательный ответ в этом ходу — НЕ делаем лишний запрос к LLM,
