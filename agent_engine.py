@@ -686,7 +686,8 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
         # ЗАЩИТА ОТ ГАЛЛЮЦИНАЦИЙ: если модель НЕ вызвала generate_document,
         # но в своём тексте утверждает, что документ «готов», «собран», «отправлен» —
         # это ложное обещание. Принудительно считаем ход незаконченным, чтобы
-        # модель за siguiente витке вызовала инструмент, и не отдаём такой текст пользователю.
+        # модель за следующим витком вызвала инструмент, и не отдаём такой текст пользователю.
+        hallucination_detected = False
         if not document_ready:
             text_lower = (turn["text"] or "").lower()
             false_ready_markers = (
@@ -697,21 +698,24 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                 "заполнил шаблон", "заполнил форму", "документ по шаблону",
             )
             if any(marker in text_lower for marker in false_ready_markers):
+                hallucination_detected = True
                 is_incomplete = True
                 # Перезаписываем ответ модели на честное продолжение
                 turn["text"] = "Собираю финальный документ..."
 
         # Если вызовы были чисто локальными (сохранение данных, прикрепление кнопок, отправка файлов)
         # И модель УЖЕ вернула содержательный ответ в этом ходу — НЕ делаем лишний запрос к LLM,
-        # отдаём ответ пользователю сразу, сохраняя полный текст описания и кнопки.
+        # отдаём ответ пользователю сразу, сохраняя полный текст описания и кнопок.
         # НО если текст явно оборван на ':' или '...', или слишком короткий — продолжаем цикл,
         # чтобы дать модели возможность закончить формулировку вопроса!
-        is_incomplete = bool(
-            turn["text"] and (
-                turn["text"].strip().endswith((":", "...", "—", "-"))
-                or len(turn["text"].strip()) < 30
+        # НО если была галлюцинация — НЕ сбрасываем is_incomplete
+        if not hallucination_detected:
+            is_incomplete = bool(
+                turn["text"] and (
+                    turn["text"].strip().endswith((":", "...", "—", "-"))
+                    or len(turn["text"].strip()) < 30
+                )
             )
-        )
 
         # Защита от "пустых обещалок" в ходе с вызовом инструментов —
         # см. _is_empty_promise ниже.
