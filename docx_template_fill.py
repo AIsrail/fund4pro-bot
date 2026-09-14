@@ -124,13 +124,28 @@ def find_best_section_match(cell_text: str, sections: dict[str, str]) -> str | N
     if not c_clean:
         return None
 
-    # 1. Прямое совпадение заголовка или подстроки
+    # 1. Прямое совпадение заголовка или подстроки — собираем ВСЕ кандидаты и
+    # берём самый содержательный (по длине), а не первый попавшийся.
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ: вопрос анкеты — длинный текст (например "ПРОЕКТ:
+    # Кратко опишите цель, задачи, предполагаемую деятельность..."), и
+    # короткий заголовок вроде "Рабочий план реализации проекта" почти
+    # всегда оказывается его подстрокой, даже если содержание под ним —
+    # заглушка на пару строк, а не развёрнутый ответ. Возврат по первому
+    # совпадению (порядок = порядок заголовков в документе) подставлял этот
+    # короткий текст вместо настоящего ответа под другим заголовком (типа
+    # "Цель и задачи" или "Деятельность и результаты"), который тоже
+    # подходил бы под этот вопрос, но проверялся позже и никогда не
+    # доходил до дела — самый важный раздел заявки («ПРОЕКТ») оставался
+    # фактически незаполненным содержательно.
+    candidates = []
     for h, content in sections.items():
         h_clean = clean_str(h)
         if not h_clean or not content:
             continue
         if h_clean in c_clean or c_clean in h_clean:
-            return content
+            candidates.append(content)
+    if candidates:
+        return max(candidates, key=len)
 
     # 2. Семантическое сопоставление ключевых разделов грантовых форм
     semantic_mappings = [
@@ -146,10 +161,13 @@ def find_best_section_match(cell_text: str, sections: dict[str, str]) -> str | N
 
     for prompt_triggers, section_triggers in semantic_mappings:
         if any(pt in c_clean for pt in prompt_triggers):
+            candidates = []
             for h, content in sections.items():
                 h_c = clean_str(h)
                 if any(st in h_c for st in section_triggers):
-                    return content
+                    candidates.append(content)
+            if candidates:
+                return max(candidates, key=len)
 
     # 3. Совпадение первых слов
     w_prompt = c_clean.split()[:3]
@@ -271,6 +289,24 @@ async def fill_donor_docx_template(template_path: str, markdown_text: str, outpu
             elif len(unique_cells) == 1:
                 cell = unique_cells[0]
                 matched_content = find_best_section_match(cell.text, sections)
+
+                # РЕАЛЬНЫЙ ИНЦИДЕНТ: для вопроса "ПРОЕКТ: цель, задачи,
+                # деятельность, результат" (самый важный раздел заявки)
+                # find_best_section_match нашёл короткий заголовок-подстроку
+                # ("Рабочий план реализации проекта"), под которым оказалась
+                # не сама деятельность, а служебная памятка донора — и это
+                # засчиталось как 'заполнено'. Все вопросы этого типа —
+                # открытые, развёрнутые (форма явно просит абзац-два), так
+                # что совпадение короче разумного порога почти наверняка
+                # промах нечёткого сопоставления, а не настоящий ответ —
+                # безопаснее отправить такую ячейку на второй проход (LLM
+                # с полным контекстом), чем молча принять мусорное совпадение.
+                if matched_content and len(matched_content) < 150:
+                    logger.warning(
+                        "fill_donor_docx_template: отбрасываю подозрительно короткое совпадение (%d симв.) для ячейки %r",
+                        len(matched_content), cell.text.strip()[:80],
+                    )
+                    matched_content = None
 
                 if matched_content and matched_content not in cell.text:
                     _append_section(cell, matched_content)
