@@ -262,6 +262,26 @@ async def fill_donor_docx_template(template_path: str, markdown_text: str, outpu
     unmatched_kv: list[tuple[str, "docx.table._Cell"]] = []
     unmatched_sections: list[tuple[str, "docx.table._Cell"]] = []
 
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ: после того как "ПРОЕКТ" (цель/задачи) наконец стал
+    # заполняться настоящим содержанием, этот же текст стал "лучшим
+    # совпадением" (или ответом второго прохода) ещё для нескольких СОВСЕМ
+    # других вопросов подряд — чекбоксов категорий благополучателей,
+    # косвенных благополучателей, состава команды. Разные ячейки с РАЗНЫМ
+    # текстом вопроса не должны получать ОДИН И ТОТ ЖЕ развёрнутый ответ —
+    # это почти всегда либо промах fuzzy-matching, либо модель второго
+    # прохода "полениласm" и скопировала один ответ на несколько пунктов.
+    # Легитимный случай — ТА ЖЕ ячейка/вопрос физически продублирован в
+    # документе (например колонки таблицы 13) — это ловится по одинаковому
+    # clean_str(question), а не блокируется.
+    filled_content_by_question: dict[str, str] = {}
+
+    def _content_conflicts(question_text: str, content: str) -> bool:
+        qkey = clean_str(question_text)
+        for other_q, other_content in filled_content_by_question.items():
+            if other_content == content and other_q != qkey:
+                return True
+        return False
+
     for table in doc.tables:
         for row in table.rows:
             # Получаем уникальные ячейки строки (исключаем дубликаты объединённых ячеек)
@@ -308,8 +328,16 @@ async def fill_donor_docx_template(template_path: str, markdown_text: str, outpu
                     )
                     matched_content = None
 
+                if matched_content and _content_conflicts(cell.text, matched_content):
+                    logger.warning(
+                        "fill_donor_docx_template: отбрасываю совпадение — этот же текст уже использован для другого вопроса (ячейка %r)",
+                        cell.text.strip()[:80],
+                    )
+                    matched_content = None
+
                 if matched_content and matched_content not in cell.text:
                     _append_section(cell, matched_content)
+                    filled_content_by_question[clean_str(cell.text)] = matched_content
                     filled_count += 1
                     filled_sections_count += 1
                 elif not matched_content:
@@ -332,8 +360,15 @@ async def fill_donor_docx_template(template_path: str, markdown_text: str, outpu
 
         for q, cell in unmatched_sections:
             content = extra_sections.get(q)
+            if content and _content_conflicts(q, content):
+                logger.warning(
+                    "fill_donor_docx_template: второй проход вернул уже использованный для другого вопроса ответ — отбрасываю (вопрос %r)",
+                    q[:80],
+                )
+                content = None
             if content:
                 _append_section(cell, content)
+                filled_content_by_question[clean_str(q)] = content
                 filled_count += 1
                 filled_sections_count += 1
 
