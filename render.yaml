@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: fund4pro-bot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: BOT_TOKEN
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
