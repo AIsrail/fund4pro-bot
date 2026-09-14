@@ -1163,6 +1163,14 @@ async def generate_final_document(session_data: dict) -> str:
         # заголовками формы донора; при расхождении — ОДНА попытка
         # исправления с explicit diff, не бесконечный цикл.
         result = await _enforce_donor_structure(result, donor_template, session_data)
+    else:
+        # ЖАЛОБА: "в заявках упускает некоторые разделы или специально
+        # оставляет их пустыми" — донорская ветка выше (_enforce_donor_structure)
+        # уже сверяет структуру формы донора, но для универсальной структуры
+        # (когда формы донора нет) такой проверки не было вообще — модель
+        # могла молча пропустить, например, "Устойчивость" или оставить под
+        # заголовком одну пустую строку, и это уходило пользователю как есть.
+        result = await _enforce_free_form_sections(result, session_data)
     # РЕАЛЬНЫЙ ИНЦИДЕНТ (х2): модель вместо документа написала связный
     # текст-отказ ('Не могу заполнить донорскую форму...', позже другими
     # словами: 'Реальное положение дел. У меня по этому проекту нет...') —
@@ -1199,6 +1207,86 @@ def _extract_headings(text: str) -> list[str]:
         if stripped.startswith("##"):
             headings.append(stripped.lstrip("#").strip())
     return headings
+
+
+def _split_into_sections(text: str) -> list[tuple[str, str]]:
+    """[(заголовок, текст_раздела)] по markdown-заголовкам '## ...'."""
+    lines = text.split("\n")
+    sections: list[tuple[str, str]] = []
+    current_heading = None
+    current_body: list[str] = []
+    for line in lines:
+        if line.strip().startswith("##"):
+            if current_heading is not None:
+                sections.append((current_heading, "\n".join(current_body).strip()))
+            current_heading = line.strip().lstrip("#").strip()
+            current_body = []
+        else:
+            current_body.append(line)
+    if current_heading is not None:
+        sections.append((current_heading, "\n".join(current_body).strip()))
+    return sections
+
+
+FREE_FORM_REQUIRED_SECTIONS = (
+    ("Executive Summary / Резюме", ("executive summary", "резюме")),
+    ("Об организации", ("организац",)),
+    ("Обоснование проблемы", ("проблем",)),
+    ("Цель и задачи", ("цель", "задач")),
+    ("План деятельности", ("деятельност", "мероприят")),
+    ("Ожидаемые результаты", ("результат",)),
+    ("Устойчивость", ("устойчив",)),
+    ("Бюджет", ("бюджет",)),
+)
+
+MIN_SECTION_CHARS = 60  # раздел короче этого — фактически пустая заглушка, не содержание
+
+
+async def _enforce_free_form_sections(result: str, session_data: dict) -> str:
+    """Аналог _enforce_donor_structure ниже, но для универсальной структуры
+    (когда официальной формы донора не нашлось) — проверяет, что каждый из
+    обязательных разделов, перечисленных в инструкции generate_final_document,
+    реально присутствует И содержит содержательный текст, а не голый
+    заголовок. При обнаружении пропусков — ОДНА попытка исправления с явным
+    списком того, что нужно дописать (тот же паттерн, не бесконечный цикл)."""
+    sections = _split_into_sections(result)
+    missing = []
+    for label, keywords in FREE_FORM_REQUIRED_SECTIONS:
+        body = None
+        for heading, section_body in sections:
+            if any(kw in heading.lower() for kw in keywords):
+                body = section_body
+                break
+        if body is None or len(body) < MIN_SECTION_CHARS:
+            missing.append(label)
+
+    if not missing:
+        return result
+
+    logger.warning(
+        "generate_final_document: свободная структура — раздел(ы) отсутствуют или почти пусты: %s",
+        missing,
+    )
+    fix_prompt = (
+        f"{SYSTEM_PROMPT}\n\nТы только что собрал документ, но в нём отсутствуют "
+        f"или почти пусты (заголовок есть, а содержания нет) эти обязательные "
+        f"разделы: {', '.join(missing)}.\n\n"
+        f"Перепиши документ ЗАНОВО целиком, обязательно включив содержательный "
+        f"текст (не заглушку) в КАЖДЫЙ из этих разделов — если реальных данных "
+        f"по разделу нет, пиши предложения целиком с XYZ-плейсхолдерами на месте "
+        f"конкретных цифр/фактов (см. правило плейсхолдеров), но НЕ оставляй "
+        f"раздел пустым и не пропускай его."
+        f"{doc_language_clause(session_data)}"
+    )
+    try:
+        fixed = await call_claude_required(
+            fix_prompt, f"Предыдущая (неполная) версия:\n{result[:6000]}", max_tokens=8000,
+        )
+        if await is_actual_document(fixed):
+            return fixed
+    except LLMEmptyResponseError:
+        pass
+    return result
 
 
 async def _enforce_donor_structure(result: str, donor_template: str, session_data: dict) -> str:

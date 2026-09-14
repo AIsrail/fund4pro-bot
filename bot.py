@@ -8,6 +8,7 @@ from aiogram.types import ErrorEvent
 import config
 import agent_router
 from handlers import payments_handlers
+from update_dedup import DedupMiddleware
 
 logger = logging.getLogger("fund4pro.bot")
 
@@ -44,6 +45,12 @@ async def main():
 
     bot = Bot(token=config.BOT_TOKEN)
     dp = Dispatcher(storage=_build_storage())
+
+    # Защита от повторной обработки одного и того же update_id (см.
+    # update_dedup.py) — закрывает наиболее вероятный триггер бага, когда
+    # один и тот же апдейт (например файл от пользователя) отрабатывался
+    # дважды параллельно и второй ответ агента противоречил первому.
+    dp.update.outer_middleware(DedupMiddleware())
 
     # РЕДИЗАЙН (v3): единый агентный роутер вместо ~13 файлов handlers/*.py,
     # каждый из которых был изолированным FSM-шагом с узким LLM-промптом на

@@ -270,6 +270,34 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
         session["_pending_file_attachments"] = pending
         return f"Файл(ы) шаблона донора ({sent_count} шт.) прикреплены и отправляются пользователю в чат."
 
+    if name == "search_project_data":
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return "Ошибка: не указан поисковый запрос"
+        from data_search import try_search_statistics, format_results_for_prompt
+        try:
+            results = await try_search_statistics(query)
+        except Exception as exc:
+            logger.warning("search_project_data failed: %s: %s", type(exc).__name__, exc)
+            return (
+                "Поиск данных сейчас не сработал технически — сообщи пользователю "
+                "честно и используй XYZ-плейсхолдер вместо выдуманной цифры."
+            )
+        if not results:
+            return (
+                f"По запросу '{query}' живых данных в открытом поиске не нашлось. "
+                "Не выдумывай цифру — используй правило XYZ-плейсхолдеров и скажи "
+                "пользователю прямо, что не нашёл живых данных по этой теме, "
+                "предложи прислать свои источники, если есть."
+            )
+        formatted = format_results_for_prompt(results)
+        return (
+            f"Найдено по запросу '{query}' (best-effort веб-поиск, источники "
+            f"НЕ верифицированы — прежде чем использовать конкретную цифру, "
+            f"явно укажи источник рядом с ней в тексте, и предупреди пользователя, "
+            f"что цифру стоит перепроверить перед подачей):\n{formatted}"
+        )
+
     if name == "find_matching_grants":
         query = str(args.get("query") or "").strip()
         from connect4pro_catalog import search_matching_grants
@@ -527,6 +555,7 @@ FOLLOWUP_TOOLS = {
     "select_donor_form",
     "generate_document",
     "find_matching_grants",
+    "search_project_data",
 }
 
 
@@ -570,6 +599,60 @@ def _is_empty_promise(text: str | None) -> bool:
     return False
 
 
+MAX_HISTORY_MESSAGES = 60
+MAX_HISTORY_CHARS = 60000  # ~15k токенов с запасом — держит счёт токенов провайдера в разумных пределах
+
+
+def _message_len(m: dict) -> int:
+    content = m.get("content")
+    total = len(content) if isinstance(content, str) else 0
+    for tc in m.get("tool_calls", []) or []:
+        total += len(json.dumps(tc, ensure_ascii=False))
+    return total
+
+
+def _trim_history(history: list[dict]) -> None:
+    """Обрезает историю диалога спереди (старые ходы), когда она разрастается
+    сверх разумного объёма — БЕЗ потери фактов: build_system_prompt заново
+    вставляет ЖИВОЙ снепшот project_data в каждый системный промпт (см.
+    build_system_prompt), так что все сохранённые факты видны модели
+    независимо от истории. История нужна только для тона/непрерывности
+    разговора, поэтому её можно безопасно укорачивать.
+
+    РЕАЛЬНЫЙ РИСК ("бот то читает, то не может читать содержимое чата"):
+    history_openai раньше рос без ограничений весь срок сессии — с
+    полными текстами загруженных файлов (до 8000 симв. каждый) и
+    результатами fetch_donor_page/search_project_data в истории, длинная
+    сессия легко перерастала контекст провайдера, и в зависимости от того,
+    какой провайдер (DeepSeek/Anthropic/Gemini) в этот момент отвечал —
+    поведение "помнит/не помнит" становилось непредсказуемым.
+
+    Режем ТОЛЬКО по границе хода (role == "user"), чтобы никогда не
+    разорвать пару tool_calls/tool-result — разрыв такой пары ломает формат
+    запроса у обоих провайдеров."""
+    if len(history) <= MAX_HISTORY_MESSAGES and sum(_message_len(m) for m in history) <= MAX_HISTORY_CHARS:
+        return
+
+    # Всегда оставляем хотя бы последние MAX_HISTORY_MESSAGES сообщений целиком,
+    # и режем дополнительно с начала, пока не уложимся в char-бюджет.
+    cut = max(0, len(history) - MAX_HISTORY_MESSAGES)
+    while cut < len(history) and history[cut].get("role") != "user":
+        cut += 1
+
+    remaining_chars = sum(_message_len(m) for m in history[cut:])
+    while remaining_chars > MAX_HISTORY_CHARS and cut < len(history) - 1:
+        removed = history[cut]
+        next_cut = cut + 1
+        while next_cut < len(history) and history[next_cut].get("role") != "user":
+            next_cut += 1
+        remaining_chars -= sum(_message_len(m) for m in history[cut:next_cut])
+        cut = next_cut
+
+    if cut > 0:
+        logger.info("Обрезаю историю диалога: удаляю %d старых сообщений (осталось %d)", cut, len(history) - cut)
+        del history[:cut]
+
+
 async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
     """Главная точка входа — один ход диалога: добавляет сообщение
     пользователя, крутит цикл модель<->инструменты до финального текстового
@@ -583,6 +666,7 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
 
     history = session.setdefault("history_openai", [])  # плоский OpenAI-формат, провайдеро-независимый
     history.append({"role": "user", "content": user_text})
+    _trim_history(history)
 
     tool_log: list[str] = []
     document_ready = False
