@@ -1149,6 +1149,16 @@ async def generate_final_document(session_data: dict) -> str:
             f"{doc_language_clause(session_data)}"
         )
     result = await call_claude_required(system_prompt, _session_summary(session_data), max_tokens=8000)
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ: длинная форма донора (много таблиц/разделов, каждый
+    # по 150-200 слов) иногда упиралась в max_tokens=8000 и обрывалась
+    # посреди слова ('...в сёлах Са') — тот же класс бага уже чинили в
+    # extract_donor_template_structure тем же приёмом: один повтор с
+    # увеличенным лимитом, если текст выглядит явно оборванным.
+    if len(result) > 2000 and not result.rstrip().endswith((".", "!", "?", '"', "»", ":", ")")):
+        logger.warning("generate_final_document: response looks truncated, retrying with higher max_tokens")
+        retried = await call_claude_required(system_prompt, _session_summary(session_data), max_tokens=16000)
+        if len(retried) >= len(result):
+            result = retried
     if donor_template:
         # РЕАЛЬНЫЙ ИНЦИДЕНТ: несмотря на явную инструкцию "заполни ЭТУ форму
         # ДОСЛОВНО, буква в букву", модель всё равно 'улучшала' структуру
@@ -1540,6 +1550,107 @@ RED_FLAG_SYSTEM_PROMPT = f"""
 ошибку "для галочки" — отмечай только реальные, конкретные проблемы,
 которые видны непосредственно в тексте.
 """.strip()
+
+
+_DONOR_ONLY_FIELD_MARKERS = (
+    "заполняется гдф", "заполняется ггф", "заполняется донором",
+    "заполняется фондом", "заполняется адвайзером", "office use only",
+    "for office use", "рекомендующий адвайзер", "заполняется организатором",
+)
+
+
+def looks_like_applicant_field(label: str) -> bool:
+    """Явный фильтр ДО обращения к модели: поля, которые по формулировке
+    метки однозначно не предназначены для заполнения заявителем (адвайзер
+    донора, служебные пометки) — не передаём их модели вообще, чтобы даже
+    не рисковать, что она всё-таки что-то туда впишет."""
+    l = label.strip().lower()
+    if not l or len(l) < 4:
+        return False
+    return not any(m in l for m in _DONOR_ONLY_FIELD_MARKERS)
+
+
+async def fill_missing_donor_fields(
+    kv_labels: list[str], section_questions: list[str], session_data: dict
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Один LLM-вызов, отвечающий на поля/вопросы формы донора, которые
+    детерминированный fuzzy-матчинг в docx_template_fill.py не смог
+    сопоставить ни с одним фрагментом уже сгенерированного текста заявки.
+
+    РЕАЛЬНЫЙ ИНЦИДЕНТ: до этой функции такие поля молча оставались
+    пустыми в финальном .docx (find_best_kv_match/find_best_section_match
+    возвращали None -> ячейка просто не трогалась) — несмотря на то что
+    системный промпт прямо запрещает оставлять недостающие данные пустыми
+    (правило XYZ-плейсхолдеров). Разрыв был не в самом правиле, а в том,
+    что правило применялось только к markdown-тексту, а финальная вставка
+    в РЕАЛЬНЫЙ .docx-файл донора — отдельный, чисто механический fuzzy-matching
+    шаг, который о правиле плейсхолдеров вообще не знал.
+
+    Возвращает (key_values, sections) в тех же форматах, что и
+    parse_markdown_fields_and_sections, готовые к слиянию перед повторным
+    прицельным проходом заполнения только этих ранее пустых ячеек."""
+    kv_labels = [l for l in kv_labels if looks_like_applicant_field(l)]
+    section_questions = [q for q in section_questions if looks_like_applicant_field(q)]
+    if not kv_labels and not section_questions:
+        return {}, {}
+
+    items = [f"KV{i}: {lbl}" for i, lbl in enumerate(kv_labels)]
+    items += [f"SEC{i}: {q}" for i, q in enumerate(section_questions)]
+
+    system_prompt = (
+        f"{SYSTEM_PROMPT}\n\nТебе дан список полей/вопросов ОРИГИНАЛЬНОЙ формы "
+        f"донора, которые остались незаполненными после автоматического "
+        f"сопоставления с уже сгенерированным текстом заявки. Для КАЖДОГО "
+        f"пункта дай короткий ответ (1 предложение для KV-полей, 1-3 "
+        f"предложения для SEC-вопросов) на основе контекста проекта ниже.\n\n"
+        f"ВАЖНО:\n"
+        f"- Следуй правилу XYZ-плейсхолдеров для любых недостающих цифр/дат/"
+        f"фактов — НИКОГДА не выдумывай правдоподобное число или дату.\n"
+        f"- Если пункт ЯВНО не предназначен для заполнения заявителем (метка "
+        f"вроде 'для служебного использования', поле подписи/адвайзера "
+        f"донора) — верни для него пустую строку \"\", не выдумывай ответ.\n"
+        f"- Если пункт — чекбокс-категория без содержательного вопроса рядом "
+        f"(например одно слово 'Женщины:' само по себе, без остального "
+        f"текста вопроса о количестве) — тоже верни \"\".\n\n"
+        f"Контекст проекта:\n{_session_summary(session_data)}\n\n"
+        f'Верни СТРОГО валидный JSON без markdown-обрамления: {{"KV0": "...", '
+        f'"SEC1": "..."}} — по одному ключу на каждый пункт из списка ниже '
+        f"(даже если значение — пустая строка)."
+    )
+    user_message = "\n".join(items)
+
+    try:
+        raw = await call_claude(system_prompt, user_message, max_tokens=3000)
+    except Exception as exc:
+        logger.warning("fill_missing_donor_fields: call_claude failed: %s: %s", type(exc).__name__, exc)
+        return {}, {}
+
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            raise ValueError("no JSON object found in response")
+        parsed = json.loads(raw[start:end + 1])
+        if not isinstance(parsed, dict):
+            raise ValueError("unexpected shape")
+    except Exception as exc:
+        logger.warning(
+            "fill_missing_donor_fields: JSON parse failed: %s: %s | raw[:200]=%r",
+            type(exc).__name__, exc, raw[:200],
+        )
+        return {}, {}
+
+    key_values: dict[str, str] = {}
+    sections: dict[str, str] = {}
+    for i, lbl in enumerate(kv_labels):
+        val = str(parsed.get(f"KV{i}", "") or "").strip()
+        if val:
+            key_values[lbl] = val
+    for i, q in enumerate(section_questions):
+        val = str(parsed.get(f"SEC{i}", "") or "").strip()
+        if val:
+            sections[q] = val
+    return key_values, sections
 
 
 async def check_red_flags(document_text: str, session_data: dict) -> dict:

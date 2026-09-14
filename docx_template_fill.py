@@ -161,11 +161,38 @@ def find_best_section_match(cell_text: str, sections: dict[str, str]) -> str | N
     return None
 
 
-def fill_donor_docx_template(template_path: str, markdown_text: str, output_path: str, session: dict | None = None) -> bool:
+def _fill_cell(target, val: str) -> None:
+    target.text = val
+    for p in target.paragraphs:
+        for r in p.runs:
+            r.font.name = "Times New Roman"
+            r.font.size = Pt(10.5)
+
+
+def _append_section(cell, content: str) -> None:
+    p = cell.add_paragraph()
+    p.paragraph_format.space_before = Pt(6)
+    p.paragraph_format.line_spacing = 1.15
+    run = p.add_run(f"\n{content}")
+    run.font.name = "Times New Roman"
+    run.font.size = Pt(11)
+
+
+async def fill_donor_docx_template(template_path: str, markdown_text: str, output_path: str, session: dict | None = None) -> bool:
     """Открывает оригинальный docx-файл донора, находит пустые ячейки после
     соответствующих меток или поля ввода и заполняет их, сохраняя 100%
     оригинальной верстки (таблицы, шрифты, колонтитулы).
-    Возвращает True ТОЛЬКО если форма реально заполнена содержанием."""
+    Возвращает True ТОЛЬКО если форма реально заполнена содержанием.
+
+    ДВА ПРОХОДА: первый — дешёвый детерминированный fuzzy-matching по тексту,
+    который уже сгенерировала модель (find_best_kv_match/find_best_section_match).
+    РЕАЛЬНЫЙ ИНЦИДЕНТ: поля/вопросы формы, для которых matching не нашёл
+    совпадения, раньше молча оставались пустыми — 'Финансовое положение',
+    'Когда организация была создана', детальный бюджет и т.п. пропадали из
+    итогового файла, хотя правило XYZ-плейсхолдеров прямо запрещает
+    оставлять недостающее пустым. Второй проход — один батч-запрос к модели
+    (llm.fill_missing_donor_fields) ТОЛЬКО по тому, что осталось пустым
+    после первого прохода, с явным исключением полей донора/чекбоксов."""
     try:
         doc = docx.Document(template_path)
     except Exception as e:
@@ -210,6 +237,13 @@ def fill_donor_docx_template(template_path: str, markdown_text: str, output_path
     filled_count = 0
     filled_sections_count = 0
 
+    # Проход 1: детерминированный fuzzy-matching. Для всего, что НЕ нашло
+    # соответствия, запоминаем метку/вопрос И саму ячейку-мишень — чтобы во
+    # втором проходе не пересканировать документ заново, а точечно
+    # дозаполнить именно эти ячейки.
+    unmatched_kv: list[tuple[str, "docx.table._Cell"]] = []
+    unmatched_sections: list[tuple[str, "docx.table._Cell"]] = []
+
     for table in doc.tables:
         for row in table.rows:
             # Получаем уникальные ячейки строки (исключаем дубликаты объединённых ячеек)
@@ -228,13 +262,10 @@ def fill_donor_docx_template(template_path: str, markdown_text: str, output_path
                     if j + 1 < len(unique_cells) and not unique_cells[j + 1].text.strip():
                         val = find_best_kv_match(lbl, key_values)
                         if val:
-                            target = unique_cells[j + 1]
-                            target.text = val
-                            for p in target.paragraphs:
-                                for r in p.runs:
-                                    r.font.name = "Times New Roman"
-                                    r.font.size = Pt(10.5)
+                            _fill_cell(unique_cells[j + 1], val)
                             filled_count += 1
+                        else:
+                            unmatched_kv.append((lbl, unique_cells[j + 1]))
 
             # Случай Б: 1-ячеечная таблица с развёрнутым вопросом (Таблицы 5, 6, 7, 8, 9, 10, 12, 13)
             elif len(unique_cells) == 1:
@@ -242,14 +273,38 @@ def fill_donor_docx_template(template_path: str, markdown_text: str, output_path
                 matched_content = find_best_section_match(cell.text, sections)
 
                 if matched_content and matched_content not in cell.text:
-                    p = cell.add_paragraph()
-                    p.paragraph_format.space_before = Pt(6)
-                    p.paragraph_format.line_spacing = 1.15
-                    run = p.add_run(f"\n{matched_content}")
-                    run.font.name = "Times New Roman"
-                    run.font.size = Pt(11)
+                    _append_section(cell, matched_content)
                     filled_count += 1
                     filled_sections_count += 1
+                elif not matched_content:
+                    unmatched_sections.append((cell.text.strip(), cell))
+
+    # Проход 2: один батч-запрос к модели только по тому, что осталось
+    # пустым — см. РЕАЛЬНЫЙ ИНЦИДЕНТ в llm.fill_missing_donor_fields.
+    if (unmatched_kv or unmatched_sections) and session is not None:
+        from llm import fill_missing_donor_fields
+
+        kv_labels = [lbl for lbl, _ in unmatched_kv]
+        section_questions = [q for q, _ in unmatched_sections]
+        extra_kv, extra_sections = await fill_missing_donor_fields(kv_labels, section_questions, session)
+
+        for lbl, target in unmatched_kv:
+            val = extra_kv.get(lbl)
+            if val:
+                _fill_cell(target, val)
+                filled_count += 1
+
+        for q, cell in unmatched_sections:
+            content = extra_sections.get(q)
+            if content:
+                _append_section(cell, content)
+                filled_count += 1
+                filled_sections_count += 1
+
+        logger.info(
+            "fill_donor_docx_template: second pass answered %d/%d missing kv fields and %d/%d missing sections",
+            len(extra_kv), len(unmatched_kv), len(extra_sections), len(unmatched_sections),
+        )
 
     logger.info("fill_donor_docx_template filled %d fields and %d sections in %s",
                 filled_count, filled_sections_count, template_path)

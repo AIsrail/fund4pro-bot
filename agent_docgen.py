@@ -102,7 +102,7 @@ async def export_docx(text: str, session: dict) -> str:
         donor_doc_path = session.get("donor_template_file_path")
 
     if donor_doc_path and os.path.exists(donor_doc_path):
-        success = fill_donor_docx_template(donor_doc_path, text, path, session=session)
+        success = await fill_donor_docx_template(donor_doc_path, text, path, session=session)
         if success:
             logger.info("Successfully populated chosen donor template docx: %s", donor_doc_path)
             return path
