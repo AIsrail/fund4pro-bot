@@ -411,8 +411,15 @@ async def _send_docx(message: Message, text: str, session: dict) -> None:
 
     try:
         async with show_working(message, "📄 Формирую Word-файл..."):
-            path = await export_docx(text, session)
+            path, official_template = await export_docx(text, session)
         await message.answer_document(FSInputFile(path))
+        if not official_template:
+            await message.answer(
+                "⚠️ Не смог заполнить именно оригинальный файл формы донора (он не найден в текущей "
+                "сессии — например, после перезапуска бота) — выше документ с тем же содержанием, но "
+                "собранный в свободном формате. Пришли ещё раз файл шаблона донора, и я соберу заявку "
+                "строго в нём, прежде чем отправлять донору."
+            )
     except Exception as e:
         logger.exception("Failed to export/send docx: %s", e)
         await message.answer("⚠️ Не удалось собрать .docx файл. Попробуй ещё раз написать 'собери документ'.")

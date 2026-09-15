@@ -9,6 +9,7 @@
 на Gemini, тем же путём, что и llm.call_claude.
 """
 
+import base64
 import json
 import logging
 
@@ -94,6 +95,16 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
                     "path": path,
                     "text": f.get("text", ""),
                     "url": f.get("url", ""),
+                    # РЕАЛЬНЫЙ ИНЦИДЕНТ: Render free-tier стирает локальный
+                    # диск при каждом засыпании/рестарте контейнера, а
+                    # session (FSM data) хранится в Redis и переживает
+                    # рестарт. save_donor_form пишет файл ТОЛЬКО на диск —
+                    # после рестарта export_docx находит path в session, но
+                    # самого файла там больше нет, и бот молча откатывается
+                    # на generate-with-markdown (документ уже не в форме
+                    # донора). Храним сами байты здесь же, в session, как
+                    # запасной источник восстановления файла.
+                    "content_b64": base64.b64encode(content).decode("ascii"),
                 }
                 saved_files.append(f_entry)
                 pending_att.append({
@@ -179,7 +190,10 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
                             txt = ""
                         if txt.strip():
                             clean_fn = fn.split("_", 1)[-1] if "_" in fn else fn
-                            candidates.append({"filename": clean_fn, "path": p, "text": txt})
+                            candidates.append({
+                                "filename": clean_fn, "path": p, "text": txt,
+                                "content_b64": base64.b64encode(raw).decode("ascii"),
+                            })
                     except Exception:
                         pass
         if not candidates:
@@ -229,6 +243,20 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
             session["chosen_donor_form"] = chosen.get("filename")
             # Сохраняем путь к выбранному файлу для export_docx
             session["chosen_donor_form_path"] = chosen.get("path")
+            # export_docx ищет файл по filename именно в saved_donor_files —
+            # если chosen пришёл из donor_form_candidates или дискового кэша
+            # (не из saved_donor_files), его там ещё нет. Прописываем/
+            # обновляем запись, чтобы path и content_b64 (переживающий
+            # рестарт контейнера, в отличие от локального диска) были
+            # доступны экспорту независимо от того, откуда взят выбор.
+            saved_files = session.get("saved_donor_files", [])
+            for i, sf in enumerate(saved_files):
+                if sf.get("filename") == chosen.get("filename"):
+                    saved_files[i] = {**sf, **chosen}
+                    break
+            else:
+                saved_files.append(chosen)
+            session["saved_donor_files"] = saved_files
             return (
                 f"Выбрана форма '{chosen.get('filename')}'. Её официальная структура извлечена и сохранена в donor_template:\n"
                 f"{structure[:1500]}\n\n"

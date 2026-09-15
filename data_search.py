@@ -5,15 +5,21 @@
 Раньше был единственный источник (DuckDuckGo HTML) — часто блокируется/
 ограничивается, из-за чего бот выглядел так, будто "зацикливается на одних
 и тех же стандартных сайтах" (на деле — просто не находил ничего живого и
-молча возвращал пустой список). Теперь пробуем несколько независимых
-бесплатных источников по очереди (без API-ключей): DuckDuckGo HTML,
-Startpage (использует тот же индекс Google, другой фронтенд, реже
-блокируется) и Wikipedia REST API (для базовых статистических/справочных
-фактов о странах/регионах/явлениях). Все источники best-effort — при
-неудаче каждого пробуем следующий, при неудаче всех возвращаем пустой
-список, вызывающий код обязан явно пометить данные как оценку (§4.3
-плейбука), а не выдавать их как измеренный факт.
-"""
+молча возвращал пустой список). Особенно на Render (общий пул IP облачных
+хостингов, который поисковики банят агрессивнее, чем обычный домашний IP) —
+поэтому один и тот же запрос то находит что-то, то нет: не баг в логике, а
+непостоянная антибот-блокировка конкретного источника в конкретный момент.
+
+Теперь пробуем НЕСКОЛЬКО независимых бесплатных источников по очереди (без
+API-ключей): несколько публичных инстансов SearXNG (метапоисковик поверх
+Google/Bing/Brave и др., отдаёт JSON, обычно держит облачные IP лучше, чем
+голый DuckDuckGo-скрейпинг — пробуем несколько инстансов, т.к. отдельный
+инстанс тоже может быть недоступен), DuckDuckGo HTML, Startpage (тот же
+индекс Google, другой фронтенд), Wikipedia REST API и Wikidata (структурные
+факты о странах/регионах/явлениях, почти никогда не блокируются). Все
+источники best-effort — при неудаче каждого пробуем следующий, при неудаче
+всех возвращаем пустой список, вызывающий код обязан явно пометить данные
+как оценку (§4.3 плейбука), а не выдавать их как измеренный факт."""
 
 import httpx
 from bs4 import BeautifulSoup
@@ -21,6 +27,17 @@ from bs4 import BeautifulSoup
 DDG_URL = "https://html.duckduckgo.com/html/"
 STARTPAGE_URL = "https://www.startpage.com/sp/search"
 WIKIPEDIA_SEARCH_URL = "https://ru.wikipedia.org/w/api.php"
+WIKIDATA_SEARCH_URL = "https://www.wikidata.org/w/api.php"
+
+# Публичные инстансы SearXNG с открытым JSON-выводом (searx.space). Список
+# инстансов время от времени меняется/умирает — поэтому пробуем несколько
+# подряд вместо одного жёстко заданного, и это best-effort, а не гарантия.
+SEARXNG_INSTANCES = [
+    "https://searx.be",
+    "https://search.inetol.net",
+    "https://priv.au",
+    "https://baresearch.org",
+]
 
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -32,11 +49,47 @@ async def try_search_statistics(query: str, max_results: int = 5) -> list[dict]:
     который дал хоть что-то. Пустой список только если ВСЕ источники
     неудачны — вызывающий код должен воспринимать это как "не нашёл", а не
     падать."""
-    for search_fn in (_search_duckduckgo, _search_startpage, _search_wikipedia, _search_crawl4ai):
+    for search_fn in (
+        _search_searxng,
+        _search_duckduckgo,
+        _search_startpage,
+        _search_wikipedia,
+        _search_wikidata,
+        _search_crawl4ai,
+    ):
         try:
             results = await search_fn(query, max_results)
         except Exception:
             results = []
+        if results:
+            return results
+    return []
+
+
+async def _search_searxng(query: str, max_results: int) -> list[dict]:
+    """Метапоисковик поверх нескольких обычных движков сразу (Google, Bing,
+    Brave и др.) — если один инстанс недоступен/ограничен, пробуем
+    следующий, прежде чем сдаться в пользу голого DuckDuckGo-скрейпинга."""
+    for base_url in SEARXNG_INSTANCES:
+        try:
+            async with httpx.AsyncClient(timeout=8, follow_redirects=True, headers=_HEADERS) as client:
+                resp = await client.get(f"{base_url}/search", params={
+                    "q": query, "format": "json", "language": "ru",
+                })
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception:
+            continue
+        results = []
+        for item in (data.get("results") or [])[:max_results]:
+            title = item.get("title", "")
+            if not title:
+                continue
+            results.append({
+                "title": title,
+                "url": item.get("url", ""),
+                "snippet": item.get("content", ""),
+            })
         if results:
             return results
     return []
@@ -103,6 +156,34 @@ async def _search_wikipedia(query: str, max_results: int) -> list[dict]:
             "title": title,
             "url": f"https://ru.wikipedia.org/wiki/{title.replace(' ', '_')}",
             "snippet": snippet,
+        })
+    return results
+
+
+async def _search_wikidata(query: str, max_results: int) -> list[dict]:
+    """Ещё один почти никогда не блокируемый источник структурных фактов
+    (население, площадь, официальные показатели стран/регионов/организаций)
+    — резерв на случай, когда и обычный веб-поиск, и русская Wikipedia не
+    дали ничего по запросу."""
+    async with httpx.AsyncClient(timeout=10, headers=_HEADERS) as client:
+        resp = await client.get(WIKIDATA_SEARCH_URL, params={
+            "action": "wbsearchentities",
+            "search": query,
+            "language": "ru",
+            "format": "json",
+            "limit": max_results,
+        })
+        resp.raise_for_status()
+        data = resp.json()
+    results = []
+    for item in data.get("search", []):
+        label = item.get("label", "")
+        if not label:
+            continue
+        results.append({
+            "title": label,
+            "url": item.get("concepturi", ""),
+            "snippet": item.get("description", ""),
         })
     return results
 

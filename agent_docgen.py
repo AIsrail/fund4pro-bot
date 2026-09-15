@@ -71,11 +71,17 @@ async def _run_red_flags_gate(text: str, session_data: dict) -> str:
     return fixed
 
 
-async def export_docx(text: str, session: dict) -> str:
-    """Рендерит текст в .docx и возвращает путь к временному файлу.
+async def export_docx(text: str, session: dict) -> tuple[str, bool]:
+    """Рендерит текст в .docx и возвращает (путь_к_файлу, official_template).
     Если в сессии выбран конкретный файл формы донора (chosen_donor_form
     + saved_donor_files) — заполняет поля прямо внутри этого файла,
-    сохраняя все 100% таблиц, стилей и логотипов донора без изменений."""
+    сохраняя все 100% таблиц, стилей и логотипов донора без изменений.
+    official_template=False значит, что реальный файл донора был ожидаем
+    (has_donor_template), но недоступен/не смог быть заполнен — итоговый
+    .docx лишь имитирует структуру формы обычным текстом, и вызывающий код
+    должен явно предупредить пользователя, что это не тот файл, который
+    примет донор."""
+    import base64
     import os
     import tempfile
     from docgen import markdown_to_docx
@@ -90,22 +96,49 @@ async def export_docx(text: str, session: dict) -> str:
 
     # Ищем путь к ВЫБРАННОМУ пользователем/моделью файлу формы донора
     donor_doc_path = None
+    donor_entry = None
     chosen_fn = session.get("chosen_donor_form")
     if chosen_fn:
         for f in session.get("saved_donor_files", []):
             if f.get("filename") == chosen_fn:
+                donor_entry = f
                 donor_doc_path = f.get("path")
                 break
 
-    # Fallback: если выбор не сохранён, но есть donor_template_file_path (старая логика)
+    # Fallback: если выбор не сохранён, но есть chosen_donor_form_path/
+    # donor_template_file_path (старая логика)
     if not donor_doc_path:
-        donor_doc_path = session.get("donor_template_file_path")
+        donor_doc_path = session.get("chosen_donor_form_path") or session.get("donor_template_file_path")
+
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ: Render free-tier стирает локальный диск при каждом
+    # засыпании/рестарте контейнера, а session (Redis) — нет. После рестарта
+    # donor_doc_path из session указывает на файл, которого уже физически
+    # нет — раньше это молча откатывало генерацию на markdown_to_docx,
+    # который НЕ является формой донора (донор такой документ не примет).
+    # Восстанавливаем сам файл из content_b64, сохранённого прямо в session,
+    # если локальная копия пропала.
+    if (not donor_doc_path or not os.path.exists(donor_doc_path)) and donor_entry and donor_entry.get("content_b64"):
+        try:
+            raw = base64.b64decode(donor_entry["content_b64"])
+            restored_path = os.path.join(tmp_dir, donor_entry.get("filename") or "donor_template.docx")
+            with open(restored_path, "wb") as fh:
+                fh.write(raw)
+            donor_doc_path = restored_path
+            logger.info("Restored donor template from session content_b64 (local cache was gone)")
+        except Exception:
+            logger.warning("Failed to restore donor template from session content_b64", exc_info=True)
 
     if donor_doc_path and os.path.exists(donor_doc_path):
         success = await fill_donor_docx_template(donor_doc_path, text, path, session=session)
         if success:
             logger.info("Successfully populated chosen donor template docx: %s", donor_doc_path)
-            return path
+            return path, True
+        logger.warning("fill_donor_docx_template returned False for %s — falling back to markdown_to_docx", donor_doc_path)
+    elif has_donor_template:
+        logger.warning(
+            "donor_template expected but no usable file on disk/session for this session "
+            "(chosen_donor_form=%r) — falling back to markdown_to_docx", chosen_fn,
+        )
 
     markdown_to_docx(text, title, path)
-    return path
+    return path, not has_donor_template
