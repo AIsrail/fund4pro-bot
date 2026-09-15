@@ -10,6 +10,8 @@ import re
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
+from xyz_highlight import add_text_xyz_highlighted
+
 _INLINE_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _INLINE_ITALIC_RE = re.compile(r"(?<!\*)\*([^*]+?)\*(?!\*)")
 
@@ -108,7 +110,10 @@ def _render_table(doc: Document, rows: list[list[str]]) -> None:
 def _add_inline_runs(paragraph, text: str) -> None:
     """Разбивает текст на обычные/жирные/курсивные фрагменты по **/*
     маркерам markdown и добавляет их как отдельные runs — вместо того,
-    чтобы звёздочки просто попадали в текст как есть."""
+    чтобы звёздочки просто попадали в текст как есть. Любое вхождение
+    XYZ-плейсхолдера внутри любого фрагмента красится красным жирным (см.
+    xyz_highlight) — так пользователь физически видит на вычитке, что
+    нужно заменить перед подачей, а не выискивает их в сплошном тексте."""
     pos = 0
     tokens = []
     for m in _INLINE_BOLD_RE.finditer(text):
@@ -123,16 +128,14 @@ def _add_inline_runs(paragraph, text: str) -> None:
 
     for kind, chunk in tokens:
         if kind == "bold":
-            run = paragraph.add_run(chunk)
-            run.bold = True
+            add_text_xyz_highlighted(paragraph, chunk, bold=True)
             continue
         # внутри обычного фрагмента ещё может быть *курсив*
         sub_pos = 0
         for m in _INLINE_ITALIC_RE.finditer(chunk):
             if m.start() > sub_pos:
-                paragraph.add_run(chunk[sub_pos:m.start()])
-            run = paragraph.add_run(m.group(1))
-            run.italic = True
+                add_text_xyz_highlighted(paragraph, chunk[sub_pos:m.start()])
+            add_text_xyz_highlighted(paragraph, m.group(1), italic=True)
             sub_pos = m.end()
         if sub_pos < len(chunk):
-            paragraph.add_run(chunk[sub_pos:])
+            add_text_xyz_highlighted(paragraph, chunk[sub_pos:])

@@ -7,6 +7,8 @@ import logging
 import docx
 from docx.shared import Pt
 
+from xyz_highlight import add_text_xyz_highlighted
+
 logger = logging.getLogger("fund4pro.docx_template_fill")
 
 
@@ -180,20 +182,16 @@ def find_best_section_match(cell_text: str, sections: dict[str, str]) -> str | N
 
 
 def _fill_cell(target, val: str) -> None:
-    target.text = val
-    for p in target.paragraphs:
-        for r in p.runs:
-            r.font.name = "Times New Roman"
-            r.font.size = Pt(10.5)
+    target.text = ""
+    p = target.paragraphs[0] if target.paragraphs else target.add_paragraph()
+    add_text_xyz_highlighted(p, val, font_name="Times New Roman", font_size=Pt(10.5))
 
 
 def _append_section(cell, content: str) -> None:
     p = cell.add_paragraph()
     p.paragraph_format.space_before = Pt(6)
     p.paragraph_format.line_spacing = 1.15
-    run = p.add_run(f"\n{content}")
-    run.font.name = "Times New Roman"
-    run.font.size = Pt(11)
+    add_text_xyz_highlighted(p, f"\n{content}", font_name="Times New Roman", font_size=Pt(11))
 
 
 async def fill_donor_docx_template(template_path: str, markdown_text: str, output_path: str, session: dict | None = None) -> bool:
