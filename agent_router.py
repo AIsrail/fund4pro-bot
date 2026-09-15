@@ -23,6 +23,7 @@ from aiogram.types import CallbackQuery, FSInputFile, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import agent_engine
+import project_memory
 from typing_indicator import show_typing, show_working, show_live_progress
 
 router = Router()
@@ -161,6 +162,70 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("agentflow:"))
 async def choose_flow(callback: CallbackQuery, state: FSMContext):
     flow = callback.data.split(":")[1]
+
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ: раньше этот хендлер БЕЗУСЛОВНО обнулял project_data
+    # ("я то уже 2-ю неделю даю ему инфо про один и тот же конкурс и про ту
+    # же самую организацию") — единственный вход в разработку проекта всегда
+    # стартовал с чистого листа, даже если пользователь уже рассказывал
+    # об этой же организации/доноре в прошлый раз (в другой день, после
+    # рестарта Render, после "Начать заново"). Прежде чем стирать — смотрим,
+    # есть ли сохранённый снепшот прошлого проекта ТОГО ЖЕ типа (grant/bizplan).
+    last = await project_memory.load_last_project(callback.message.chat.id)
+    if last and last.get("flow") == flow and last.get("project_data"):
+        await state.set_state(Flow.active)
+        await state.update_data(_pending_resume={"flow": flow, "project_data": last["project_data"]})
+        summary = project_memory.summarize(last["project_data"])
+        msg = (
+            f"Нашёл незавершённый проект — {summary}\n\n"
+            f"Продолжить его или начать новый с чистого листа?"
+        )
+        opts = ["1. Продолжить этот проект", "2. Начать новый проект"]
+        await state.update_data(_active_quick_replies_resume=opts)
+        kb = InlineKeyboardBuilder()
+        kb.button(text=opts[0], callback_data="agent:resume:yes")
+        kb.button(text=opts[1], callback_data="agent:resume:no")
+        kb.adjust(1)
+        await callback.message.answer(msg, reply_markup=kb.as_markup())
+        await callback.answer()
+        return
+
+    await _start_fresh_flow(callback.message, state, flow)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "agent:resume:yes")
+async def resume_project_yes(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    pending = data.get("_pending_resume") or {}
+    project_data = pending.get("project_data") or {}
+    flow = pending.get("flow", "grant")
+    await state.set_state(Flow.active)
+    await state.set_data({
+        "flow": flow,
+        "ui_language": "ru",
+        "project_data": project_data,
+        "history_openai": [],
+    })
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer()
+    await _ensure_active(state)
+    await _run_turn_and_reply(
+        callback.message, state,
+        "Продолжаем этот проект. Напомни коротко, на чём мы остановились, и спроси, что делать дальше.",
+    )
+
+
+@router.callback_query(F.data == "agent:resume:no")
+async def resume_project_no(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    pending = data.get("_pending_resume") or {}
+    flow = pending.get("flow", "grant")
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer()
+    await _start_fresh_flow(callback.message, state, flow)
+
+
+async def _start_fresh_flow(message: Message, state: FSMContext, flow: str) -> None:
     await state.set_state(Flow.active)
     await state.set_data({
         "flow": flow,
@@ -184,8 +249,7 @@ async def choose_flow(callback: CallbackQuery, state: FSMContext):
         opts = ["1. Действующий бизнес", "2. Стартап с нуля", "3. Опишу текстом"]
 
     await state.update_data(_active_quick_replies=opts)
-    await callback.message.answer(msg, reply_markup=quick_reply_keyboard(opts), parse_mode="Markdown")
-    await callback.answer()
+    await message.answer(msg, reply_markup=quick_reply_keyboard(opts), parse_mode="Markdown")
 
 
 @router.callback_query(F.data == "agent:restart")
@@ -379,6 +443,20 @@ async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: st
         return
 
     await state.set_data(session)  # сохраняем актуализированные данные
+
+    # Долгоживущий снепшот (Redis, переживает /start и "Начать заново") —
+    # best-effort, не должен ронять ответ пользователю при сбое Redis.
+    # ВАЖНО: message здесь часто приходит из callback.message (нажатие
+    # кнопки) — тогда message.from_user был бы САМИМ БОТОМ (это его
+    # сообщение), а не пользователем. chat.id в приватном чате с ботом
+    # совпадает с id пользователя независимо от того, кто отправитель
+    # конкретного объекта message — используем его как надёжный ключ.
+    try:
+        await project_memory.save_last_project(
+            message.chat.id, session.get("project_data", {}), session.get("flow", "grant"),
+        )
+    except Exception:
+        logger.warning("project_memory.save_last_project failed", exc_info=True)
 
     if getattr(result, "file_attachments", None):
         for att in result.file_attachments:
