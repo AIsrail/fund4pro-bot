@@ -1149,16 +1149,48 @@ async def generate_final_document(session_data: dict) -> str:
             f"{doc_language_clause(session_data)}"
         )
     result = await call_claude_required(system_prompt, _session_summary(session_data), max_tokens=8000)
-    # РЕАЛЬНЫЙ ИНЦИДЕНТ: длинная форма донора (много таблиц/разделов, каждый
-    # по 150-200 слов) иногда упиралась в max_tokens=8000 и обрывалась
-    # посреди слова ('...в сёлах Са') — тот же класс бага уже чинили в
-    # extract_donor_template_structure тем же приёмом: один повтор с
-    # увеличенным лимитом, если текст выглядит явно оборванным.
-    if len(result) > 2000 and not result.rstrip().endswith((".", "!", "?", '"', "»", ":", ")")):
-        logger.warning("generate_final_document: response looks truncated, retrying with higher max_tokens")
-        retried = await call_claude_required(system_prompt, _session_summary(session_data), max_tokens=16000)
-        if len(retried) >= len(result):
-            result = retried
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ (жалоба держится, несмотря на прошлый фикс "один
+    # повтор с max_tokens=16000"): длинная форма донора всё равно иногда
+    # обрывается на середине ('...в сёлах Са', позже целиком пропадали
+    # КОНТЕКСТ/ПРОЕКТ/БЮДЖЕТ — обрыв случался ещё раньше в тексте). Простое
+    # увеличение max_tokens не гарантия — у провайдера (DeepSeek, основной
+    # по конфигу) может быть собственный практический потолок длины ответа
+    # за один вызов независимо от заявленного max_tokens. Поэтому вместо
+    # повторной генерации ВСЕГО текста заново — просим модель ПРОДОЛЖИТЬ
+    # ровно с того места, где оборвалось (через history), и приклеиваем
+    # результат: так каждый отдельный вызов производит меньше текста, чем
+    # полный документ с нуля, и не упирается в тот же потолок повторно.
+    # До 2 таких докруток — если и это не помогло, отдаём как есть,
+    # оборванный текст всё равно лучше, чем упавший с ошибкой запрос.
+    continuation_attempts = 0
+    while (
+        len(result) > 2000
+        and not result.rstrip().endswith((".", "!", "?", '"', "»", ":", ")"))
+        and continuation_attempts < 2
+    ):
+        continuation_attempts += 1
+        logger.warning(
+            "generate_final_document: response looks truncated (продолжение %d/2), прошу модель дописать",
+            continuation_attempts,
+        )
+        continuation_history = [
+            {"role": "user", "content": _session_summary(session_data)},
+            {"role": "assistant", "content": result},
+        ]
+        try:
+            continuation = await call_claude_required(
+                system_prompt,
+                "Твой предыдущий ответ оборвался на середине слова/предложения. "
+                "Продолжи СТРОГО с того места, где остановился — не повторяй уже "
+                "написанный текст, не начинай документ заново, не добавляй "
+                "вступительных фраз вроде 'продолжаю' — просто следующие слова "
+                "документа, как будто он не прерывался.",
+                history=continuation_history,
+                max_tokens=8000,
+            )
+        except LLMEmptyResponseError:
+            break
+        result = result + continuation
     if donor_template:
         # РЕАЛЬНЫЙ ИНЦИДЕНТ: несмотря на явную инструкцию "заполни ЭТУ форму
         # ДОСЛОВНО, буква в букву", модель всё равно 'улучшала' структуру
