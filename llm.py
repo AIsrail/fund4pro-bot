@@ -1056,6 +1056,56 @@ def _is_llm_refusal_text(text: str) -> bool:
     return any(marker in lowered for marker in refusal_markers)
 
 
+async def _continue_truncated_text(
+    text: str, system_prompt: str, session_data: dict, max_continuations: int = 2
+) -> str:
+    """Если text выглядит явно оборванным (длинный, не заканчивается знаком
+    препинания), просит модель ДОПИСАТЬ его с того места, где остановилась
+    (передавая text как assistant-реплику в history), вместо того чтобы
+    генерировать весь текст заново с нуля.
+
+    РЕАЛЬНЫЙ ИНЦИДЕНТ: полная регенерация "с нуля" (как раньше делали и
+    здесь, и в _enforce_donor_structure/_enforce_free_form_sections)
+    почти всегда упирается в тот же практический потолок длины ответа
+    провайдера (DeepSeek, основной по конфигу — max_tokens сам по себе не
+    гарантия) и обрывается в похожем месте повторно. Докрутка вместо
+    полного повтора производит за один вызов только НЕДОСТАЮЩИЙ хвост, а
+    не документ целиком — так каждый отдельный вызов кардинально короче и
+    не бьётся в тот же потолок. Общий helper, чтобы одна и та же логика не
+    дублировалась в трёх разных местах (основная генерация + оба фикса
+    структуры)."""
+    attempts = 0
+    while (
+        len(text) > 2000
+        and not text.rstrip().endswith((".", "!", "?", '"', "»", ":", ")"))
+        and attempts < max_continuations
+    ):
+        attempts += 1
+        logger.warning(
+            "Текст выглядит оборванным (докрутка %d/%d), прошу модель дописать с того же места",
+            attempts, max_continuations,
+        )
+        continuation_history = [
+            {"role": "user", "content": _session_summary(session_data)},
+            {"role": "assistant", "content": text},
+        ]
+        try:
+            continuation = await call_claude_required(
+                system_prompt,
+                "Твой предыдущий ответ оборвался на середине слова/предложения. "
+                "Продолжи СТРОГО с того места, где остановился — не повторяй уже "
+                "написанный текст, не начинай документ заново, не добавляй "
+                "вступительных фраз вроде 'продолжаю' — просто следующие слова "
+                "документа, как будто он не прерывался.",
+                history=continuation_history,
+                max_tokens=8000,
+            )
+        except LLMEmptyResponseError:
+            break
+        text = text + continuation
+    return text
+
+
 async def generate_final_document(session_data: dict) -> str:
     donor_template = session_data.get("donor_template", "")
     # РЕАЛЬНЫЙ ИНЦИДЕНТ: на этом шаге пользователь уже прошёл весь путь
@@ -1155,42 +1205,12 @@ async def generate_final_document(session_data: dict) -> str:
     # КОНТЕКСТ/ПРОЕКТ/БЮДЖЕТ — обрыв случался ещё раньше в тексте). Простое
     # увеличение max_tokens не гарантия — у провайдера (DeepSeek, основной
     # по конфигу) может быть собственный практический потолок длины ответа
-    # за один вызов независимо от заявленного max_tokens. Поэтому вместо
-    # повторной генерации ВСЕГО текста заново — просим модель ПРОДОЛЖИТЬ
-    # ровно с того места, где оборвалось (через history), и приклеиваем
-    # результат: так каждый отдельный вызов производит меньше текста, чем
-    # полный документ с нуля, и не упирается в тот же потолок повторно.
-    # До 2 таких докруток — если и это не помогло, отдаём как есть,
-    # оборванный текст всё равно лучше, чем упавший с ошибкой запрос.
-    continuation_attempts = 0
-    while (
-        len(result) > 2000
-        and not result.rstrip().endswith((".", "!", "?", '"', "»", ":", ")"))
-        and continuation_attempts < 2
-    ):
-        continuation_attempts += 1
-        logger.warning(
-            "generate_final_document: response looks truncated (продолжение %d/2), прошу модель дописать",
-            continuation_attempts,
-        )
-        continuation_history = [
-            {"role": "user", "content": _session_summary(session_data)},
-            {"role": "assistant", "content": result},
-        ]
-        try:
-            continuation = await call_claude_required(
-                system_prompt,
-                "Твой предыдущий ответ оборвался на середине слова/предложения. "
-                "Продолжи СТРОГО с того места, где остановился — не повторяй уже "
-                "написанный текст, не начинай документ заново, не добавляй "
-                "вступительных фраз вроде 'продолжаю' — просто следующие слова "
-                "документа, как будто он не прерывался.",
-                history=continuation_history,
-                max_tokens=8000,
-            )
-        except LLMEmptyResponseError:
-            break
-        result = result + continuation
+    # за один вызов независимо от заявленного max_tokens — см.
+    # _continue_truncated_text ниже для той же докрутки, применённой ЕЩЁ
+    # РАЗ после _enforce_donor_structure/_enforce_free_form_sections, чьи
+    # собственные "перепиши заново" фиксы иначе рискуют перезаписать уже
+    # дописанный текст свежим обрывом на том же самом месте.
+    result = await _continue_truncated_text(result, system_prompt, session_data)
     if donor_template:
         # РЕАЛЬНЫЙ ИНЦИДЕНТ: несмотря на явную инструкцию "заполни ЭТУ форму
         # ДОСЛОВНО, буква в букву", модель всё равно 'улучшала' структуру
@@ -1324,6 +1344,7 @@ async def _enforce_free_form_sections(result: str, session_data: dict) -> str:
         fixed = await call_claude_required(
             fix_prompt, f"Предыдущая (неполная) версия:\n{result[:6000]}", max_tokens=8000,
         )
+        fixed = await _continue_truncated_text(fixed, fix_prompt, session_data)
         if await is_actual_document(fixed):
             return fixed
     except LLMEmptyResponseError:
@@ -1360,9 +1381,10 @@ async def _enforce_donor_structure(result: str, donor_template: str, session_dat
             f"{doc_language_clause(session_data)}"
         )
         try:
-            return await call_claude_required(
+            fixed = await call_claude_required(
                 fix_prompt, f"Предыдущий (неполный) перевод:\n{result[:6000]}", max_tokens=8000,
             )
+            return await _continue_truncated_text(fixed, fix_prompt, session_data)
         except LLMEmptyResponseError:
             return result
 
@@ -1405,7 +1427,7 @@ async def _enforce_donor_structure(result: str, donor_template: str, session_dat
             f"Предыдущий (неверный по структуре) результат:\n{result[:6000]}",
             max_tokens=8000,
         )
-        return fixed
+        return await _continue_truncated_text(fixed, fix_prompt, session_data)
     except LLMEmptyResponseError:
         # Не можем исправить — лучше вернуть исходный результат, чем упасть
         # с ошибкой на этапе, где документ технически уже есть.
