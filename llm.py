@@ -1057,7 +1057,7 @@ def _is_llm_refusal_text(text: str) -> bool:
 
 
 async def _continue_truncated_text(
-    text: str, system_prompt: str, session_data: dict, max_continuations: int = 2
+    text: str, system_prompt: str, session_data: dict, max_continuations: int = 5
 ) -> str:
     """Если text выглядит явно оборванным (длинный, не заканчивается знаком
     препинания), просит модель ДОПИСАТЬ его с того места, где остановилась
