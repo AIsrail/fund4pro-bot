@@ -332,72 +332,69 @@ async def call_claude(
     user_message: str,
     history: list[dict] | None = None,
     max_tokens: int = 2000,
+    prefer_anthropic: bool = False,
 ) -> str:
-    # Приоритетно используем DeepSeek (быстро, надежно и с активным балансом)
-    if _deepseek_client:
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ: на длинных генерациях (финальный документ по форме
+    # донора, ~15 разделов) DeepSeek (приоритетный провайдер) стабильно
+    # обрывал ответ на середине заметно раньше запрошенного max_tokens — не
+    # ошибка (текст непустой, вызов формально успешен), а просто короткий
+    # ответ, поэтому обычный "фоллбэк при сбое" здесь не срабатывал вообще.
+    # Несколько слоёв докрутки/разбиения на части смягчили, но не убрали
+    # проблему полностью. prefer_anthropic переставляет Anthropic (заметно
+    # надёжнее держит длину ответа на таких генерациях) на первое место —
+    # используется в generate_final_document и её докрутках/фиксах.
+    async def _try_anthropic() -> str:
+        if not config.ANTHROPIC_API_KEY:
+            return ""
         try:
-            res_text = await call_fallback_llm(
-                system_prompt=system_prompt,
-                user_message=user_message,
-                history=history,
+            messages = (history or []) + [{"role": "user", "content": user_message}]
+            response = await _client.messages.create(
+                model=config.LLM_MODEL,
                 max_tokens=max_tokens,
+                system=system_prompt,
+                messages=messages,
             )
-            if res_text.strip():
-                return res_text
-        except Exception as ds_exc:
-            logger.warning("DeepSeek in call_claude failed: %s, falling back to Anthropic", ds_exc)
-
-    try:
-        messages = (history or []) + [{"role": "user", "content": user_message}]
-        response = await _client.messages.create(
-            model=config.LLM_MODEL,
-            max_tokens=max_tokens,
-            system=system_prompt,
-            messages=messages,
-        )
-        text = "".join(block.text for block in response.content if block.type == "text")
-        if not text.strip():
-            logger.warning(
-                "call_claude got empty text: stop_reason=%s, system_len=%d, user_len=%d, max_tokens=%d",
-                getattr(response, "stop_reason", "?"), len(system_prompt), len(user_message), max_tokens,
-            )
-        else:
-            return text
-    except Exception as exc:
-        logger.warning(
-            "Primary Anthropic call failed: %s (%s). Attempting fallback provider...",
-            type(exc).__name__, exc,
-        )
-        if _fallback_client:
-            try:
-                fallback_text = await call_fallback_llm(
-                    system_prompt=system_prompt,
-                    user_message=user_message,
-                    history=history,
-                    max_tokens=max_tokens,
+            text = "".join(block.text for block in response.content if block.type == "text")
+            if not text.strip():
+                logger.warning(
+                    "call_claude(Anthropic) got empty text: stop_reason=%s, system_len=%d, user_len=%d, max_tokens=%d",
+                    getattr(response, "stop_reason", "?"), len(system_prompt), len(user_message), max_tokens,
                 )
-                if fallback_text.strip():
-                    logger.info("Successfully received answer from fallback model (%s)", config.FALLBACK_LLM_MODEL)
-                    return fallback_text
-            except Exception as fb_exc:
-                logger.error("Fallback provider also failed: %s (%s)", type(fb_exc).__name__, fb_exc)
-        # Если fallback не сработал или отсутствует, пробрасываем исходное исключение
-        raise
+            return text
+        except Exception as exc:
+            logger.warning("Anthropic call failed: %s (%s)", type(exc).__name__, exc)
+            return ""
 
-    # Если Anthropic вернул пустой текст без исключения, пробуем fallback
-    if _fallback_client:
+    async def _try_deepseek_or_gemini() -> str:
+        if not (_deepseek_client or _fallback_client):
+            return ""
         try:
-            fallback_text = await call_fallback_llm(
-                system_prompt=system_prompt,
-                user_message=user_message,
-                history=history,
-                max_tokens=max_tokens,
+            return await call_fallback_llm(
+                system_prompt=system_prompt, user_message=user_message,
+                history=history, max_tokens=max_tokens,
             )
-            if fallback_text.strip():
-                return fallback_text
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("DeepSeek/Gemini call failed: %s (%s)", type(exc).__name__, exc)
+            return ""
 
+    if prefer_anthropic:
+        order = (_try_anthropic, _try_deepseek_or_gemini)
+    elif _deepseek_client:
+        order = (_try_deepseek_or_gemini, _try_anthropic)
+    else:
+        order = (_try_anthropic, _try_deepseek_or_gemini)
+
+    last_exc: Exception | None = None
+    for attempt in order:
+        try:
+            text = await attempt()
+        except Exception as exc:  # не должно случаться (attempt-функции сами ловят исключения), но не рискуем
+            last_exc = exc
+            continue
+        if text.strip():
+            return text
+    if last_exc:
+        raise last_exc
     return ""
 
 
@@ -442,6 +439,7 @@ async def call_claude_required(
     user_message: str,
     history: list[dict] | None = None,
     max_tokens: int = 2000,
+    prefer_anthropic: bool = False,
 ) -> str:
     """Like call_claude, but retries and raises LLMEmptyResponseError
     instead of silently returning "" on an empty/failed response.
@@ -452,6 +450,11 @@ async def call_claude_required(
     generic, unrecoverable-looking error after a single retry. The actual
     exception is now logged (fund4pro.log) instead of being silently
     swallowed, so failures are diagnosable instead of a black box.
+
+    prefer_anthropic — see call_claude — passed through for long-form
+    generations where DeepSeek's shorter practical per-call output has
+    caused persistent truncation (final document generation and its
+    structure-repair follow-ups).
     """
     attempts = 3
     for attempt in range(attempts):
@@ -461,7 +464,10 @@ async def call_claude_required(
             # лимит до текстового блока), удваиваем лимит на следующей
             # попытке вместо того чтобы повторять тот же самый сбой.
             effective_max_tokens = max(max_tokens, min(max_tokens * (2 ** attempt), 16000))
-            text = await call_claude(system_prompt, user_message, history, max_tokens=effective_max_tokens)
+            text = await call_claude(
+                system_prompt, user_message, history,
+                max_tokens=effective_max_tokens, prefer_anthropic=prefer_anthropic,
+            )
         except Exception as exc:
             logger.warning(
                 "call_claude failed (attempt %d/%d): %s: %s",
@@ -1099,6 +1105,7 @@ async def _continue_truncated_text(
                 "документа, как будто он не прерывался.",
                 history=continuation_history,
                 max_tokens=8000,
+                prefer_anthropic=True,
             )
         except LLMEmptyResponseError:
             break
@@ -1222,7 +1229,7 @@ async def generate_final_document(session_data: dict) -> str:
                     "заголовок/разделы, которых здесь нет."
                 ),
             )
-            part1 = await call_claude_required(part1_prompt, _session_summary(session_data), max_tokens=8000)
+            part1 = await call_claude_required(part1_prompt, _session_summary(session_data), max_tokens=8000, prefer_anthropic=True)
             part1 = await _continue_truncated_text(part1, part1_prompt, session_data, max_continuations=3)
 
             part2_prompt = _build_donor_template_prompt(
@@ -1236,7 +1243,7 @@ async def generate_final_document(session_data: dict) -> str:
                     f"{part1[:4000]}"
                 ),
             )
-            part2 = await call_claude_required(part2_prompt, _session_summary(session_data), max_tokens=8000)
+            part2 = await call_claude_required(part2_prompt, _session_summary(session_data), max_tokens=8000, prefer_anthropic=True)
             part2 = await _continue_truncated_text(part2, part2_prompt, session_data, max_continuations=3)
 
             result = part1.rstrip() + "\n\n" + part2.lstrip()
@@ -1281,7 +1288,7 @@ async def generate_final_document(session_data: dict) -> str:
             f"формы её нужно будет перенести в неё вручную.'"
             f"{doc_language_clause(session_data)}"
         )
-    result = await call_claude_required(system_prompt, _session_summary(session_data), max_tokens=8000)
+    result = await call_claude_required(system_prompt, _session_summary(session_data), max_tokens=8000, prefer_anthropic=True)
     # РЕАЛЬНЫЙ ИНЦИДЕНТ (жалоба держится, несмотря на прошлый фикс "один
     # повтор с max_tokens=16000"): длинная форма донора всё равно иногда
     # обрывается на середине ('...в сёлах Са', позже целиком пропадали
@@ -1426,6 +1433,7 @@ async def _enforce_free_form_sections(result: str, session_data: dict) -> str:
     try:
         fixed = await call_claude_required(
             fix_prompt, f"Предыдущая (неполная) версия:\n{result[:6000]}", max_tokens=8000,
+            prefer_anthropic=True,
         )
         fixed = await _continue_truncated_text(fixed, fix_prompt, session_data)
         if await is_actual_document(fixed):
@@ -1466,6 +1474,7 @@ async def _enforce_donor_structure(result: str, donor_template: str, session_dat
         try:
             fixed = await call_claude_required(
                 fix_prompt, f"Предыдущий (неполный) перевод:\n{result[:6000]}", max_tokens=8000,
+                prefer_anthropic=True,
             )
             return await _continue_truncated_text(fixed, fix_prompt, session_data)
         except LLMEmptyResponseError:
@@ -1522,6 +1531,7 @@ async def _enforce_donor_structure(result: str, donor_template: str, session_dat
             fix_prompt,
             f"Уже готовая часть документа (не трогать, только для контекста и согласованности фактов):\n{result[-6000:]}",
             max_tokens=8000,
+            prefer_anthropic=True,
         )
         appended = await _continue_truncated_text(appended, fix_prompt, session_data)
         return result.rstrip() + "\n\n" + appended.lstrip()
