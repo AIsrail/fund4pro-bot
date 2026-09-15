@@ -566,6 +566,33 @@ def _extract_options_from_reply(text: str) -> list[str]:
     if 2 <= len(numbered) <= 5 and numbered[0].startswith("1."):
         return numbered
 
+    # 3. Простой бинарный вопрос без списка вообще — жалоба: "куда пропала
+    # способность создавать кнопки?" — модель задаёт ровно тот вопрос,
+    # который предписан роадмапом (например ЭТАП 3.5: "есть ли у вас
+    # данные — или их лучше поискать мне?"), но свободной прозой вместо
+    # нумерованного списка, и забывает вызвать suggest_quick_replies — тогда
+    # пп. 1-2 выше ничего не находят. Разбираем последнее предложение с "?"
+    # по союзу "или" на два варианта — грубее, чем нормальный список, но
+    # кнопка с неидеальной подписью лучше, чем её полное отсутствие.
+    idx = text.rfind("?")
+    if idx != -1:
+        start = max(text.rfind(".", 0, idx), text.rfind("\n", 0, idx), text.rfind("!", 0, idx))
+        question = text[start + 1:idx + 1].strip()
+        parts = re.split(r"\s+или\s+", question, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            opts = []
+            for part in parts:
+                clean = re.sub(r"[*_`]", "", part).strip().strip("?,.—- ")
+                clean = re.sub(r"^(есть ли|нужно ли|хотите ли|стоит ли)\s+", "", clean, flags=re.IGNORECASE)
+                words = clean.split()
+                label = " ".join(words[:4])
+                if len(label) > 24:
+                    label = label[:22] + "..."
+                if label:
+                    opts.append(label)
+            if len(opts) == 2:
+                return [f"1. {opts[0]}", f"2. {opts[1]}"]
+
     return []
 
 
