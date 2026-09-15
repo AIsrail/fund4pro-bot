@@ -365,8 +365,14 @@ async def receive_document(message: Message, state: FSMContext):
         from donor_form_cache import CACHE_DIR, save_donor_form
         os.makedirs(CACHE_DIR, exist_ok=True)
         try:
-            # Сохраняем через save_donor_form, чтобы файл попал в кэш с нормальным именем
-            path = save_donor_form(await message.bot.download(message.document, destination=io.BytesIO()), message.document.file_name)
+            # Сохраняем через save_donor_form, чтобы файл попал в кэш с нормальным именем.
+            # bot.download(..., destination=...) возвращает сам destination
+            # (BinaryIO), а не байты — save_donor_form ждёт bytes, отсюда
+            # раньше падало с "object supporting the buffer API required" на
+            # КАЖДОЙ загрузке .docx (тихо ловилось except ниже и просто не
+            # попадало в кэш форм донора).
+            buf = await message.bot.download(message.document, destination=io.BytesIO())
+            path = save_donor_form(buf.getvalue(), message.document.file_name)
             # Добавляем в список доступных форм для select_donor_form
             session_data = await state.get_data()
             saved = session_data.get("saved_donor_files", [])

@@ -335,7 +335,7 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
     if name == "find_matching_grants":
         query = str(args.get("query") or "").strip()
         from connect4pro_catalog import search_matching_grants
-        grants = search_matching_grants(query=query, limit=4)
+        grants = await search_matching_grants(query=query, limit=4)
         if not grants:
             return "В каталоге Connect4pro пока нет опубликованных конкурсов по этому запросу."
 

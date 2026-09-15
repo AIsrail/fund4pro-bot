@@ -8,8 +8,9 @@ import logging
 import os
 import re
 import time
-import urllib.request
 from datetime import date, datetime, timedelta
+
+import httpx
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger("fund4pro.connect4pro")
@@ -131,15 +132,30 @@ def _parse_grant_element(text_el, post_id: str = "", pub_date: str = "") -> dict
     }
 
 
-def fetch_and_update_from_web() -> list[dict]:
-    """Стягивает последние посты из веб-просмотра канала https://t.me/s/connect4_pro."""
+async def fetch_and_update_from_web() -> list[dict]:
+    """Стягивает последние посты из веб-просмотра канала https://t.me/s/connect4_pro.
+
+    РЕАЛЬНЫЙ ИНЦИДЕНТ ("бот просто застывает"): раньше это делалось через
+    urllib.request.urlopen — БЛОКИРУЮЩИЙ синхронный вызов внутри асинхронного
+    бота (единственный процесс, один event loop). Пока urlopen ждёт ответ от
+    t.me (до 12 секунд по таймауту, а при сетевых нестабильностях иногда и
+    дольше), event loop полностью стоит — не отвечает ВООБЩЕ НИКОМУ, не
+    только текущему пользователю, пока запрос не завершится. Раньше это
+    вызывалось только когда локальный кэш совсем пуст (редко), но после
+    добавления TTL-обновления кэша (раз в 6 часов, чтобы не показывать
+    протухшие дедлайны) этот блокирующий вызов стал срабатывать НАМНОГО
+    чаще — практически гарантированное периодическое зависание бота для
+    всех сразу. Переведено на httpx.AsyncClient (как везде в остальном
+    коде — data_search.py, donor_scrape.py), event loop во время ожидания
+    ответа свободен обслуживать остальных пользователей."""
     try:
-        req = urllib.request.Request(
-            CHANNEL_URL,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        )
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
+        async with httpx.AsyncClient(
+            timeout=12, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        ) as client:
+            resp = await client.get(CHANNEL_URL)
+            resp.raise_for_status()
+        html = resp.text
 
         soup = BeautifulSoup(html, "html.parser")
         wraps = soup.find_all("div", class_="tgme_widget_message_wrap")
@@ -210,7 +226,7 @@ def register_channel_post(raw_text: str, post_id: str = "", pub_date: str = "") 
     return grant
 
 
-def search_matching_grants(query: str = "", limit: int = 4) -> list[dict]:
+async def search_matching_grants(query: str = "", limit: int = 4) -> list[dict]:
     """Ищет релевантные гранты в каталоге. Если каталог пуст ИЛИ старше
     CACHE_TTL_SECONDS, стягивает из канала заново (best-effort — при неудаче
     остаётся на том, что уже есть в кэше). Просроченные по дедлайну конкурсы
@@ -219,7 +235,7 @@ def search_matching_grants(query: str = "", limit: int = 4) -> list[dict]:
     grants = load_cached_grants()
     cache_stale = not os.path.exists(CACHE_FILE) or (time.time() - os.path.getmtime(CACHE_FILE)) > CACHE_TTL_SECONDS
     if not grants or cache_stale:
-        grants = fetch_and_update_from_web() or grants
+        grants = await fetch_and_update_from_web() or grants
 
     today = date.today()
     grants = [g for g in grants if not _is_expired(g, today)]
