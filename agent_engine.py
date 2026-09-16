@@ -775,14 +775,25 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
     document_text = ""
 
     for round_i in range(MAX_TOOL_ROUNDS):
-        # Основной провайдер — DeepSeek (быстрый, стабильный и с активным балансом).
-        # Если DeepSeek недоступен — пробуем Anthropic, затем Gemini.
+        # РЕАЛЬНЫЙ ИНЦИДЕНТ: DeepSeek был поставлен основным провайдером ещё
+        # тогда, когда на аккаунте Anthropic был исчерпан лимит расходов —
+        # разумно в тот момент, но с тех пор почти ВСЕ баги поведения бота за
+        # неделю (переспрашивает факты, не те кнопки, обрывается без
+        # продолжения, путает шаги) обнаруживались именно на DeepSeek — он не
+        # так надёжно следует детальным инструкциям роадмапа, как Claude,
+        # просто не считается "недоступным" и поэтому никогда не пропускал
+        # ход Anthropic'у. generate_final_document (llm.py) уже давно
+        # предпочитает Anthropic через prefer_anthropic — здесь, в основном
+        # диалоговом цикле (где как раз и живут все найденные баги),
+        # порядок был противоположным. Лимит расходов на Anthropic поднят
+        # пользователем — пробуем Anthropic первым и здесь тоже; DeepSeek
+        # остаётся быстрым запасным вариантом, если Anthropic недоступен.
         turn = None
-        if _deepseek_client:
-            turn = await _deepseek_turn(system_prompt, history)
-        if turn is None and config.ANTHROPIC_API_KEY:
+        if config.ANTHROPIC_API_KEY:
             anthropic_messages = _openai_history_to_anthropic(history)
             turn = await _anthropic_turn(system_prompt, anthropic_messages)
+        if turn is None and _deepseek_client:
+            turn = await _deepseek_turn(system_prompt, history)
         if turn is None and _fallback_client:
             turn = await _gemini_turn(system_prompt, history)
         if turn is None:

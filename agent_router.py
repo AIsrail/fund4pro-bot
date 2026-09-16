@@ -173,7 +173,11 @@ async def choose_flow(callback: CallbackQuery, state: FSMContext):
     last = await project_memory.load_last_project(callback.message.chat.id)
     if last and last.get("flow") == flow and last.get("project_data"):
         await state.set_state(Flow.active)
-        await state.update_data(_pending_resume={"flow": flow, "project_data": last["project_data"]})
+        await state.update_data(_pending_resume={
+            "flow": flow,
+            "project_data": last["project_data"],
+            "donor_files": last.get("donor_files") or {},
+        })
         summary = project_memory.summarize(last["project_data"])
         msg = (
             f"Нашёл незавершённый проект — {summary}\n\n"
@@ -199,12 +203,17 @@ async def resume_project_yes(callback: CallbackQuery, state: FSMContext):
     pending = data.get("_pending_resume") or {}
     project_data = pending.get("project_data") or {}
     flow = pending.get("flow", "grant")
+    donor_files = pending.get("donor_files") or {}
     await state.set_state(Flow.active)
     await state.set_data({
         "flow": flow,
         "ui_language": "ru",
         "project_data": project_data,
         "history_openai": [],
+        # РЕАЛЬНЫЙ ИНЦИДЕНТ: без этого project_data["donor_template"] (текст
+        # структуры формы) восстанавливался, а сам файл формы донора — нет,
+        # export_docx не находил его и откатывался на свободный формат.
+        **donor_files,
     })
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer()
@@ -458,8 +467,13 @@ async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: st
     # совпадает с id пользователя независимо от того, кто отправитель
     # конкретного объекта message — используем его как надёжный ключ.
     try:
+        donor_files = {
+            k: session.get(k)
+            for k in ("chosen_donor_form", "saved_donor_files", "chosen_donor_form_path")
+            if session.get(k)
+        }
         await project_memory.save_last_project(
-            message.chat.id, session.get("project_data", {}), session.get("flow", "grant"),
+            message.chat.id, session.get("project_data", {}), session.get("flow", "grant"), donor_files,
         )
     except Exception:
         logger.warning("project_memory.save_last_project failed", exc_info=True)

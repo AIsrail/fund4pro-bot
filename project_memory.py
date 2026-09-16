@@ -48,9 +48,18 @@ def _get_client():
     return _redis_client
 
 
-async def save_last_project(user_id: int, project_data: dict, flow: str) -> None:
+async def save_last_project(user_id: int, project_data: dict, flow: str, donor_files: dict | None = None) -> None:
     """Best-effort — сохраняет снепшот проекта. Никогда не бросает исключение
-    наружу (вызывается после каждого хода, не должно ронять ответ пользователю)."""
+    наружу (вызывается после каждого хода, не должно ронять ответ пользователю).
+
+    РЕАЛЬНЫЙ ИНЦИДЕНТ: изначально сохранялся только project_data — donor_template
+    (ТЕКСТ структуры формы) восстанавливался при "Продолжить проект", а вот
+    chosen_donor_form/saved_donor_files (ссылка на САМ ФАЙЛ + его content_b64,
+    см. agent_docgen.export_docx) — нет, потому что живут на верхнем уровне
+    session, не внутри project_data. В итоге после резюмирования сборка
+    документа не находила файл формы донора и молча уходила в свободный
+    формат (с явным предупреждением пользователю, но результат всё равно не
+    тот). donor_files — снимок именно этих верхнеуровневых ключей."""
     client = _get_client()
     if client is None:
         return
@@ -59,14 +68,17 @@ async def save_last_project(user_id: int, project_data: dict, flow: str) -> None
     if not any(v and str(v).strip() for v in project_data.values()):
         return
     try:
-        payload = json.dumps({"project_data": project_data, "flow": flow}, ensure_ascii=False)
+        payload = json.dumps(
+            {"project_data": project_data, "flow": flow, "donor_files": donor_files or {}},
+            ensure_ascii=False,
+        )
         await client.set(f"{_KEY_PREFIX}{user_id}", payload, ex=60 * 60 * 24 * 90)
     except Exception as e:
         logger.warning("project_memory: failed to save snapshot for user %s: %s", user_id, e)
 
 
 async def load_last_project(user_id: int) -> dict | None:
-    """Возвращает {"project_data": {...}, "flow": "grant"|"bizplan"} или None."""
+    """Возвращает {"project_data": {...}, "flow": "grant"|"bizplan", "donor_files": {...}} или None."""
     client = _get_client()
     if client is None:
         return None
