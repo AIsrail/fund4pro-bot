@@ -1731,6 +1731,94 @@ def looks_like_applicant_field(label: str) -> bool:
     return not any(m in l for m in _DONOR_ONLY_FIELD_MARKERS)
 
 
+async def fill_form_fields_batch(
+    fields: list[dict], session_data: dict, already_answered: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Структурированный батч-вызов, отвечающий на ВЕСЬ переданный список
+    полей формы донора по стабильному field_id — основной (не резервный)
+    механизм заполнения в новом пайплайне docx_schema_fill.py, который
+    читает реальные ячейки шаблона напрямую вместо нечёткого сопоставления
+    текста. Каждый field — {"field_id": str, "question": str, "kind":
+    "kv"|"section"}. already_answered — ответы из предыдущих батчей той же
+    формы (для согласованности цифр между батчами, например одна и та же
+    сумма бюджета в разных разделах), не для повторного использования как
+    есть.
+
+    Развитие того же приёма, что уже был в fill_missing_donor_fields ниже
+    (батч JSON по короткому id) — здесь он применяется КО ВСЕЙ форме сразу,
+    а не только к тому, что осталось непонятым после fuzzy-matching."""
+    fields = [f for f in fields if looks_like_applicant_field(f["question"])]
+    if not fields:
+        return {}
+
+    items = "\n".join(f'{f["field_id"]} ({f["kind"]}): {f["question"]}' for f in fields)
+
+    already_note = ""
+    if already_answered:
+        preview = "\n".join(f"- {v[:150]}" for v in list(already_answered.values())[-8:])
+        already_note = (
+            f"\n\nУЖЕ ОТВЕЧЕНО В ЭТОЙ ЖЕ ФОРМЕ РАНЕЕ (для согласованности цифр/фактов — "
+            f"НЕ копируй эти ответы в новые поля буквально, если это не тот же самый "
+            f"вопрос, продублированный в форме):\n{preview}"
+        )
+
+    system_prompt = (
+        f"{SYSTEM_PROMPT}\n\nТебе дан список полей ОРИГИНАЛЬНОЙ формы донора — "
+        f"ответь на КАЖДОЕ, по одному ответу на field_id. kv-поле — короткий "
+        f"факт (одна фраза/цифра). section-поле — открытый вопрос формы, "
+        f"разверни на полноценный абзац (обычно форма ограничивает объём "
+        f"словами — уложись разумно, 100-200 слов, если не указано иное).\n\n"
+        f"ВАЖНО:\n"
+        f"- Следуй правилу XYZ-плейсхолдеров для недостающих цифр/дат/фактов "
+        f"— никогда не выдумывай правдоподобное значение.\n"
+        f"- Если сумма гранта уже известна из контекста проекта — раздели "
+        f"бюджет на статьи расходов ИМЕННО под эту сумму (обратный ход «3 "
+        f"деревьев» из методологии), а не общими словами.\n"
+        f"- Если поле явно не для заявителя (для донора/адвайзера/офиса) — "
+        f"верни для него пустую строку \"\".\n"
+        f"- КАЖДЫЙ field_id — ОТДЕЛЬНЫЙ, самостоятельный вопрос анкеты, даже "
+        f"если по теме похож на соседний (например разные поля про целевые "
+        f"группы, косвенных благополучателей, состав команды — это РАЗНЫЕ "
+        f"вопросы). НИКОГДА не копируй один и тот же развёрнутый ответ в "
+        f"несколько разных field_id — если для конкретного поля нет "
+        f"отдельного точного ответа, верни \"\", а не чужой ответ.\n\n"
+        f"Контекст проекта:\n{_session_summary(session_data)}"
+        f"{already_note}\n\n"
+        f'Верни СТРОГО валидный JSON без markdown-обрамления: {{"f1": "...", '
+        f'"f2": "..."}} — по одному ключу на КАЖДЫЙ field_id из списка ниже, '
+        f"даже если значение — пустая строка."
+    )
+    user_message = items
+
+    try:
+        raw = await call_claude(system_prompt, user_message, max_tokens=4000, prefer_anthropic=True)
+    except Exception as exc:
+        logger.warning("fill_form_fields_batch: call_claude failed: %s: %s", type(exc).__name__, exc)
+        return {}
+
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            raise ValueError("no JSON object found in response")
+        parsed = json.loads(raw[start:end + 1])
+        if not isinstance(parsed, dict):
+            raise ValueError("unexpected shape")
+    except Exception as exc:
+        logger.warning(
+            "fill_form_fields_batch: JSON parse failed: %s: %s | raw[:200]=%r",
+            type(exc).__name__, exc, raw[:200],
+        )
+        return {}
+
+    answers: dict[str, str] = {}
+    for f in fields:
+        val = str(parsed.get(f["field_id"], "") or "").strip()
+        if val:
+            answers[f["field_id"]] = val
+    return answers
+
+
 async def fill_missing_donor_fields(
     kv_labels: list[str], section_questions: list[str], session_data: dict
 ) -> tuple[dict[str, str], dict[str, str]]:
