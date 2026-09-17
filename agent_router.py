@@ -10,6 +10,7 @@ ProjectFlow:budget_discussion) автоматически мигрируют в 
 действия для агента.
 """
 
+import base64
 import io
 import logging
 import os
@@ -381,7 +382,8 @@ async def receive_document(message: Message, state: FSMContext):
             # КАЖДОЙ загрузке .docx (тихо ловилось except ниже и просто не
             # попадало в кэш форм донора).
             buf = await message.bot.download(message.document, destination=io.BytesIO())
-            path = save_donor_form(buf.getvalue(), message.document.file_name)
+            raw = buf.getvalue()
+            path = save_donor_form(raw, message.document.file_name)
             # Добавляем в список доступных форм для select_donor_form
             session_data = await state.get_data()
             saved = session_data.get("saved_donor_files", [])
@@ -390,6 +392,16 @@ async def receive_document(message: Message, state: FSMContext):
                 "path": path,
                 "text": doc_text,
                 "url": "",
+                # РЕАЛЬНЫЙ ИНЦИДЕНТ: этой ветки (пользователь прислал .docx
+                # СВОИМ файлом, не через fetch_donor_page по ссылке) не было
+                # в исходном фиксе восстановления шаблона после рестарта —
+                # там content_b64 добавлялся только для файлов, скачанных
+                # fetch_donor_page. Без него export_docx нечем было
+                # восстановить файл, когда локальный диск/сессия терялись
+                # (после рестарта ИЛИ после "Продолжить проект"), и бот снова
+                # тихо откатывался на свободный формат, хотя пользователь
+                # УЖЕ прислал форму донора вручную.
+                "content_b64": base64.b64encode(raw).decode("ascii"),
             })
             session_data["saved_donor_files"] = saved
             await state.set_data(session_data)
