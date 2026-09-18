@@ -314,6 +314,38 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
         query = str(args.get("query") or "").strip()
         if not query:
             return "Ошибка: не указан поисковый запрос"
+
+        # РЕАЛЬНЫЙ ИНЦИДЕНТ: старая цепочка (SearXNG/DuckDuckGo/Startpage —
+        # скрейпинг HTML через httpx+BeautifulSoup) регулярно не находила
+        # ничего по нишевым локальным запросам (например живой тест: "турпоток
+        # Арсланбоб Сары-Челек" — 0 релевантных результатов), отчасти из-за
+        # антибот-блокировки облачных IP Render. Нативный веб-поиск Claude
+        # (llm.web_search_and_summarize) работает с инфраструктуры Anthropic,
+        # не подвержен этой блокировке, и сразу возвращает синтезированный
+        # ответ с источниками, а не сырые ссылки. Пробуется первым; при
+        # недоступности (нет ключа/сбой) молча падает на старую цепочку —
+        # ничего не ломается для случая, когда Anthropic сам недоступен.
+        from llm import web_search_and_summarize
+        try:
+            org_info = (project_data.get("org_info") or "")[:300]
+            summary, sources = await web_search_and_summarize(query, context=org_info)
+        except Exception as exc:
+            logger.warning("web_search_and_summarize failed, falling back to scraping chain: %s: %s", type(exc).__name__, exc)
+            summary, sources = "", []
+
+        if summary:
+            src_lines = "\n".join(f"- {s['title']}: {s['url']}" for s in sources[:5])
+            return (
+                f"Найдено по запросу '{query}' (живой веб-поиск через Claude):\n{summary}\n\n"
+                f"Источники:\n{src_lines}\n\n"
+                f"ОБЯЗАТЕЛЬНО вызови update_project В ЭТОМ ЖЕ ХОДУ и сохрани "
+                f"конкретные найденные цифры/факты (с источником) в подходящее поле "
+                f"(problem_and_idea, если это про масштаб проблемы, или other_notes) "
+                f"— иначе они останутся только в этом сообщении чата и не попадут в "
+                f"итоговый документ при generate_document. Просто упомянуть находку "
+                f"пользователю в тексте ответа НЕДОСТАТОЧНО."
+            )
+
         from data_search import try_search_statistics, format_results_for_prompt
         try:
             results = await try_search_statistics(query)
@@ -325,7 +357,8 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
             )
         if not results:
             return (
-                f"По запросу '{query}' живых данных в открытом поиске не нашлось. "
+                f"По запросу '{query}' живых данных в открытом поиске не нашлось (пробовал "
+                "и веб-поиск Claude, и резервную цепочку поисковиков). "
                 "Не выдумывай цифру — используй правило XYZ-плейсхолдеров и скажи "
                 "пользователю прямо, что не нашёл живых данных по этой теме, "
                 "предложи прислать свои источники, если есть."

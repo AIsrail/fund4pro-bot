@@ -512,6 +512,77 @@ async def call_claude_required(
     raise LLMEmptyResponseError("Empty response after retry")
 
 
+async def web_search_and_summarize(query: str, context: str = "") -> tuple[str, list[dict]]:
+    """Живой веб-поиск через нативный серверный инструмент Claude
+    (web_search) вместо скрейпинга HTML сторонних поисковиков.
+
+    РЕАЛЬНЫЙ ИНЦИДЕНТ: data_search.py (SearXNG/DuckDuckGo/Startpage через
+    httpx+BeautifulSoup) регулярно не находит НИЧЕГО по нишевым локальным
+    запросам (например "турпоток Арсланбоб Сары-Челек") — отчасти потому
+    что этих данных просто нет в сети, но отчасти и потому что облачные IP
+    Render чаще блокируются антибот-защитой поисковиков, чем обычный
+    домашний IP (см. комментарии в data_search.py). Anthropic сам держит
+    инфраструктуру веб-поиска на своей стороне — не подвержен блокировке
+    IP Render, и вдобавок ищет и СИНТЕЗИРУЕТ ответ одним вызовом (сам
+    формулирует запросы, может сделать несколько поисков, сразу даёт
+    текстовый ответ с источниками), а не просто отдаёт сырой список
+    ссылок, которые потом ещё раз надо скармливать модели.
+
+    Пробуется ПЕРВЫМ (в agent_engine.py) — при недоступности (нет ключа,
+    сбой API) вызывающий код молча падает на старую цепочку скрейпинга в
+    data_search.py, ничего не ломая.
+
+    Возвращает (текст_с_ответом, [{"title","url"}, ...]) — пустая строка и
+    пустой список, если поиск не дал результата или Anthropic недоступен."""
+    if not config.ANTHROPIC_API_KEY:
+        return "", []
+
+    system_prompt = (
+        "Ты — ассистент, который ищет РЕАЛЬНЫЕ, актуальные факты/цифры в "
+        "открытом интернете по конкретному запросу для грантовой заявки. "
+        "Используй инструмент веб-поиска (можно несколько запросов, если "
+        "первый не дал релевантного). В ответе — только конкретные найденные "
+        "факты/цифры с указанием источника (название + что именно там "
+        "написано), без домыслов и оценок от себя. Если после поиска "
+        "релевантных данных по существу вопроса НЕ нашлось — прямо напиши "
+        "'Живых данных по этому запросу не нашлось', НЕ придумывай "
+        "правдоподобную цифру и не подменяй запрошенное общими сведениями "
+        "не по теме."
+    )
+    user_message = query if not context else f"{query}\n\nКонтекст проекта: {context}"
+
+    try:
+        response = await _client.messages.create(
+            model=config.LLM_MODEL,
+            max_tokens=1500,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}],
+            tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 3}],
+        )
+    except Exception as exc:
+        logger.warning("web_search_and_summarize: call failed: %s: %s", type(exc).__name__, exc)
+        return "", []
+
+    text_parts = []
+    sources: list[dict] = []
+    for block in response.content:
+        if block.type == "text":
+            text_parts.append(block.text)
+        elif block.type == "web_search_tool_result":
+            content = block.content
+            if isinstance(content, list):  # успех — список web_search_result; объект content означает ошибку инструмента
+                for item in content:
+                    url = getattr(item, "url", None)
+                    title = getattr(item, "title", None)
+                    if url:
+                        sources.append({"title": title or url, "url": url})
+
+    summary = "\n".join(text_parts).strip()
+    if "живых данных" in summary.lower() and "не нашл" in summary.lower():
+        return "", []  # честное "не нашёл" от модели — не показываем как найденный результат
+    return summary, sources
+
+
 async def generate_ideas(org_info: str, donor_info: str, flow: str, donor_forms_text: str = "") -> tuple[str, list[str]]:
     """Возвращает (вводное_примечание, [идея1, идея2, ...]).
 
