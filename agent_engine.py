@@ -487,31 +487,48 @@ async def _chatgpt_turn(system_prompt: str, messages: list[dict]) -> dict | None
         return None
 
 
-async def _gemini_turn(system_prompt: str, messages: list[dict]) -> dict:
+async def _gemini_turn(system_prompt: str, messages: list[dict]) -> dict | None:
     """Один вызов Gemini (OpenAI-совместимый tool calling). messages здесь
-    в OpenAI chat-completions формате (роли system/user/assistant/tool)."""
-    oa_messages = [{"role": "system", "content": system_prompt}] + messages
-    resp = await _fallback_client.chat.completions.create(
-        model=config.FALLBACK_LLM_MODEL,
-        messages=oa_messages,
-        tools=TOOLS_OPENAI,
-        max_tokens=4000,
-        extra_body={"reasoning_effort": "none"},
-    )
-    msg = resp.choices[0].message
-    tool_calls = []
-    if msg.tool_calls:
-        for tc in msg.tool_calls:
-            try:
-                args = json.loads(tc.function.arguments)
-            except Exception:
-                args = {}
-            tool_calls.append({"id": tc.id, "name": tc.function.name, "input": args})
-    return {
-        "text": (msg.content or "").strip(),
-        "tool_calls": tool_calls,
-        "raw_message": msg,
-    }
+    в OpenAI chat-completions формате (роли system/user/assistant/tool).
+
+    РЕАЛЬНЫЙ ИНЦИДЕНТ: эта функция была БЕЗ try/except — единственная из
+    четырёх *_turn-функций. Пока Gemini был ПОСЛЕДНИМ в цепочке (до
+    сегодняшнего переупорядочивания на Anthropic->ChatGPT->Gemini->DeepSeek),
+    это было менее заметно — DeepSeek успевал сработать раньше. После
+    переупорядочивания Gemini оказался ПЕРЕД DeepSeek, и когда у Gemini
+    кончился собственный месячный лимit трат (RESOURCE_EXHAUSTED, отдельно
+    от лимитов Anthropic/OpenAI), необработанное исключение уронило ВЕСЬ ход
+    агента, даже не дав DeepSeek — настоящему последнему резерву — попытаться
+    ответить. Живой инцидент: все четыре провайдера оказались одновременно
+    без доступа/бюджета (Anthropic — лимит до 1 октября, OpenAI — $0
+    кредитов, Gemini — исчерпан spend cap), но DeepSeek, скорее всего, ещё
+    был жив — просто не получил шанса, потому что цепочка упала раньше."""
+    try:
+        oa_messages = [{"role": "system", "content": system_prompt}] + messages
+        resp = await _fallback_client.chat.completions.create(
+            model=config.FALLBACK_LLM_MODEL,
+            messages=oa_messages,
+            tools=TOOLS_OPENAI,
+            max_tokens=4000,
+            extra_body={"reasoning_effort": "none"},
+        )
+        msg = resp.choices[0].message
+        tool_calls = []
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except Exception:
+                    args = {}
+                tool_calls.append({"id": tc.id, "name": tc.function.name, "input": args})
+        return {
+            "text": (msg.content or "").strip(),
+            "tool_calls": tool_calls,
+            "raw_message": msg,
+        }
+    except Exception as exc:
+        logger.warning("Gemini agent turn failed: %s: %s", type(exc).__name__, exc)
+        return None
 
 
 async def _deepseek_turn(system_prompt: str, messages: list[dict]) -> dict | None:
