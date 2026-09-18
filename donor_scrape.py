@@ -18,7 +18,7 @@ donor_info.py показывает пользователю кнопки руч�
 """
 
 import io
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin
 
 import httpx
 from bs4 import BeautifulSoup
@@ -133,7 +133,15 @@ async def try_scrape_donor_forms(url: str) -> list[dict]:
     ) as client:
         for file_url in links[:MAX_FILES_TO_FETCH]:
             text, content = await _fetch_and_extract(client, file_url)
-            filename = file_url.rsplit("/", 1)[-1] or "donor_form"
+            # РЕАЛЬНЫЙ ИНЦИДЕНТ: URL немецкого посольства отдаёт файл с
+            # процент-закодированным кириллическим именем в пути
+            # ("%D0%B7%D0%B0..."). Без unquote() имя так и оставалось
+            # percent-encoded — donor_form_cache.save_donor_form фильтрует
+            # "%", но оставляет все hex-цифры (они alnum), склеивая их в
+            # нечитаемую строку на ~150+ символов, что уже само по себе
+            # ловится отдельным лимитом длины там же — но декодировать здесь
+            # правильнее по смыслу: имя файла должно быть тем, что оно есть.
+            filename = unquote(file_url.rsplit("/", 1)[-1]) or "donor_form"
             fmt = "xlsx" if filename.lower().endswith((".xls", ".xlsx")) else "other"
             results.append({
                 "url": file_url, "text": text, "filename": filename,

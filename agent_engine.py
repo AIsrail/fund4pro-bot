@@ -90,7 +90,18 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
         for f in forms:
             content = f.get("content") or b""
             if content:
-                path = save_donor_form(content, f["filename"])
+                # РЕАЛЬНЫЙ ИНЦИДЕНТ: один файл с патологически длинным/
+                # проблемным именем (см. save_donor_form) уронил ВЕСЬ ход
+                # агента необработанным исключением — включая уже успешно
+                # скачанные ДРУГИЕ файлы той же страницы (например, если
+                # донор публикует форму на нескольких языках, а падает
+                # только одна). Один плохой файл не должен топить всю
+                # страницу — пропускаем его и продолжаем с остальными.
+                try:
+                    path = save_donor_form(content, f["filename"])
+                except OSError:
+                    logger.warning("save_donor_form failed for %r, skipping this file", f.get("filename"), exc_info=True)
+                    continue
                 f_entry = {
                     "filename": f["filename"],
                     "path": path,
