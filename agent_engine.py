@@ -886,9 +886,27 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                 # сразу просим прислать файл заново.
                 has_template_text = bool(project_data.get("donor_template"))
                 chosen_fn = session.get("chosen_donor_form")
+                saved_files = session.get("saved_donor_files", [])
                 has_file_ref = bool(chosen_fn) and any(
-                    f.get("filename") == chosen_fn for f in session.get("saved_donor_files", [])
+                    f.get("filename") == chosen_fn for f in saved_files
                 )
+                # РЕАЛЬНЫЙ ИНЦИДЕНТ (тот же день, живой тест): пользователь
+                # присылает .docx ПРЯМЫМ ВЛОЖЕНИЕМ (agent_router.receive_document),
+                # модель читает текст, зовёт update_project(donor_template=...)
+                # вместо select_donor_form — donor_template заполнен, но
+                # chosen_donor_form остаётся пустым, хотя файл СЕЙЧАС лежит в
+                # saved_donor_files. Промпт это лечит (см. agent_roadmap.py), но
+                # промпт-инструкции и раньше оказывались ненадёжными на практике
+                # (см. коммит про проактивные базовые факты) — если это тот самый
+                # частный, однозначный случай (СТРУКТУРА только что извлечена и в
+                # сессии есть РОВНО ОДИН сохранённый файл формы), незачем гонять
+                # пользователя за уже присланным файлом — просто линкуем его как
+                # выбранный, а не блокируем генерацию.
+                if has_template_text and not has_file_ref and len(saved_files) == 1:
+                    session["chosen_donor_form"] = saved_files[0].get("filename")
+                    session["chosen_donor_form_path"] = saved_files[0].get("path")
+                    chosen_fn = session["chosen_donor_form"]
+                    has_file_ref = bool(chosen_fn)
                 if has_template_text and not has_file_ref and not session.get("_donor_file_missing_warned"):
                     session["_donor_file_missing_warned"] = True
                     result_str = (
