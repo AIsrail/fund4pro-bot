@@ -1731,6 +1731,76 @@ def looks_like_applicant_field(label: str) -> bool:
     return not any(m in l for m in _DONOR_ONLY_FIELD_MARKERS)
 
 
+async def fill_table_field(question: str, columns: list[str], session_data: dict) -> list[list[str]]:
+    """РЕАЛЬНЫЙ ИНЦИДЕНТ: пользователь прямо указал, что в оригинальной форме
+    ГГФ поля "Рабочий план" и "Бюджет проекта" — это не абзац вопроса со
+    свободным текстом рядом, а ВЛОЖЕННАЯ В ЯЧЕЙКУ ТАБЛИЦА (строки "№ |
+    Мероприятие | Срок | Результат" и "№ | Статья расходов | Кол-во |
+    Стоимость") — донор жёстко требует именно построчный табличный формат,
+    и старая логика kv/section эту вложенную таблицу вообще не видела,
+    просто дописывая абзац прозы рядом с пустой таблицей-шаблоном.
+
+    Эта функция — отдельный, специализированный вызов (не часть общего
+    fill_form_fields_batch, т.к. форма ответа принципиально другая: не одна
+    строка на field_id, а МАССИВ СТРОК с несколькими колонками) — просит
+    модель вернуть содержимое именно в виде строк таблицы, по колонкам
+    оригинальной формы, а не единым текстом."""
+    col_list = ", ".join(f'"{c}"' for c in columns)
+    system_prompt = (
+        f"{SYSTEM_PROMPT}\n\nЭто поле ОРИГИНАЛЬНОЙ формы донора, которое "
+        f"жёстко требует ЗАПОЛНЕННУЮ ТАБЛИЦУ (донор рассчитывает именно на "
+        f"построчный формат, не на абзац текста). Колонки таблицы, в этом "
+        f"порядке: {col_list}.\n\n"
+        f"Верни от 3 до 8 строк (по реальному числу пунктов — не растягивай "
+        f"искусственно и не сжимай в одну строку то, что логично разбить на "
+        f"несколько). Каждая строка — ровно одно значение НА КАЖДУЮ колонку, "
+        f"в том же порядке. Если одна из колонок — порядковый номер ('№') — "
+        f"заполни его последовательно (1, 2, 3...). Если колонка — денежная "
+        f"сумма и известна ОБЩАЯ запрошенная сумма гранта — раздели её по "
+        f"строкам так, чтобы сумма строк сходилась с общей суммой (обратный "
+        f"ход «3 деревьев» из методологии). Никогда не выдумывай "
+        f"правдоподобную цифру там, где реальных данных нет — используй "
+        f"правило XYZ-плейсхолдеров внутри конкретной ячейки, не пропускай "
+        f"всю строку.\n\n"
+        f"Контекст проекта:\n{_session_summary(session_data)}\n\n"
+        f'Верни СТРОГО валидный JSON без markdown-обрамления, массив '
+        f'массивов строк: [["1", "...", "...", "..."], ["2", "...", "...", "..."]]'
+    )
+    user_message = f"Вопрос формы: {question}"
+
+    try:
+        raw = await call_claude(system_prompt, user_message, max_tokens=2000, prefer_anthropic=True)
+    except Exception as exc:
+        logger.warning("fill_table_field: call_claude failed: %s: %s", type(exc).__name__, exc)
+        return []
+
+    try:
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start == -1 or end == -1 or end < start:
+            raise ValueError("no JSON array found in response")
+        parsed = json.loads(raw[start:end + 1])
+        if not isinstance(parsed, list):
+            raise ValueError("unexpected shape")
+    except Exception as exc:
+        logger.warning(
+            "fill_table_field: JSON parse failed: %s: %s | raw[:200]=%r",
+            type(exc).__name__, exc, raw[:200],
+        )
+        return []
+
+    rows: list[list[str]] = []
+    for row in parsed:
+        if not isinstance(row, list):
+            continue
+        cells = [str(v or "").strip() for v in row]
+        # Модель иногда путает число колонок — дополняем/обрезаем под форму.
+        cells = (cells + [""] * len(columns))[:len(columns)]
+        if any(cells):
+            rows.append(cells)
+    return rows
+
+
 async def fill_form_fields_batch(
     fields: list[dict], session_data: dict, already_answered: dict[str, str] | None = None,
 ) -> dict[str, str]:

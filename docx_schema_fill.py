@@ -27,12 +27,15 @@ field_id на каждый вопрос сразу с учётом всего п
 как и раньше, эта функция их не трогает; известное, некритичное ограничение,
 не регрессия относительно старого поведения (там их тоже не было)."""
 
+import copy
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 import docx
 from docx.shared import Pt
+from docx.table import _Row
 
 from xyz_highlight import add_text_xyz_highlighted
 
@@ -45,8 +48,9 @@ CHUNK_SIZE = 12  # полей на один структурированный �
 class FieldSpec:
     field_id: str
     question: str
-    kind: str  # "kv" (короткий факт рядом с меткой) | "section" (открытый вопрос в своей ячейке)
-    target: Any  # ссылка на docx.table._Cell, куда писать ответ
+    kind: str  # "kv" (короткий факт рядом с меткой) | "section" (открытый абзац) | "table" (вложенная таблица)
+    target: Any  # "kv"/"section": docx.table._Cell; "table": (nested_table, template_row_idx, total_row_idx)
+    columns: list[str] | None = None  # только для kind == "table" — заголовки колонок по порядку
 
 
 def extract_template_schema(doc: "docx.Document") -> list[FieldSpec]:
@@ -81,25 +85,70 @@ def extract_template_schema(doc: "docx.Document") -> list[FieldSpec]:
                         counter += 1
                         fields.append(FieldSpec(f"f{counter}", lbl, "kv", unique_cells[j + 1]))
             elif len(unique_cells) == 1:
-                # Одна ячейка с самим вопросом целиком (открытый, развёрнутый ответ)
-                text = unique_cells[0].text.strip()
-                if text:
-                    counter += 1
-                    fields.append(FieldSpec(f"f{counter}", text, "section", unique_cells[0]))
+                cell = unique_cells[0]
+                text = cell.text.strip()
+                if not text:
+                    continue
+                # РЕАЛЬНЫЙ ИНЦИДЕНТ: некоторые вопросы формы (план мероприятий,
+                # построчный бюджет) требуют не абзац текста, а ВЛОЖЕННУЮ В
+                # ЯЧЕЙКУ ТАБЛИЦУ — донор жёстко рассчитывает на построчный
+                # формат. cell.text не включает текст вложенных таблиц (он
+                # читается отдельно через cell.tables), так что раньше такие
+                # поля тихо классифицировались как "section" и вложенная
+                # таблица оставалась пустой навсегда — абзац дописывался
+                # рядом, а не в предназначенные для этого строки.
+                if cell.tables:
+                    nested = cell.tables[0]
+                    header, template_row_idx, total_row_idx = _find_nested_table_rows(nested)
+                    if header and template_row_idx is not None:
+                        counter += 1
+                        fields.append(FieldSpec(
+                            f"f{counter}", text, "table",
+                            (nested, template_row_idx, total_row_idx), columns=header,
+                        ))
+                        continue
+                    # Вложенная таблица есть, но без узнаваемого шаблона строки
+                    # (нет ни одной полностью пустой строки после заголовка) —
+                    # падаем обратно на section, чтобы хотя бы текст не потерять.
+                counter += 1
+                fields.append(FieldSpec(f"f{counter}", text, "section", cell))
 
     return fields
 
 
+def _find_nested_table_rows(nested_table) -> tuple[list[str], int | None, int | None]:
+    """Определяет заголовок вложенной таблицы, индекс пустой строки-шаблона
+    (куда вписывать реальные данные) и, если есть, индекс строки "ИТОГО"
+    (для итоговой суммы бюджета)."""
+    if len(nested_table.rows) < 2:
+        return [], None, None
+    header = [c.text.strip() for c in nested_table.rows[0].cells]
+    template_row_idx = None
+    total_row_idx = None
+    for ri in range(1, len(nested_table.rows)):
+        cells_text = [c.text.strip() for c in nested_table.rows[ri].cells]
+        if any(t.upper() in ("ИТОГО", "ИТОГ", "TOTAL", "ВСЕГО") for t in cells_text if t):
+            total_row_idx = ri
+        elif template_row_idx is None and all(t == "" for t in cells_text):
+            template_row_idx = ri
+    return header, template_row_idx, total_row_idx
+
+
 async def build_field_answers(fields: list[FieldSpec], session_data: dict) -> dict[str, str]:
-    """Отвечает на ВСЕ поля схемы батчами по CHUNK_SIZE — один структурированный
-    JSON-вызов на батч (llm.fill_form_fields_batch), не нечёткое сопоставление.
+    """Отвечает на все поля схемы КРОМЕ "table" батчами по CHUNK_SIZE — один
+    структурированный JSON-вызов на батч (llm.fill_form_fields_batch), не
+    нечёткое сопоставление. "table"-поля отвечаются отдельно, через
+    build_table_answers — форма их ответа другая (массив строк, а не одна
+    строка на field_id), так что в общий батч они не годятся.
+
     Передаёт уже полученные ответы в контекст следующего батча, чтобы цифры
     (сумма бюджета, даты) оставались согласованными между батчами."""
     from llm import fill_form_fields_batch
 
+    flat_fields = [f for f in fields if f.kind != "table"]
     answers: dict[str, str] = {}
-    for i in range(0, len(fields), CHUNK_SIZE):
-        chunk = fields[i:i + CHUNK_SIZE]
+    for i in range(0, len(flat_fields), CHUNK_SIZE):
+        chunk = flat_fields[i:i + CHUNK_SIZE]
         chunk_dicts = [{"field_id": f.field_id, "question": f.question, "kind": f.kind} for f in chunk]
         try:
             result = await fill_form_fields_batch(chunk_dicts, session_data, already_answered=answers)
@@ -107,6 +156,26 @@ async def build_field_answers(fields: list[FieldSpec], session_data: dict) -> di
             logger.warning("build_field_answers: batch %d-%d failed, continuing with rest", i, i + len(chunk), exc_info=True)
             result = {}
         answers.update(result)
+    return answers
+
+
+async def build_table_answers(fields: list[FieldSpec], session_data: dict) -> dict[str, list[list[str]]]:
+    """Отдельный проход для "table"-полей (план мероприятий, построчный
+    бюджет) — по одному вызову на поле, т.к. таких полей обычно 1-2 на форму
+    и их ответ структурно другой (массив строк по колонкам)."""
+    from llm import fill_table_field
+
+    answers: dict[str, list[list[str]]] = {}
+    for f in fields:
+        if f.kind != "table":
+            continue
+        try:
+            rows = await fill_table_field(f.question, f.columns or [], session_data)
+        except Exception:
+            logger.warning("build_table_answers: field %s failed", f.field_id, exc_info=True)
+            rows = []
+        if rows:
+            answers[f.field_id] = rows
     return answers
 
 
@@ -123,13 +192,102 @@ def _append_section_answer(cell, content: str) -> None:
     add_text_xyz_highlighted(p, f"\n{content}", font_name="Times New Roman", font_size=Pt(11))
 
 
-def write_answers_to_template(fields: list[FieldSpec], answers: dict[str, str]) -> tuple[int, int]:
+_NUMBER_RE = re.compile(r"[\d\s]+(?:[.,]\d+)?")
+
+
+def _extract_number(text: str) -> float | None:
+    """Best-effort: вытаскивает первое число из строки вида '1 820 USD' —
+    используется только чтобы посчитать ИТОГО по бюджетной таблице; если
+    формат неожиданный, просто пропускаем строку в сумме, не роняя запись."""
+    m = _NUMBER_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(0).replace(" ", "").replace(",", ".")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _duplicate_row_after(nested_table, anchor_tr, template_tr) -> "_Row":
+    """Клонирует XML строки-шаблона и вставляет копию сразу ПОСЛЕ anchor_tr
+    (не всегда после самого шаблона!) — python-docx не даёт готового API
+    "вставить строку между другими", это стандартный обходной путь через
+    прямую работу с lxml-элементом.
+
+    РЕАЛЬНЫЙ ИНЦИДЕНТ (поймано локальным тестом на реалистичных данных, ещё
+    до релиза): если каждую новую строку вставлять "сразу после
+    template_tr", то при N > 1 строках получается LIFO-порядок — последняя
+    добавленная строка оказывается САМОЙ ПЕРВОЙ (3, 2, 1 вместо 1, 2, 3).
+    Вызывающий код обязан двигать anchor_tr вперёд на каждую новую строку."""
+    new_tr = copy.deepcopy(template_tr)
+    anchor_tr.addnext(new_tr)
+    return _Row(new_tr, nested_table)
+
+
+def _fill_row_cells(row: "_Row", values: list[str]) -> None:
+    for cell, val in zip(row.cells, values):
+        cell.text = ""
+        p = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+        add_text_xyz_highlighted(p, val, font_name="Times New Roman", font_size=Pt(10))
+
+
+def _fill_table_field(field: FieldSpec, rows: list[list[str]]) -> bool:
+    """Вписывает построчные данные во вложенную таблицу вместо одной пустой
+    строки-шаблона: клонирует строку-шаблон под КАЖДУЮ реальную строку
+    ответа, затем удаляет исходный пустой шаблон. Если у таблицы есть строка
+    "ИТОГО" — досчитывает сумму по последней колонке (обычно "Стоимость"/
+    "Сумма") и вписывает её в последнюю ячейку этой строки."""
+    nested_table, template_row_idx, total_row_idx = field.target
+    if not rows:
+        return False
+
+    template_tr = nested_table.rows[template_row_idx]._tr
+    anchor_tr = template_tr
+    for values in rows:
+        row_obj = _duplicate_row_after(nested_table, anchor_tr, template_tr)
+        _fill_row_cells(row_obj, values)
+        anchor_tr = row_obj._tr  # следующая строка встаёт сразу после ЭТОЙ, не после шаблона
+
+    # Исходная пустая строка-шаблон больше не нужна — удаляем её XML-узел.
+    template_tr.getparent().remove(template_tr)
+
+    if total_row_idx is not None:
+        # total_row_idx был вычислен ДО клонирования/удаления — строки таблицы
+        # сдвинулись на len(rows) - 1 (клоны добавлены, шаблон удалён).
+        try:
+            total_row = nested_table.rows[total_row_idx + len(rows) - 1]
+            total = sum(v for v in (_extract_number(r[-1]) for r in rows) if v is not None)
+            if total:
+                last_cell = total_row.cells[-1]
+                last_cell.text = ""
+                p = last_cell.paragraphs[0] if last_cell.paragraphs else last_cell.add_paragraph()
+                run = p.add_run(f"{total:,.0f}".replace(",", " "))
+                run.bold = True
+                run.font.name = "Times New Roman"
+                run.font.size = Pt(10)
+        except IndexError:
+            logger.warning("_fill_table_field: could not locate ИТОГО row after cloning")
+    return True
+
+
+def write_answers_to_template(
+    fields: list[FieldSpec], answers: dict[str, str], table_answers: dict[str, list[list[str]]] | None = None,
+) -> tuple[int, int, int]:
     """Прямая, детерминированная запись — каждый field.target уже указывает
-    ровно на ту ячейку, куда должен попасть его ответ. Сопоставлять по
-    тексту не нужно: связь установлена один раз при извлечении схемы."""
+    ровно на ту ячейку (или вложенную таблицу), куда должен попасть его
+    ответ. Сопоставлять по тексту не нужно: связь установлена один раз при
+    извлечении схемы."""
+    table_answers = table_answers or {}
     filled_kv = 0
     filled_sections = 0
+    filled_tables = 0
     for f in fields:
+        if f.kind == "table":
+            rows = table_answers.get(f.field_id)
+            if rows and _fill_table_field(f, rows):
+                filled_tables += 1
+            continue
         val = (answers.get(f.field_id) or "").strip()
         if not val:
             continue
@@ -140,7 +298,7 @@ def write_answers_to_template(fields: list[FieldSpec], answers: dict[str, str]) 
             if val not in f.target.text:
                 _append_section_answer(f.target, val)
                 filled_sections += 1
-    return filled_kv, filled_sections
+    return filled_kv, filled_sections, filled_tables
 
 
 async def fill_donor_docx_template_v2(template_path: str, output_path: str, session: dict) -> tuple[bool, str]:
@@ -161,11 +319,12 @@ async def fill_donor_docx_template_v2(template_path: str, output_path: str, sess
         return False, ""
 
     answers = await build_field_answers(fields, session)
-    filled_kv, filled_sections = write_answers_to_template(fields, answers)
+    table_answers = await build_table_answers(fields, session)
+    filled_kv, filled_sections, filled_tables = write_answers_to_template(fields, answers, table_answers)
 
     logger.info(
-        "fill_donor_docx_template_v2: filled %d/%d kv fields and %d sections (of %d total fields) in %s",
-        filled_kv, sum(1 for f in fields if f.kind == "kv"), filled_sections, len(fields), template_path,
+        "fill_donor_docx_template_v2: filled %d/%d kv fields, %d sections, %d tables (of %d total fields) in %s",
+        filled_kv, sum(1 for f in fields if f.kind == "kv"), filled_sections, filled_tables, len(fields), template_path,
     )
 
     # Та же защита, что была в старом пайплайне: форма с солидным числом
@@ -178,9 +337,12 @@ async def fill_donor_docx_template_v2(template_path: str, output_path: str, sess
         )
         return False, ""
 
-    if filled_kv + filled_sections == 0:
+    if filled_kv + filled_sections + filled_tables == 0:
         return False, ""
 
     doc.save(output_path)
-    text_for_check = "\n".join(answers.get(f.field_id, "") for f in fields)
+    table_text = "\n".join(
+        " | ".join(cell for row in rows for cell in row) for rows in table_answers.values()
+    )
+    text_for_check = "\n".join(answers.get(f.field_id, "") for f in fields) + "\n" + table_text
     return True, text_for_check
