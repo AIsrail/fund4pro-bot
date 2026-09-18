@@ -2,10 +2,16 @@ import os
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+# Порядок фолбэка (по явному запросу пользователя): Anthropic -> OpenAI (ChatGPT)
+# -> Gemini -> DeepSeek последним. Каждый провайдер включается только если для
+# него задан ключ — отсутствующий ключ просто пропускается в цепочке, ничего
+# не падает.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.1")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 FALLBACK_LLM_MODEL = os.environ.get("FALLBACK_LLM_MODEL", "gemini-2.5-flash")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 # Модель для генерации контента. См. product-self-knowledge, если понадобится
 # свериться с актуальным списком моделей перед деплоем.

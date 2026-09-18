@@ -3,10 +3,11 @@
 спросить/сохранить/сгенерировать, вызывая инструменты (agent_tools.py) по
 собственному усмотрению вместо того, чтобы код диктовал следующий шаг.
 
-Поддерживает оба провайдера сквозным образом (Anthropic Tool Use и OpenAI-
-совместимый tool calling для Gemini-fallback) — пробует Anthropic первым,
-при любой ошибке (в т.ч. текущий исчерпанный баланс) прозрачно переключается
-на Gemini, тем же путём, что и llm.call_claude.
+Поддерживает несколько провайдеров сквозным образом (Anthropic Tool Use и
+OpenAI-совместимый tool calling для ChatGPT/Gemini/DeepSeek) — пробует
+Anthropic первым, при любой ошибке (в т.ч. исчерпанный баланс) прозрачно
+переключается дальше по цепочке ChatGPT -> Gemini -> DeepSeek, тем же
+порядком, что и llm.call_claude (по явному запросу пользователя, 2026-09-18).
 """
 
 import base64
@@ -16,7 +17,7 @@ import logging
 import config
 from agent_roadmap import build_system_prompt
 from agent_tools import TOOLS_OPENAI, to_anthropic_tools
-from llm import _client, _deepseek_client, _fallback_client
+from llm import _client, _chatgpt_client, _deepseek_client, _fallback_client
 
 logger = logging.getLogger("fund4pro.agent_engine")
 
@@ -410,6 +411,38 @@ async def _anthropic_turn(system_prompt: str, messages: list[dict]) -> dict | No
     }
 
 
+async def _chatgpt_turn(system_prompt: str, messages: list[dict]) -> dict | None:
+    """Один вызов ChatGPT/OpenAI (нативный tool calling — TOOLS_OPENAI уже в
+    нужном формате, конвертация не нужна, в отличие от Anthropic-ветки)."""
+    if not _chatgpt_client:
+        return None
+    try:
+        oa_messages = [{"role": "system", "content": system_prompt}] + messages
+        resp = await _chatgpt_client.chat.completions.create(
+            model=config.OPENAI_MODEL,
+            messages=oa_messages,
+            tools=TOOLS_OPENAI,
+            max_tokens=4000,
+        )
+        msg = resp.choices[0].message
+        tool_calls = []
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except Exception:
+                    args = {}
+                tool_calls.append({"id": tc.id, "name": tc.function.name, "input": args})
+        return {
+            "text": (msg.content or "").strip(),
+            "tool_calls": tool_calls,
+            "raw_message": msg,
+        }
+    except Exception as exc:
+        logger.warning("ChatGPT agent turn failed: %s: %s", type(exc).__name__, exc)
+        return None
+
+
 async def _gemini_turn(system_prompt: str, messages: list[dict]) -> dict:
     """Один вызов Gemini (OpenAI-совместимый tool calling). messages здесь
     в OpenAI chat-completions формате (роли system/user/assistant/tool)."""
@@ -780,22 +813,20 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
         # разумно в тот момент, но с тех пор почти ВСЕ баги поведения бота за
         # неделю (переспрашивает факты, не те кнопки, обрывается без
         # продолжения, путает шаги) обнаруживались именно на DeepSeek — он не
-        # так надёжно следует детальным инструкциям роадмапа, как Claude,
-        # просто не считается "недоступным" и поэтому никогда не пропускал
-        # ход Anthropic'у. generate_final_document (llm.py) уже давно
-        # предпочитает Anthropic через prefer_anthropic — здесь, в основном
-        # диалоговом цикле (где как раз и живут все найденные баги),
-        # порядок был противоположным. Лимит расходов на Anthropic поднят
-        # пользователем — пробуем Anthropic первым и здесь тоже; DeepSeek
-        # остаётся быстрым запасным вариантом, если Anthropic недоступен.
+        # так надёжно следует детальным инструкциям роадмапа, как Claude.
+        # Порядок фолбэка (по явному запросу пользователя, 2026-09-18):
+        # Anthropic -> ChatGPT -> Gemini -> DeepSeek последним — тот же
+        # порядок, что и в llm.call_claude/call_fallback_llm.
         turn = None
         if config.ANTHROPIC_API_KEY:
             anthropic_messages = _openai_history_to_anthropic(history)
             turn = await _anthropic_turn(system_prompt, anthropic_messages)
-        if turn is None and _deepseek_client:
-            turn = await _deepseek_turn(system_prompt, history)
+        if turn is None and _chatgpt_client:
+            turn = await _chatgpt_turn(system_prompt, history)
         if turn is None and _fallback_client:
             turn = await _gemini_turn(system_prompt, history)
+        if turn is None and _deepseek_client:
+            turn = await _deepseek_turn(system_prompt, history)
         if turn is None:
             return AgentTurnResult(reply="⚠️ Ни один провайдер модели недоступен сейчас. Попробуй через минуту.")
 

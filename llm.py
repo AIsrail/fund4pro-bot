@@ -22,16 +22,18 @@ import config
 logger = logging.getLogger("fund4pro.llm")
 _client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 
-_deepseek_client = None
-if getattr(config, "DEEPSEEK_API_KEY", None) and AsyncOpenAI is not None:
+# Порядок фолбэка (по явному запросу пользователя, 2026-09-18): Anthropic ->
+# ChatGPT (OpenAI) -> Gemini -> DeepSeek последним. Раньше DeepSeek шёл вторым
+# и оказался наименее надёжным в следовании детальным инструкциям роадмапа
+# (см. комментарии в agent_engine.py про баги поведения бота) — теперь он
+# последний резерв, а не второй по важности провайдер.
+_chatgpt_client = None
+if getattr(config, "OPENAI_API_KEY", None) and AsyncOpenAI is not None:
     try:
-        _deepseek_client = AsyncOpenAI(
-            api_key=config.DEEPSEEK_API_KEY,
-            base_url="https://api.deepseek.com",
-        )
-        logger.info("DeepSeek client initialized successfully (model=%s)", config.DEEPSEEK_MODEL)
-    except Exception as _de:
-        logger.warning("Failed to initialize DeepSeek client: %s", _de)
+        _chatgpt_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+        logger.info("ChatGPT (OpenAI) client initialized successfully (model=%s)", config.OPENAI_MODEL)
+    except Exception as _oe:
+        logger.warning("Failed to initialize ChatGPT client: %s", _oe)
 
 _fallback_client = None
 if getattr(config, "GEMINI_API_KEY", None) and AsyncOpenAI is not None:
@@ -43,6 +45,17 @@ if getattr(config, "GEMINI_API_KEY", None) and AsyncOpenAI is not None:
         logger.info("Fallback Gemini client initialized successfully (model=%s)", config.FALLBACK_LLM_MODEL)
     except Exception as _fe:
         logger.warning("Failed to initialize fallback Gemini client: %s", _fe)
+
+_deepseek_client = None
+if getattr(config, "DEEPSEEK_API_KEY", None) and AsyncOpenAI is not None:
+    try:
+        _deepseek_client = AsyncOpenAI(
+            api_key=config.DEEPSEEK_API_KEY,
+            base_url="https://api.deepseek.com",
+        )
+        logger.info("DeepSeek client initialized successfully (model=%s)", config.DEEPSEEK_MODEL)
+    except Exception as _de:
+        logger.warning("Failed to initialize DeepSeek client: %s", _de)
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +300,10 @@ async def call_fallback_llm(
     history: list[dict] | None = None,
     max_tokens: int = 2000,
 ) -> str:
-    """Резервный вызов через DeepSeek (приоритет) или Gemini при отказе Anthropic."""
+    """Резервная цепочка при отказе Anthropic — по явному запросу пользователя
+    (2026-09-18): ChatGPT (OpenAI) -> Gemini -> DeepSeek последним. DeepSeek
+    раньше шёл первым в этой цепочке и оказался наименее надёжным в
+    следовании детальным инструкциям роадмапа — теперь он последний резерв."""
     effective_max_tokens = max(max_tokens, 200)
     messages = []
     if system_prompt.strip():
@@ -296,21 +312,21 @@ async def call_fallback_llm(
         messages.extend(history)
     messages.append({"role": "user", "content": user_message})
 
-    # Приоритетный fallback: DeepSeek
-    if _deepseek_client:
+    # 1) ChatGPT (OpenAI)
+    if _chatgpt_client:
         try:
-            resp = await _deepseek_client.chat.completions.create(
-                model=getattr(config, "DEEPSEEK_MODEL", "deepseek-chat"),
+            resp = await _chatgpt_client.chat.completions.create(
+                model=config.OPENAI_MODEL,
                 messages=messages,
                 max_tokens=effective_max_tokens,
             )
             if resp.choices and resp.choices[0].message and resp.choices[0].message.content:
-                logger.info("Successfully received answer from DeepSeek (%s)", config.DEEPSEEK_MODEL)
+                logger.info("Successfully received answer from ChatGPT (%s)", config.OPENAI_MODEL)
                 return resp.choices[0].message.content
-        except Exception as ds_err:
-            logger.warning("DeepSeek call failed: %s, falling back to Gemini", ds_err)
+        except Exception as oa_err:
+            logger.warning("ChatGPT call failed: %s, falling back to Gemini", oa_err)
 
-    # Запасной fallback: Gemini
+    # 2) Gemini
     if _fallback_client:
         try:
             resp = await _fallback_client.chat.completions.create(
@@ -319,10 +335,24 @@ async def call_fallback_llm(
                 max_tokens=effective_max_tokens,
                 extra_body={"reasoning_effort": "none"},
             )
-            if resp.choices and resp.choices[0].message:
+            if resp.choices and resp.choices[0].message and resp.choices[0].message.content:
+                logger.info("Successfully received answer from Gemini (%s)", config.FALLBACK_LLM_MODEL)
                 return resp.choices[0].message.content or ""
         except Exception as gem_err:
-            logger.error("Gemini fallback also failed: %s", gem_err)
+            logger.warning("Gemini call failed: %s, falling back to DeepSeek", gem_err)
+
+    # 3) DeepSeek — последний резерв
+    if _deepseek_client:
+        try:
+            resp = await _deepseek_client.chat.completions.create(
+                model=getattr(config, "DEEPSEEK_MODEL", "deepseek-chat"),
+                messages=messages,
+                max_tokens=effective_max_tokens,
+            )
+            if resp.choices and resp.choices[0].message:
+                return resp.choices[0].message.content or ""
+        except Exception as ds_err:
+            logger.error("DeepSeek (last resort) also failed: %s", ds_err)
 
     return ""
 
@@ -334,15 +364,11 @@ async def call_claude(
     max_tokens: int = 2000,
     prefer_anthropic: bool = False,
 ) -> str:
-    # РЕАЛЬНЫЙ ИНЦИДЕНТ: на длинных генерациях (финальный документ по форме
-    # донора, ~15 разделов) DeepSeek (приоритетный провайдер) стабильно
-    # обрывал ответ на середине заметно раньше запрошенного max_tokens — не
-    # ошибка (текст непустой, вызов формально успешен), а просто короткий
-    # ответ, поэтому обычный "фоллбэк при сбое" здесь не срабатывал вообще.
-    # Несколько слоёв докрутки/разбиения на части смягчили, но не убрали
-    # проблему полностью. prefer_anthropic переставляет Anthropic (заметно
-    # надёжнее держит длину ответа на таких генерациях) на первое место —
-    # используется в generate_final_document и её докрутках/фиксах.
+    # Порядок (по явному запросу пользователя, 2026-09-18): Anthropic всегда
+    # первым, затем ChatGPT -> Gemini -> DeepSeek (см. call_fallback_llm).
+    # prefer_anthropic сохранён как параметр (используется во всех реальных
+    # вызовах документо-генерации) для обратной совместимости сигнатуры, но
+    # больше не меняет порядок — Anthropic теперь первый безусловно.
     async def _try_anthropic() -> str:
         if not config.ANTHROPIC_API_KEY:
             return ""
@@ -365,8 +391,8 @@ async def call_claude(
             logger.warning("Anthropic call failed: %s (%s)", type(exc).__name__, exc)
             return ""
 
-    async def _try_deepseek_or_gemini() -> str:
-        if not (_deepseek_client or _fallback_client):
+    async def _try_fallback_chain() -> str:
+        if not (_chatgpt_client or _fallback_client or _deepseek_client):
             return ""
         try:
             return await call_fallback_llm(
@@ -374,15 +400,10 @@ async def call_claude(
                 history=history, max_tokens=max_tokens,
             )
         except Exception as exc:
-            logger.warning("DeepSeek/Gemini call failed: %s (%s)", type(exc).__name__, exc)
+            logger.warning("Fallback chain (ChatGPT/Gemini/DeepSeek) failed: %s (%s)", type(exc).__name__, exc)
             return ""
 
-    if prefer_anthropic:
-        order = (_try_anthropic, _try_deepseek_or_gemini)
-    elif _deepseek_client:
-        order = (_try_deepseek_or_gemini, _try_anthropic)
-    else:
-        order = (_try_anthropic, _try_deepseek_or_gemini)
+    order = (_try_anthropic, _try_fallback_chain)
 
     last_exc: Exception | None = None
     for attempt in order:
