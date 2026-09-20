@@ -454,6 +454,35 @@ async def receive_any_message(message: Message, state: FSMContext):
     await _run_turn_and_reply(message, state, raw_text)
 
 
+_last_llm_alert_ts = 0.0
+
+
+async def _alert_owner_llm_down(message: Message) -> None:
+    """Владелец узнаёт о том, что все LLM-провайдеры недоступны, сразу, а не
+    по жалобам пользователей ("бот тупит"). Не чаще раза в 30 минут."""
+    global _last_llm_alert_ts
+    import time
+    import config
+
+    owner = getattr(config, "OWNER_CHAT_ID", None)
+    if not owner and getattr(config, "UNLIMITED_USER_IDS", None):
+        owner = min(config.UNLIMITED_USER_IDS)
+    if not owner:
+        return
+    if time.time() - _last_llm_alert_ts < 1800:
+        return
+    _last_llm_alert_ts = time.time()
+    try:
+        await message.bot.send_message(
+            owner,
+            "🚨 fund4pro-bot: ни один LLM-провайдер не отвечает (лимит/баланс). "
+            "Проверьте: Anthropic (месячный лимит), OpenAI (кредиты), Gemini (spend cap), "
+            "DeepSeek (баланс). Пользователи видят сообщение об этом.",
+        )
+    except Exception:
+        logger.warning("Failed to alert owner about LLM outage", exc_info=True)
+
+
 async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: str) -> None:
     session = await state.get_data()
     try:
@@ -469,7 +498,25 @@ async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: st
         )
         return
 
+    found_notes = session.pop("_found_data_notes", [])
     await state.set_data(session)  # сохраняем актуализированные данные
+
+    if getattr(result, "llm_unavailable", False):
+        await _alert_owner_llm_down(message)
+
+    # Пользователь должен видеть, ЧТО именно бот нашёл в сети и на чём
+    # строит цифры — раньше находки уходили только модели (в скрытый
+    # результат инструмента) и в документ, а в чате их не было видно.
+    if found_notes:
+        from telegram_text import send_long
+        blocks = []
+        for n in found_notes:
+            src = "\n".join(f"• {s['title']} — {s['url']}" for s in n.get("sources", [])[:3])
+            blocks.append(f"🔎 Поиск: «{n['query']}»\n{n['summary'][:900]}" + (f"\n\nИсточники:\n{src}" if src else ""))
+        try:
+            await send_long(message, "\n\n———\n\n".join(blocks))
+        except Exception:
+            logger.warning("Failed to send found-data block", exc_info=True)
 
     # Долгоживущий снепшот (Redis, переживает /start и "Начать заново") —
     # best-effort, не должен ронять ответ пользователю при сбое Redis.

@@ -179,6 +179,57 @@ async def build_table_answers(fields: list[FieldSpec], session_data: dict) -> di
     return answers
 
 
+XYZ_MAX_SHARE = 0.10  # не более 10% значений в заявке могут быть маркерами XYZ
+_NUM_RE = re.compile(r"\d[\d\s.,]*")
+
+
+def xyz_ratio(texts: list[str]) -> float:
+    """Доля XYZ среди всех "значений" (числа + XYZ) в текстах заявки."""
+    xyz = sum(t.count("XYZ") for t in texts)
+    nums = sum(len(_NUM_RE.findall(t.replace("XYZ", " "))) for t in texts)
+    total = xyz + nums
+    return xyz / total if total else 0.0
+
+
+async def enforce_xyz_budget(
+    answers: dict[str, str], table_answers: dict[str, list[list[str]]], session_data: dict,
+) -> float:
+    """Если XYZ больше 10% — один проход llm.resolve_placeholders_batch по
+    фрагментам с XYZ (замена на оценки от бюджета). Правит answers и
+    table_answers на месте, возвращает итоговую долю XYZ."""
+    from llm import resolve_placeholders_batch
+
+    def all_texts() -> list[str]:
+        return list(answers.values()) + [c for rows in table_answers.values() for r in rows for c in r]
+
+    ratio = xyz_ratio(all_texts())
+    if ratio <= XYZ_MAX_SHARE:
+        return ratio
+
+    items = [{"id": fid, "text": t} for fid, t in answers.items() if "XYZ" in t]
+    for fid, rows in table_answers.items():
+        for ri, row in enumerate(rows):
+            for ci, cell in enumerate(row):
+                if "XYZ" in cell:
+                    items.append({"id": f"{fid}|{ri}|{ci}", "text": cell})
+
+    for i in range(0, len(items), 12):
+        resolved = await resolve_placeholders_batch(items[i:i + 12], session_data)
+        for key, new_text in resolved.items():
+            if "|" in key:
+                fid, ri, ci = key.split("|")
+                try:
+                    table_answers[fid][int(ri)][int(ci)] = new_text
+                except (KeyError, IndexError, ValueError):
+                    pass
+            elif key in answers:
+                answers[key] = new_text
+
+    final = xyz_ratio(all_texts())
+    logger.info("enforce_xyz_budget: XYZ share %.0f%% -> %.0f%%", ratio * 100, final * 100)
+    return final
+
+
 def _fill_kv_cell(target, val: str) -> None:
     target.text = ""
     p = target.paragraphs[0] if target.paragraphs else target.add_paragraph()
@@ -320,6 +371,10 @@ async def fill_donor_docx_template_v2(template_path: str, output_path: str, sess
 
     answers = await build_field_answers(fields, session)
     table_answers = await build_table_answers(fields, session)
+    try:
+        await enforce_xyz_budget(answers, table_answers, session)
+    except Exception:
+        logger.warning("enforce_xyz_budget failed, continuing with unresolved XYZ", exc_info=True)
     filled_kv, filled_sections, filled_tables = write_answers_to_template(fields, answers, table_answers)
 
     logger.info(

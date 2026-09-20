@@ -12,7 +12,7 @@ import re
 from docx.shared import RGBColor
 
 _XYZ_RE = re.compile(r"XYZ")
-XYZ_COLOR = RGBColor(0xCC, 0x00, 0x00)
+XYZ_COLOR = RGBColor(0xFF, 0x00, 0x00)  # яркий красный — заметнее прежнего тёмного 0xCC0000
 
 
 def add_text_xyz_highlighted(

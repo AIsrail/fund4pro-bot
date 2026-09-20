@@ -37,7 +37,9 @@ class AgentTurnResult:
         tool_log: list[str] | None = None,
         quick_replies: list[str] | None = None,
         file_attachments: list[dict] | None = None,
+        llm_unavailable: bool = False,
     ):
+        self.llm_unavailable = llm_unavailable
         self.reply = reply
         self.document_ready = document_ready
         self.document_text = document_text
@@ -334,6 +336,9 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
             summary, sources = "", []
 
         if summary:
+            session.setdefault("_found_data_notes", []).append(
+                {"query": query, "summary": summary, "sources": sources[:5]}
+            )
             src_lines = "\n".join(f"- {s['title']}: {s['url']}" for s in sources[:5])
             return (
                 f"Найдено по запросу '{query}' (живой веб-поиск через Claude):\n{summary}\n\n"
@@ -364,6 +369,11 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
                 "предложи прислать свои источники, если есть."
             )
         formatted = format_results_for_prompt(results)
+        session.setdefault("_found_data_notes", []).append({
+            "query": query,
+            "summary": "\n".join(f"• {r['title']}: {r['snippet'][:200]}" for r in results[:4]),
+            "sources": [{"title": r["title"], "url": r["url"]} for r in results[:4]],
+        })
         return (
             f"Найдено по запросу '{query}' (best-effort веб-поиск, источники "
             f"НЕ верифицированы — прежде чем использовать конкретную цифру, "
@@ -861,12 +871,18 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
     system_prompt = build_system_prompt(project_data, flow, ui_language, doc_language)
 
     history = session.setdefault("history_openai", [])  # плоский OpenAI-формат, провайдеро-независимый
+    # Точка отката: если ни один провайдер не ответил, реплика пользователя и
+    # всё дописанное в этом ходу удаляются из истории — иначе при повторе то же
+    # сообщение окажется в истории дважды, а модель увидит "ответ без вопроса"
+    # (реальная причина путаницы шагов при отказе провайдеров).
+    history_rollback_len = len(history)
     history.append({"role": "user", "content": user_text})
     _trim_history(history)
 
     tool_log: list[str] = []
     document_ready = False
     document_text = ""
+    empty_reply_retries = 0
 
     for round_i in range(MAX_TOOL_ROUNDS):
         # РЕАЛЬНЫЙ ИНЦИДЕНТ: DeepSeek был поставлен основным провайдером ещё
@@ -889,10 +905,33 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
         if turn is None and _deepseek_client:
             turn = await _deepseek_turn(system_prompt, history)
         if turn is None:
-            return AgentTurnResult(reply="⚠️ Ни один провайдер модели недоступен сейчас. Попробуй через минуту.")
+            del history[min(history_rollback_len, len(history)):]
+            return AgentTurnResult(
+                reply=(
+                    "⚠️ Сейчас у бота нет доступа ни к одной ИИ-модели (исчерпан лимит или баланс "
+                    "у провайдеров). Это не ошибка в вашем сообщении — оно НЕ потеряно: просто "
+                    "отправьте его ещё раз, когда доступ восстановят. Владельцу бота уже отправлено "
+                    "уведомление."
+                ),
+                llm_unavailable=True,
+            )
+
+        if not turn["tool_calls"] and not (turn["text"] or "").strip():
+            # Пустой ответ модели раньше подменялся заглушкой "Понял, продолжаем." —
+            # бот делал вид, что шаг пройден, и шаги диалога расходились с
+            # реальным состоянием. Теперь: один повтор запроса, затем честная ошибка.
+            if empty_reply_retries < 1:
+                empty_reply_retries += 1
+                logger.warning("Empty model reply (no text, no tool calls) — retrying once")
+                continue
+            del history[min(history_rollback_len, len(history)):]
+            return AgentTurnResult(
+                reply="⚠️ Модель вернула пустой ответ. Повторите, пожалуйста, ваше сообщение ещё раз.",
+                llm_unavailable=True,
+            )
 
         if not turn["tool_calls"]:
-            reply = turn["text"] or "Понял, продолжаем."
+            reply = turn["text"]
             quick_replies = session.pop("_pending_quick_replies", [])
             file_attachments = session.pop("_pending_file_attachments", [])
 

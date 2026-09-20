@@ -161,8 +161,64 @@ def test_full_pipeline_with_mocked_llm_preserves_structure_and_places_answers_co
         llm.call_claude = original_call_claude
 
 
+def test_xyz_share_is_capped_by_second_pass():
+    """Пользователь: «90% должны быть данные, только 10% можно XYZ». Если
+    доля XYZ выше 10%, enforce_xyz_budget должен заменить XYZ оценками."""
+    import llm
+    from docx_schema_fill import enforce_xyz_budget, xyz_ratio
+
+    async def fake_call_claude(system_prompt, user_message, history=None, max_tokens=2000, prefer_anthropic=False):
+        out = {}
+        for line in user_message.strip().split(chr(10)):
+            key, _, text = line.partition(": ")
+            out[key] = text.replace("XYZ", "около 120")
+        return json.dumps(out, ensure_ascii=False)
+
+    original = llm.call_claude
+    llm.call_claude = fake_call_claude
+    try:
+        answers = {"f1": "XYZ туристов, рост XYZ%, XYZ тонн", "f2": "Проект длится 12 месяцев, 4 семинара"}
+        table_answers = {"f3": [["1", "Семинары", "XYZ мес.", "XYZ"]]}
+        assert xyz_ratio(list(answers.values())) > 0.10
+        final = asyncio.run(enforce_xyz_budget(answers, table_answers, {"org_info": "x"}))
+        assert final <= 0.10, final
+        assert "XYZ" not in answers["f1"] and "около 120" in answers["f1"]
+        assert "XYZ" not in table_answers["f3"][0][2]
+        print("OK: XYZ share capped at <=10% via second pass")
+    finally:
+        llm.call_claude = original
+
+
+def test_all_providers_down_rolls_back_history_and_flags_outage():
+    """Все LLM-провайдеры недоступны: реплика пользователя не должна
+    оставаться в истории (иначе путаница шагов при повторе), ответ —
+    понятное сообщение, llm_unavailable=True (для уведомления владельца)."""
+    import agent_engine
+
+    async def none_turn(*a, **k):
+        return None
+
+    saved = (agent_engine._anthropic_turn, agent_engine._chatgpt_turn,
+             agent_engine._gemini_turn, agent_engine._deepseek_turn)
+    agent_engine._anthropic_turn = none_turn
+    agent_engine._chatgpt_client = agent_engine._fallback_client = agent_engine._deepseek_client = None
+    agent_engine.config.ANTHROPIC_API_KEY = "x"
+    try:
+        session = {"history_openai": [{"role": "user", "content": "старое"}, {"role": "assistant", "content": "ответ"}]}
+        result = asyncio.run(agent_engine.run_agent_turn(session, "новое сообщение"))
+        assert result.llm_unavailable is True
+        assert [m["content"] for m in session["history_openai"]] == ["старое", "ответ"], session["history_openai"]
+        assert "потеряно" in result.reply
+        print("OK: provider outage rolls back history and flags llm_unavailable")
+    finally:
+        (agent_engine._anthropic_turn, agent_engine._chatgpt_turn,
+         agent_engine._gemini_turn, agent_engine._deepseek_turn) = saved
+
+
 if __name__ == "__main__":
     test_extract_template_schema_finds_all_real_fields()
     test_donor_only_fields_are_filtered_before_llm_call()
     test_full_pipeline_with_mocked_llm_preserves_structure_and_places_answers_correctly()
+    test_xyz_share_is_capped_by_second_pass()
+    test_all_providers_down_rolls_back_history_and_flags_outage()
     print("\nAll tests passed.")
