@@ -9,6 +9,7 @@
 import asyncio
 import logging
 import json
+import re
 
 from anthropic import AsyncAnthropic
 
@@ -1724,8 +1725,16 @@ async def summarize_understanding(label: str, content: str) -> str:
         return ""
 
 
+def _today_line() -> str:
+    """Модель не знает текущую дату — раньше проект планировался на месяцы,
+    которые уже прошли (реальный инцидент: «март — октябрь 2026» в сентябре
+    2026). Дата идёт в каждый контекст."""
+    import datetime
+    return f"Сегодняшняя дата: {datetime.date.today().isoformat()} (сроки проекта ставь в будущем, не в прошлом)."
+
+
 def _session_summary(session_data: dict) -> str:
-    parts = []
+    parts = [_today_line()]
     for key in (
         "org_info", "donor_info", "donor_forms_text", "selected_idea", "project_data",
         "goal_and_objectives", "action_trees", "concept_text", "budget_text",
@@ -1823,6 +1832,36 @@ def looks_like_applicant_field(label: str) -> bool:
     return not any(m in l for m in _DONOR_ONLY_FIELD_MARKERS)
 
 
+def _parse_json_rows(raw: str) -> list:
+    """Достаёт массив строк из ответа модели. Устойчив к тексту вокруг JSON
+    и к обрезанному по max_tokens ответу: если массив не закрыт, берём все
+    полностью закрытые строки (раньше обрезанный ответ терял ВСЮ таблицу —
+    план мероприятий оставался пустым)."""
+    start = raw.find("[[")
+    if start == -1:
+        start = raw.find("[")
+    if start == -1:
+        raise ValueError("no JSON array found in response")
+    end = raw.rfind("]")
+    try:
+        parsed = json.loads(raw[start:end + 1])
+        if isinstance(parsed, list):
+            return parsed
+    except Exception:
+        pass
+    rows = []
+    for m in re.finditer(r"\[[^\[\]]*\]", raw[start + 1:]):
+        try:
+            row = json.loads(m.group(0))
+        except Exception:
+            continue
+        if isinstance(row, list):
+            rows.append(row)
+    if not rows:
+        raise ValueError("no complete rows in response")
+    return rows
+
+
 async def fill_table_field(question: str, columns: list[str], session_data: dict) -> list[list[str]]:
     """РЕАЛЬНЫЙ ИНЦИДЕНТ: пользователь прямо указал, что в оригинальной форме
     ГГФ поля "Рабочий план" и "Бюджет проекта" — это не абзац вопроса со
@@ -1860,25 +1899,22 @@ async def fill_table_field(question: str, columns: list[str], session_data: dict
     )
     user_message = f"Вопрос формы: {question}"
 
-    try:
-        raw = await call_claude(system_prompt, user_message, max_tokens=2000, prefer_anthropic=True)
-    except Exception as exc:
-        logger.warning("fill_table_field: call_claude failed: %s: %s", type(exc).__name__, exc)
-        return []
-
-    try:
-        start = raw.find("[")
-        end = raw.rfind("]")
-        if start == -1 or end == -1 or end < start:
-            raise ValueError("no JSON array found in response")
-        parsed = json.loads(raw[start:end + 1])
-        if not isinstance(parsed, list):
-            raise ValueError("unexpected shape")
-    except Exception as exc:
-        logger.warning(
-            "fill_table_field: JSON parse failed: %s: %s | raw[:200]=%r",
-            type(exc).__name__, exc, raw[:200],
-        )
+    parsed = None
+    for attempt in (1, 2):
+        try:
+            raw = await call_claude(system_prompt, user_message, max_tokens=6000, prefer_anthropic=True)
+        except Exception as exc:
+            logger.warning("fill_table_field: call_claude failed (attempt %d): %s: %s", attempt, type(exc).__name__, exc)
+            continue
+        try:
+            parsed = _parse_json_rows(raw)
+            break
+        except Exception as exc:
+            logger.warning(
+                "fill_table_field: JSON parse failed (attempt %d): %s: %s | raw[:200]=%r | raw[-200:]=%r",
+                attempt, type(exc).__name__, exc, raw[:200], raw[-200:],
+            )
+    if parsed is None:
         return []
 
     rows: list[list[str]] = []
@@ -1973,8 +2009,17 @@ async def fill_form_fields_batch(
         f"- Если сумма гранта уже известна из контекста проекта — раздели "
         f"бюджет на статьи расходов ИМЕННО под эту сумму (обратный ход «3 "
         f"деревьев» из методологии), а не общими словами.\n"
+        f"- КОНТАКТЫ И РЕКВИЗИТЫ (ФИО контактного лица, телефон, email, сайт/"
+        f"соцсети, адрес, факс, номер регистрации): бери ТОЛЬКО из контекста "
+        f"проекта, дословно. Если в контексте этого нет — верни ровно \"XYZ\". "
+        f"НИКОГДА не подставляй вместо них год, страну донора, название города "
+        f"или другое \"похожее\" слово.\n"
         f"- Если поле явно не для заявителя (для донора/адвайзера/офиса) — "
         f"верни для него пустую строку \"\".\n"
+        f"- Поле с пометкой «[только текстовая часть]» — в ячейке ниже сама "
+        f"вставлена таблица (план/бюджет), её заполняют отдельно. Ответь ТОЛЬКО "
+        f"на текстовые вопросы (цель, задачи, деятельность, ожидаемый результат, "
+        f"участие женщин/молодёжи/людей с ОВЗ и т.п.), таблицу НЕ дублируй.\n"
         f"- КАЖДЫЙ field_id — ОТДЕЛЬНЫЙ, самостоятельный вопрос анкеты, даже "
         f"если по теме похож на соседний (например разные поля про целевые "
         f"группы, косвенных благополучателей, состав команды — это РАЗНЫЕ "

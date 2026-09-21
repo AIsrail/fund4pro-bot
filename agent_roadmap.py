@@ -498,6 +498,11 @@ FULL_ROADMAP_SYSTEM_PROMPT = "\n\n".join([
 ])
 
 
+def _today_iso() -> str:
+    import datetime
+    return datetime.date.today().isoformat()
+
+
 def compute_next_step(project_data: dict, flow: str = "grant") -> str:
     """Детерминированно (кодом, а не моделью) определяет текущий этап
     разговора по тому, что уже собрано в project_data, и формулирует
@@ -578,6 +583,7 @@ def build_lite_system_prompt(project_data: dict, flow: str, ui_language: str, do
     return (
         LITE_CORE_RULES + "\n\n" + PLACEHOLDER_RULE + "\n\n"
         + "Сейчас пользователь разрабатывает " + subject + ".\n\n"
+        + "СЕГОДНЯШНЯЯ ДАТА: " + _today_iso() + " (сроки проекта — в будущем).\n\n"
         + "ТЕКУЩИЕ ДАННЫЕ ПРОЕКТА:\n" + data_lines + lang + "\n\n"
         + "ТВОЙ СЛЕДУЮЩИЙ ШАГ: " + compute_next_step(project_data, flow)
     )
@@ -619,6 +625,7 @@ def build_system_prompt(project_data: dict, flow: str, ui_language: str, doc_lan
     return (
         f"{FULL_ROADMAP_SYSTEM_PROMPT}\n\n"
         f"Сейчас пользователь разрабатывает {subject}.\n\n"
+        f"СЕГОДНЯШНЯЯ ДАТА: {_today_iso()} — сроки проекта планируй в будущем.\n\n"
         f"ТЕКУЩИЕ ДАННЫЕ ПРОЕКТА (то, что уже известно — не переспрашивай это):\n"
         f"{data_lines}"
         f"{lang_clause}\n\n"

@@ -41,6 +41,7 @@ from xyz_highlight import add_text_xyz_highlighted
 
 logger = logging.getLogger("fund4pro.docx_schema_fill")
 
+PROSE_CELL_MIN_CHARS = 300  # ячейка с вложенной таблицей и вопросом длиннее — есть и текстовая часть
 CHUNK_SIZE = 12  # полей на один структурированный вызов — держит ответ в разумных max_tokens
 
 
@@ -51,6 +52,7 @@ class FieldSpec:
     kind: str  # "kv" (короткий факт рядом с меткой) | "section" (открытый абзац) | "table" (вложенная таблица)
     target: Any  # "kv"/"section": docx.table._Cell; "table": (nested_table, template_row_idx, total_row_idx)
     columns: list[str] | None = None  # только для kind == "table" — заголовки колонок по порядку
+    before_table: bool = False  # "section" в ячейке с вложенной таблицей: текст идёт ВЫШЕ таблицы
 
 
 def extract_template_schema(doc: "docx.Document") -> list[FieldSpec]:
@@ -106,6 +108,18 @@ def extract_template_schema(doc: "docx.Document") -> list[FieldSpec]:
                             f"f{counter}", text, "table",
                             (nested, template_row_idx, total_row_idx), columns=header,
                         ))
+                        # РЕАЛЬНЫЙ ИНЦИДЕНТ: ячейка «ПРОЕКТ: цель, задачи, деятельность,
+                        # результат... + рабочий план» содержит и текстовые вопросы, и
+                        # вложенную таблицу. Раньше поле считалось ТОЛЬКО таблицей —
+                        # описание проекта (главный раздел заявки) не писалось вообще.
+                        # Длинная формулировка = есть текстовая часть -> отдельное
+                        # section-поле, ответ вписывается выше таблицы.
+                        if len(text) > PROSE_CELL_MIN_CHARS:
+                            counter += 1
+                            fields.append(FieldSpec(
+                                f"f{counter}", "[только текстовая часть] " + text, "section",
+                                cell, before_table=True,
+                            ))
                         continue
                     # Вложенная таблица есть, но без узнаваемого шаблона строки
                     # (нет ни одной полностью пустой строки после заголовка) —
@@ -230,17 +244,66 @@ async def enforce_xyz_budget(
     return final
 
 
+_COUNTRY_OR_YEAR_RE = re.compile(
+    r"^(19|20)\d{2}$|^(германия|россия|казахстан|кыргызстан|узбекистан|таджикистан|сша|"
+    r"germany|usa|kyrgyzstan|kazakhstan|uzbekistan|tajikistan)$", re.IGNORECASE)
+
+
+def sanitize_contact_answers(fields: list[FieldSpec], answers: dict[str, str]) -> int:
+    """Страховка от «правдоподобного мусора» в контактах (реальный инцидент:
+    «Контактное лицо: Германия», сайт/телефон/email: «2026»). Если значение
+    по форме не может быть телефоном/email/сайтом/ФИО — заменяем на XYZ,
+    чтобы пользователь увидел красное поле, а не поверил выдумке.
+    Возвращает число исправленных полей."""
+    fixed = 0
+    for f in fields:
+        if f.kind != "kv":
+            continue
+        val = (answers.get(f.field_id) or "").strip()
+        if not val or val.upper() == "XYZ":
+            continue
+        label = f.question.lower()
+        bad = False
+        if "почт" in label or "e-mail" in label or "email" in label:
+            bad = "@" not in val
+        elif "телефон" in label or label.strip() in ("tel", "phone"):
+            bad = sum(ch.isdigit() for ch in val) < 6
+        elif "сайт" in label or "соцсет" in label or "website" in label:
+            bad = not re.search(r"[.@]|instagram|facebook|telegram", val, re.IGNORECASE)
+        elif label.startswith("контактное лицо") or "contact person" in label:
+            words = [w for w in re.split(r"\s+", val) if re.search(r"[^\W\d_]", w)]
+            bad = len(words) < 2 or bool(_COUNTRY_OR_YEAR_RE.match(val))
+        if bad:
+            logger.warning("sanitize_contact_answers: %r -> XYZ (label=%r)", val[:60], f.question[:60])
+            answers[f.field_id] = "XYZ"
+            fixed += 1
+    return fixed
+
+
 def _fill_kv_cell(target, val: str) -> None:
     target.text = ""
     p = target.paragraphs[0] if target.paragraphs else target.add_paragraph()
     add_text_xyz_highlighted(p, val, font_name="Times New Roman", font_size=Pt(10.5))
 
 
-def _append_section_answer(cell, content: str) -> None:
+def _append_section_answer(cell, content: str, before_table: bool = False) -> None:
     p = cell.add_paragraph()
     p.paragraph_format.space_before = Pt(6)
     p.paragraph_format.line_spacing = 1.15
     add_text_xyz_highlighted(p, f"\n{content}", font_name="Times New Roman", font_size=Pt(11))
+    if before_table and cell.tables:
+        # add_paragraph() кладёт абзац в конец ячейки (под вложенную таблицу) —
+        # переносим выше неё; если прямо над таблицей короткий заголовок
+        # («Рабочий план реализации проекта»), текст встаёт над этим заголовком.
+        tbl = cell.tables[0]._tbl
+        anchor = tbl
+        prev = tbl.getprevious()
+        while prev is not None and prev.tag.endswith("}p") and not "".join(prev.itertext()).strip():
+            anchor = prev
+            prev = prev.getprevious()
+        if prev is not None and prev.tag.endswith("}p") and len("".join(prev.itertext()).strip()) < 80:
+            anchor = prev
+        anchor.addprevious(p._p)
 
 
 _NUMBER_RE = re.compile(r"[\d\s]+(?:[.,]\d+)?")
@@ -347,7 +410,7 @@ def write_answers_to_template(
             filled_kv += 1
         else:
             if val not in f.target.text:
-                _append_section_answer(f.target, val)
+                _append_section_answer(f.target, val, before_table=f.before_table)
                 filled_sections += 1
     return filled_kv, filled_sections, filled_tables
 
@@ -370,6 +433,7 @@ async def fill_donor_docx_template_v2(template_path: str, output_path: str, sess
         return False, ""
 
     answers = await build_field_answers(fields, session)
+    sanitize_contact_answers(fields, answers)
     table_answers = await build_table_answers(fields, session)
     try:
         await enforce_xyz_budget(answers, table_answers, session)

@@ -215,10 +215,60 @@ def test_all_providers_down_rolls_back_history_and_flags_outage():
          agent_engine._gemini_turn, agent_engine._deepseek_turn) = saved
 
 
+def test_project_prose_goes_above_plan_table_and_contacts_are_sanitized():
+    """Реальный инцидент (заявка на ГГФ): описание проекта в ячейке с вложенной
+    таблицей плана не писалось вообще; в контактах стояли «Германия»/«2026»."""
+    from docx_schema_fill import (
+        extract_template_schema, write_answers_to_template, sanitize_contact_answers,
+    )
+
+    doc = docx.Document(FIXTURE)
+    fields = extract_template_schema(doc)
+
+    prose = next(f for f in fields if f.kind == "section" and f.before_table)
+    assert prose.question.startswith("[только текстовая часть]"), prose.question
+    assert prose.target.tables, "prose field must live in the cell that holds the nested plan table"
+
+    answers = {prose.field_id: "PROJECT-PROSE-MARKER"}
+    write_answers_to_template(fields, answers, {})
+    cell_xml = list(prose.target._tc.iterchildren())
+    tbl_idx = next(i for i, el in enumerate(cell_xml) if el.tag.endswith("}tbl"))
+    prose_idx = next(i for i, el in enumerate(cell_xml) if "PROJECT-PROSE-MARKER" in "".join(el.itertext()))
+    assert prose_idx < tbl_idx, "project description must be ABOVE the nested plan table"
+
+    def kv(label_part):
+        return next(f for f in fields if f.kind == "kv" and label_part in f.question.lower())
+
+    contact, site, phone, email = kv("контактное лицо"), kv("вебсайт"), kv("телефон"), kv("электронной почты")
+    ans = {contact.field_id: "Германия", site.field_id: "2026", phone.field_id: "2026", email.field_id: "2026"}
+    assert sanitize_contact_answers(fields, ans) == 4
+    assert all(v == "XYZ" for v in ans.values()), ans
+
+    good = {contact.field_id: "Азамат Токтогулов", site.field_id: "destinatsiya.kg",
+            phone.field_id: "+996 555 123 456", email.field_id: "a@b.kg"}
+    assert sanitize_contact_answers(fields, dict(good)) == 0
+    print("OK: project prose above plan table; junk contacts replaced with XYZ")
+
+
+def test_truncated_table_json_keeps_complete_rows():
+    """Ответ модели по плану обрезался по max_tokens — раньше терялась ВСЯ
+    таблица (план оставался пустым). Теперь берутся все закрытые строки."""
+    from llm import _parse_json_rows
+
+    raw = 'Вот план: [["1", "Тренинг", "март", "20 чел."], ["2", "Сайт", "апрель", "1 сайт"], ["3", "Кру'
+    rows = _parse_json_rows(raw)
+    assert rows == [["1", "Тренинг", "март", "20 чел."], ["2", "Сайт", "апрель", "1 сайт"]], rows
+    full = _parse_json_rows('[["1","a","b","c"],["2","d","e","f"]]')
+    assert len(full) == 2
+    print("OK: truncated table JSON still yields complete rows")
+
+
 if __name__ == "__main__":
     test_extract_template_schema_finds_all_real_fields()
     test_donor_only_fields_are_filtered_before_llm_call()
     test_full_pipeline_with_mocked_llm_preserves_structure_and_places_answers_correctly()
     test_xyz_share_is_capped_by_second_pass()
     test_all_providers_down_rolls_back_history_and_flags_outage()
+    test_project_prose_goes_above_plan_table_and_contacts_are_sanitized()
+    test_truncated_table_json_keeps_complete_rows()
     print("\nAll tests passed.")
