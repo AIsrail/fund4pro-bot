@@ -269,6 +269,18 @@ async def restart(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+def _button_text_from_message(callback: CallbackQuery) -> str:
+    """Текст кнопки, по которой нажали, из reply_markup исходного сообщения."""
+    try:
+        for row in callback.message.reply_markup.inline_keyboard:
+            for btn in row:
+                if btn.callback_data == callback.data:
+                    return (btn.text or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
 @router.callback_query(F.data.startswith("qr:"))
 async def handle_quick_reply(callback: CallbackQuery, state: FSMContext):
     """Пользователь тапнул одну из кнопок-подсказок (suggest_quick_replies).
@@ -277,12 +289,17 @@ async def handle_quick_reply(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     data = await state.get_data()
     options = data.get("_active_quick_replies") or []
-    try:
-        idx = int(callback.data.split(":", 1)[1])
-        chosen = options[idx]
-    except (ValueError, IndexError):
-        await callback.message.answer("Эта кнопка устарела — напиши ответ текстом 👇")
-        return
+    # Текст нажатой кнопки берём из самого сообщения: он всегда совпадает с тем,
+    # что видит пользователь. Список в FSM перезаписывается на каждом ходе и
+    # пропадает при рестарте/деплое Render (диск бесплатного тарифа стирается),
+    # из-за чего кнопка из старого сообщения «устаревала» или давала чужой пункт.
+    chosen = _button_text_from_message(callback)
+    if not chosen:
+        try:
+            chosen = options[int(callback.data.split(":", 1)[1])]
+        except (ValueError, IndexError):
+            await callback.message.answer("Эта кнопка устарела — напиши ответ текстом 👇")
+            return
     # Убираем стрелки/пальцы вниз и призывы нажать кнопку, фиксируем выбор в сообщении
     try:
         old_text = callback.message.text or callback.message.caption or ""
