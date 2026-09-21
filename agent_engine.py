@@ -15,7 +15,7 @@ import json
 import logging
 
 import config
-from agent_roadmap import build_system_prompt
+from agent_roadmap import build_lite_system_prompt, build_system_prompt
 from agent_tools import TOOLS_OPENAI, to_anthropic_tools
 from llm import _client, _chatgpt_client, _deepseek_client, _fallback_client
 
@@ -869,6 +869,9 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
     doc_language = session.get("doc_language")
 
     system_prompt = build_system_prompt(project_data, flow, ui_language, doc_language)
+    # Слабым резервным моделям (Gemini flash, DeepSeek) — короткий промпт с вычисленным
+    # кодом шагом: на полном 60-КБ роадмапе они теряли нить и не помнили проект.
+    lite_prompt = build_lite_system_prompt(project_data, flow, ui_language, doc_language)
 
     history = session.setdefault("history_openai", [])  # плоский OpenAI-формат, провайдеро-независимый
     # Точка отката: если ни один провайдер не ответил, реплика пользователя и
@@ -901,9 +904,9 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
         if turn is None and _chatgpt_client:
             turn = await _chatgpt_turn(system_prompt, history)
         if turn is None and _fallback_client:
-            turn = await _gemini_turn(system_prompt, history)
+            turn = await _gemini_turn(lite_prompt, history)
         if turn is None and _deepseek_client:
-            turn = await _deepseek_turn(system_prompt, history)
+            turn = await _deepseek_turn(lite_prompt, history)
         if turn is None:
             del history[min(history_rollback_len, len(history)):]
             return AgentTurnResult(
