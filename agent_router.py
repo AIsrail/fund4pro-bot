@@ -180,15 +180,25 @@ async def choose_flow(callback: CallbackQuery, state: FSMContext):
             "donor_files": last.get("donor_files") or {},
         })
         summary = project_memory.summarize(last["project_data"])
+        # РЕАЛЬНАЯ ЖАЛОБА: было только "продолжить этот же проект" / "начать
+        # с нуля" — а частый случай "та же организация, но новый донор" не
+        # покрывался ни одним из двух: продолжить нельзя (это другой донор
+        # и другой проект), а "с нуля" стирал и профиль организации, из-за
+        # чего приходилось заново присылать те же данные об организации,
+        # которые уже даны 2 недели назад. Третья кнопка держит org_info/
+        # org_contacts (в т.ч. «картотеку» контактов — см. document_reader.
+        # extract_contact_facts), но сбрасывает всё донор-специфичное.
         msg = (
             f"Нашёл незавершённый проект — {summary}\n\n"
-            f"Продолжить его или начать новый с чистого листа?"
+            f"Продолжить его, начать полностью новый проект, или это та же "
+            f"организация, но для другого донора?"
         )
-        opts = ["1. Продолжить этот проект", "2. Начать новый проект"]
+        opts = ["1. Продолжить этот проект", "2. Новый проект, та же организация", "3. Начать с чистого листа"]
         await state.update_data(_active_quick_replies_resume=opts)
         kb = InlineKeyboardBuilder()
         kb.button(text=opts[0], callback_data="agent:resume:yes")
-        kb.button(text=opts[1], callback_data="agent:resume:no")
+        kb.button(text=opts[1], callback_data="agent:resume:sameorg")
+        kb.button(text=opts[2], callback_data="agent:resume:no")
         kb.adjust(1)
         await callback.message.answer(msg, reply_markup=kb.as_markup())
         await callback.answer()
@@ -222,6 +232,38 @@ async def resume_project_yes(callback: CallbackQuery, state: FSMContext):
     await _run_turn_and_reply(
         callback.message, state,
         "Продолжаем этот проект. Напомни коротко, на чём мы остановились, и спроси, что делать дальше.",
+    )
+
+
+@router.callback_query(F.data == "agent:resume:sameorg")
+async def resume_project_same_org(callback: CallbackQuery, state: FSMContext):
+    """Тот же заявитель, новый донор: держим org_info/org_contacts (профиль
+    организации + «картотека» контактов), сбрасываем всё донор- и
+    проект-специфичное (донор, форма донора, проблема, цели, бюджет) и файлы
+    старой формы донора — иначе select_donor_form мог бы попытаться заново
+    использовать форму ПРОШЛОГО донора для нового проекта."""
+    data = await state.get_data()
+    pending = data.get("_pending_resume") or {}
+    old_project_data = pending.get("project_data") or {}
+    flow = pending.get("flow", "grant")
+    kept = {
+        k: v for k, v in old_project_data.items()
+        if k in ("org_info", "org_contacts") and v
+    }
+    await state.set_state(Flow.active)
+    await state.set_data({
+        "flow": flow,
+        "ui_language": "ru",
+        "project_data": kept,
+        "history_openai": [],
+    })
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer()
+    await _ensure_active(state)
+    await _run_turn_and_reply(
+        callback.message, state,
+        "Начинаем новый проект для той же организации — данные об организации сохранены, "
+        "повторно спрашивать их не нужно. Спроси про нового донора/конкурс.",
     )
 
 
