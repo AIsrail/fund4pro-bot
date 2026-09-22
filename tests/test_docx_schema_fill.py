@@ -303,6 +303,46 @@ def test_round_budget_total_gets_nudged_to_a_non_round_number():
     print(f"OK: round budget total {total_before} nudged to non-round {total_after}")
 
 
+def test_requested_amount_field_synced_to_actual_budget_table_total():
+    """РЕАЛЬНЫЙ ИНЦИДЕНТ (живая заявка на ГГФ): модель независимо ответила
+    «Запрашиваемая сумма: 7000», а строки бюджетной таблицы (до нуджа) тоже
+    складывались ровно в 7000 — но _nudge_round_total сдвинул итог до 7182
+    (чтобы он не выглядел круглым), и «Запрашиваемая сумма» осталась старым
+    числом. Для донора это хуже круглой суммы — первое, что делает ревьюер,
+    это складывает бюджет на калькуляторе и сверяет с запрошенной суммой.
+    sync_requested_amount_with_budget_total должна подтянуть кв-поле к
+    фактическому ИТОГО, а не наоборот."""
+    from docx_schema_fill import (
+        extract_template_schema, sync_requested_amount_with_budget_total, _nudge_round_total,
+    )
+
+    doc = docx.Document(FIXTURE)
+    fields = extract_template_schema(doc)
+    amount_field = next(f for f in fields if f.kind == "kv" and "Запрашиваемая сумма" in f.question)
+    budget_field = next(f for f in fields if "подробный бюджет проекта" in f.question)
+
+    rows = [
+        ["1", "Контейнеры", "5 точек x $520", "$2 600"],
+        ["2", "Обучение", "150 участников", "$700"],
+        ["3", "Походы", "2 похода", "$1 200"],
+        ["4", "Вывоз мусора", "около 400 кг", "$610"],
+        ["5", "Админ", "12 месяцев", "$1 050"],
+        ["6", "M&E", "12 месяцев", "$420"],
+        ["7", "Контингенси", "резерв", "$420"],
+    ]
+    assert sum(float(r[-1].replace("$", "").replace(" ", "")) for r in rows) == 7000  # круглая, как модель и ответила
+    _nudge_round_total(rows, budget_field.columns)
+    nudged_total = sum(float(r[-1].replace("$", "").replace(" ", "")) for r in rows)
+    assert nudged_total != 7000, "fixture setup: nudge should have moved the total off 7000"
+
+    answers = {amount_field.field_id: "7 000"}  # модель ответила независимо, до нуджа
+    table_answers = {budget_field.field_id: rows}
+    changed = sync_requested_amount_with_budget_total(fields, answers, table_answers)
+    assert changed is True
+    assert answers[amount_field.field_id] == f"{nudged_total:,.0f}".replace(",", " ")
+    print(f"OK: requested-amount field synced from stale 7 000 to actual budget total {answers[amount_field.field_id]}")
+
+
 def test_truncated_form_fields_batch_recovers_complete_fields_not_the_whole_batch():
     """РЕАЛЬНЫЙ ИНЦИДЕНТ (Render, эта же сессия): батч из 12 полей на
     max_tokens=4000 обрезался ДО закрывающей "}" — весь батч (включая раздел
@@ -450,6 +490,7 @@ if __name__ == "__main__":
     test_project_prose_goes_above_plan_table_and_contacts_are_sanitized()
     test_truncated_table_json_keeps_complete_rows()
     test_round_budget_total_gets_nudged_to_a_non_round_number()
+    test_requested_amount_field_synced_to_actual_budget_table_total()
     test_truncated_form_fields_batch_recovers_complete_fields_not_the_whole_batch()
     test_excess_blank_paragraphs_are_collapsed_after_writing_an_answer()
     test_extract_contact_facts_reads_real_org_profile()

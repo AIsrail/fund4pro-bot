@@ -194,6 +194,51 @@ async def build_table_answers(fields: list[FieldSpec], session_data: dict) -> di
     return answers
 
 
+_REQUESTED_AMOUNT_RE = re.compile(
+    r"запрашиваем\w*\s+сумм|сумм\w*\s+гранта|requested\s+amount|amount\s+requested", re.IGNORECASE)
+
+
+def sync_requested_amount_with_budget_total(
+    fields: list[FieldSpec], answers: dict[str, str], table_answers: dict[str, list[list[str]]],
+) -> bool:
+    """РЕАЛЬНЫЙ ИНЦИДЕНТ (пойман на живой заявке): «Запрашиваемая сумма» —
+    отдельное kv-поле, отвечает на него модель независимо от бюджетной
+    таблицы. Обычно оба ответа совпадают (сумма строк = ровно запрошенная
+    сумма) — но _nudge_round_total (см. выше) намеренно чуть меняет ОДНУ
+    строку бюджета, если итог подозрительно круглый, и после этого ИТОГО
+    таблицы и «Запрашиваемая сумма» разъезжаются на ту же величину (в живом
+    прогоне: $7000 заявлено, а таблица сложилась в $7182). Для донора это
+    даже хуже, чем круглая сумма — правило из грантового плейбука «сумма
+    строк бюджета ДОЛЖНА дословно совпадать с запрошенной суммой» (это же
+    первая проверка любого ревьюера, складывающего колонку на калькуляторе).
+    Поэтому запрошенная сумма — не независимый ответ модели, а ВСЕГДА
+    производная от фактической суммы бюджетной таблицы, вычисленной
+    в последнюю очередь (после нуджа), а не наоборот."""
+    budget_field = next(
+        (f for f in fields if f.kind == "table" and f.columns and _MONEY_COL_RE.search(f.columns[-1])),
+        None,
+    )
+    if budget_field is None:
+        return False
+    rows = table_answers.get(budget_field.field_id)
+    if not rows:
+        return False
+    total = sum(v for v in (_extract_number(r[-1]) for r in rows) if v is not None)
+    if not total:
+        return False
+    formatted = f"{total:,.0f}".replace(",", " ")
+
+    amount_field = next(
+        (f for f in fields if f.kind == "kv" and _REQUESTED_AMOUNT_RE.search(f.question)), None,
+    )
+    if amount_field is None:
+        return False
+    if answers.get(amount_field.field_id) != formatted:
+        answers[amount_field.field_id] = formatted
+        return True
+    return False
+
+
 XYZ_MAX_SHARE = 0.10  # не более 10% значений в заявке могут быть маркерами XYZ
 _NUM_RE = re.compile(r"\d[\d\s.,]*")
 
@@ -565,6 +610,11 @@ async def fill_donor_docx_template_v2(template_path: str, output_path: str, sess
         await enforce_xyz_budget(answers, table_answers, session)
     except Exception:
         logger.warning("enforce_xyz_budget failed, continuing with unresolved XYZ", exc_info=True)
+    # Последним шагом, ПОСЛЕ нуджа круглого итога и XYZ-подстановки (оба
+    # могут менять сумму строк бюджета) — синхронизируем «Запрашиваемая
+    # сумма» с фактическим ИТОГО, а не наоборот.
+    if sync_requested_amount_with_budget_total(fields, answers, table_answers):
+        logger.info("fill_donor_docx_template_v2: synced requested-amount field to actual budget total")
     filled_kv, filled_sections, filled_tables = write_answers_to_template(fields, answers, table_answers)
 
     logger.info(
