@@ -598,7 +598,48 @@ LITE_CORE_RULES = """
 5. Не начинай разговор заново и не здоровайся повторно: ты продолжаешь существующий проект.
 6. Для цифр и статистики используй search_project_data и показывай найденное.
 7. Документ собирает ТОЛЬКО вызов generate_document — не пиши текст заявки в чате.
+8. Если ниже есть блок «ПРОВЕРЕННЫЕ КОНТАКТЫ ОРГАНИЗАЦИИ» — это уже известные факты
+   (телефон/email/сайт/адрес), даже для НОВОГО донора/проекта той же организации.
+   Используй их напрямую. НИКОГДА не говори «без точных данных двигаемся дальше»
+   и не ставь XYZ вместо того, что уже перечислено в этом блоке.
 """.strip()
+
+
+def _format_project_data_lines(project_data: dict, truncate: int | None = None) -> str:
+    """РЕАЛЬНЫЙ ИНЦИДЕНТ: пользователь второй раз в одном разговоре (второй
+    проект, новый донор, ТА ЖЕ организация) продиктовал контакты, а бот
+    (в этот момент на DeepSeek — Anthropic упёрся в месячный лимит, Gemini —
+    в spend cap) заявил "без точных данных двигаемся дальше" и поставил
+    XYZ, хотя телефон/email/сайт/адрес уже были в project_data["org_contacts"]
+    (см. document_reader.extract_contact_facts) — та же картотека, что уже
+    верно сработала в предыдущем прогоне ЭТОЙ ЖЕ сессии. Причина: org_contacts
+    — словарь, а не строка, и оба построителя промпта просто делали
+    f"- {{k}}: {{v}}" по project_data.items() — для словаря это неявный
+    Python-repr одной строкой ("{{'org_phone': '...', 'org_email': '...'}}"),
+    без явной метки "это проверенные контакты, юзай их". Слабая модель
+    (единственная реально доступная сейчас) не распознала это как факты для
+    использования и просто не сработала. Теперь org_contacts форматируется
+    ОТДЕЛЬНЫМ, явно подписанным блоком, тем же способом, что уже работает в
+    llm._session_summary для шага финальной генерации — эта функция
+    закрывает тот же разрыв на уровне разговорного промпта."""
+    project_data = project_data or {}
+    parts = []
+    contacts = project_data.get("org_contacts")
+    if isinstance(contacts, dict) and contacts:
+        contact_lines = "\n".join(f"  - {k}: {v}" for k, v in contacts.items())
+        parts.append(
+            "ПРОВЕРЕННЫЕ КОНТАКТЫ ОРГАНИЗАЦИИ (уже известны дословно — "
+            "используй их НАПРЯМУЮ, НИКОГДА не проси продиктовать их заново "
+            "и не ставь вместо них XYZ):\n" + contact_lines
+        )
+    for k, v in project_data.items():
+        if not v or k == "org_contacts":
+            continue
+        text = str(v)
+        if truncate:
+            text = text[:truncate]
+        parts.append(f"- {k}: {text}")
+    return "\n".join(parts) if parts else "(пока ничего не собрано — начало разговора)"
 
 
 def build_lite_system_prompt(project_data: dict, flow: str, ui_language: str, doc_language: str | None) -> str:
@@ -607,8 +648,7 @@ def build_lite_system_prompt(project_data: dict, flow: str, ui_language: str, do
     вычисленный кодом следующий шаг. Полный роадмап Claude держит, слабые
     модели — нет."""
     subject = "грантового проекта" if flow == "grant" else "бизнес-плана"
-    items = [f"- {k}: {str(v)[:1500]}" for k, v in (project_data or {}).items() if v]
-    data_lines = "\n".join(items) or "(пока ничего не собрано — начало разговора)"
+    data_lines = _format_project_data_lines(project_data, truncate=1500)
     lang = ""
     if doc_language:
         lang = "\nДокумент (generate_document) пиши на языке: " + str(doc_language) + "."
@@ -636,10 +676,7 @@ def build_system_prompt(project_data: dict, flow: str, ui_language: str, doc_lan
     lang_names = {"ru": "русском", "ky": "кыргызском", "en": "английском"}
     subject = "грантового проекта" if flow == "grant" else "бизнес-плана"
 
-    if project_data:
-        data_lines = "\n".join(f"- {k}: {v}" for k, v in project_data.items() if v)
-    else:
-        data_lines = "(пока ничего не собрано — это самое начало разговора)"
+    data_lines = _format_project_data_lines(project_data)
 
     lang_clause = (
         "\n\nЯЗЫК ОБЩЕНИЯ: отвечай на том языке, на котором пользователь "
