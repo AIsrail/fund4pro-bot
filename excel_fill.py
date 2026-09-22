@@ -70,6 +70,53 @@ def fill_xlsx_template(content: bytes, cell_values: dict) -> bytes:
     return buf.getvalue()
 
 
+async def fill_donor_xlsx_template_v1(template_path: str, output_path: str, session: dict) -> tuple[bool, str]:
+    """xlsx-аналог docx_schema_fill.fill_donor_docx_template_v2 / pdf_form_fill.
+    fill_donor_pdf_template_v1 — тот же контракт (успех, текст_для_проверки),
+    чтобы agent_docgen._try_schema_fill мог выбирать путь по расширению
+    файла. РЕАЛЬНЫЙ ИНЦИДЕНТ: этот модуль существовал и работал, но был
+    подключён только в СТАРОМ FSM-хендлере (handlers/budget.py), который
+    текущая агентная архитектура (bot.py подключает только agent_router) не
+    вызывает вообще — для донора с бюджетным Excel-шаблоном (например NED)
+    бот раньше никогда не пытался заполнить именно его файл."""
+    try:
+        with open(template_path, "rb") as fh:
+            content = fh.read()
+    except Exception as e:
+        logger.warning("fill_donor_xlsx_template_v1: could not read %s: %s", template_path, e)
+        return False, ""
+
+    project_data = session.get("project_data", {})
+    budget_text = project_data.get("activities_and_budget", "")
+    if not budget_text.strip():
+        logger.info("fill_donor_xlsx_template_v1: no activities_and_budget yet, nothing to map")
+        return False, ""
+
+    structure = extract_xlsx_structure(content)
+    if not structure.strip():
+        logger.info("fill_donor_xlsx_template_v1: empty xlsx structure (no labelled cells) in %s", template_path)
+        return False, ""
+
+    mapping = await generate_budget_cell_mapping(structure, budget_text)
+    if not mapping:
+        logger.warning("fill_donor_xlsx_template_v1: could not determine cell mapping for %s", template_path)
+        return False, ""
+
+    try:
+        filled = fill_xlsx_template(content, mapping)
+    except Exception:
+        logger.warning("fill_donor_xlsx_template_v1: fill_xlsx_template failed", exc_info=True)
+        return False, ""
+
+    with open(output_path, "wb") as fh:
+        fh.write(filled)
+
+    n_cells = sum(len(cells) for cells in mapping.values())
+    logger.info("fill_donor_xlsx_template_v1: filled %d cell(s) across %d sheet(s) in %s", n_cells, len(mapping), template_path)
+    text_for_check = "\n".join(f"{sheet}!{coord}: {val}" for sheet, cells in mapping.items() for coord, val in cells.items())
+    return True, text_for_check
+
+
 async def generate_budget_cell_mapping(structure_text: str, budget_text: str) -> dict:
     """LLM решает, в какие координаты ячеек вписать какие суммы, основываясь
     на согласованном с пользователем бюджете. Возвращает {} при любой

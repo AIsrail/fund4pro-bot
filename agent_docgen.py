@@ -87,12 +87,23 @@ async def _try_schema_fill(session: dict) -> str | None:
     # — docx_schema_fill физически не умеет такое открыть. Раньше это молча
     # проваливалось в legacy-путь (свободный текст, НЕ официальная форма
     # донора), хотя правильный файл был выбран верно. См. pdf_form_fill.py.
-    is_pdf = donor_doc_path.lower().endswith(".pdf")
+    #
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ #2: у того же NED бюджет — отдельный Excel-шаблон
+    # (Application-Budget...xlsx), и в этой (агентной, v3) архитектуре
+    # excel_fill.py никогда не вызывался вообще — он был подключён только в
+    # СТАРОМ FSM-хендлере handlers/budget.py, который bot.py больше не
+    # регистрирует. Донор реально ждёт заполненный именно ЕГО Excel-файл
+    # (с его формулами/листами), не текстовую имитацию бюджета в .docx.
+    ext = donor_doc_path.lower().rsplit(".", 1)[-1] if "." in donor_doc_path else ""
     try:
-        if is_pdf:
+        if ext == "pdf":
             from pdf_form_fill import fill_donor_pdf_template_v1
             path = os.path.join(tmp_dir, "final_version.pdf")
             success, text_for_check = await fill_donor_pdf_template_v1(donor_doc_path, path, session)
+        elif ext == "xlsx":
+            from excel_fill import fill_donor_xlsx_template_v1
+            path = os.path.join(tmp_dir, "final_version.xlsx")
+            success, text_for_check = await fill_donor_xlsx_template_v1(donor_doc_path, path, session)
         else:
             from docx_schema_fill import fill_donor_docx_template_v2
             path = os.path.join(tmp_dir, "final_version.docx")
@@ -102,19 +113,23 @@ async def _try_schema_fill(session: dict) -> str | None:
         return None
 
     if not success:
-        if is_pdf:
+        if ext == "pdf":
             # Плоский/сканированный PDF без реальных AcroForm-полей — заполнить
             # программно нечем; честно падаем на legacy-путь (текстовый
             # черновик для ручного переноса), а не делаем вид, что форма заполнена.
             logger.warning("_try_schema_fill: PDF has no fillable AcroForm fields — falling back to legacy pipeline")
+        elif ext == "xlsx":
+            logger.warning("_try_schema_fill: xlsx budget mapping failed/empty — falling back to legacy pipeline")
         else:
             logger.warning("_try_schema_fill: schema-based fill did not succeed, falling back to legacy pipeline")
         return None
     logger.info("_try_schema_fill: schema-based fill succeeded — used for %s", donor_doc_path)
 
     session["final_document_text"] = text_for_check
-    if is_pdf:
+    if ext == "pdf":
         session["_prebuilt_pdf_path"] = path
+    elif ext == "xlsx":
+        session["_prebuilt_xlsx_path"] = path
     else:
         session["_prebuilt_docx_path"] = path
     return path
@@ -214,12 +229,16 @@ async def export_docx(text: str, session: dict) -> tuple[str, bool]:
     from docgen import markdown_to_docx
     from docx_template_fill import fill_donor_docx_template
 
-    # PDF-путь (см. _try_schema_fill/pdf_form_fill.py) проверяем первым —
-    # у него нет отдельного legacy fuzzy-matching фолбэка (fill_donor_docx_template
-    # работает только с .docx), так что если PDF уже собран, это финальный файл.
+    # PDF/xlsx-пути (см. _try_schema_fill) проверяем первыми — у них нет
+    # отдельного legacy fuzzy-matching фолбэка (fill_donor_docx_template
+    # работает только с .docx), так что если файл уже собран, это финальный файл.
     prebuilt_pdf = session.pop("_prebuilt_pdf_path", None)
     if prebuilt_pdf and os.path.exists(prebuilt_pdf):
         return prebuilt_pdf, True
+
+    prebuilt_xlsx = session.pop("_prebuilt_xlsx_path", None)
+    if prebuilt_xlsx and os.path.exists(prebuilt_xlsx):
+        return prebuilt_xlsx, True
 
     prebuilt = session.pop("_prebuilt_docx_path", None)
     if prebuilt and os.path.exists(prebuilt):

@@ -583,7 +583,12 @@ def compute_next_step(project_data: dict, flow: str = "grant") -> str:
                 "Сохрани update_project(activities_and_budget).")
     else:
         step = ("ЭТАП 7. Всё собрано. Коротко перескажи концепцию и бюджет, спроси подтверждение кнопками "
-                "и при согласии (или прямой команде «собери документ») вызови generate_document.")
+                "и при согласии (или прямой команде «собери документ») вызови generate_document. ЕСЛИ у "
+                "донора НЕСКОЛЬКО обязательных документов (формы с полями И/ИЛИ гайдлайны содержания — см. "
+                "donor_form_candidates/saved_donor_files) — заявка НЕ готова после одного вызова "
+                "generate_document: явно перечисли пользователю, какие документы ещё не собраны, и "
+                "продолжи select_donor_form + generate_document по каждому оставшемуся, прежде чем "
+                "сказать, что пакет полный.")
     return header + step
 
 
