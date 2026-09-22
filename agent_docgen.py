@@ -64,14 +64,23 @@ async def _try_schema_fill(session: dict) -> str | None:
 
     project_data = session.get("project_data", {})
     if not project_data.get("donor_template"):
+        # РЕАЛЬНЫЙ ИНЦИДЕНТ: этот и следующий ранний выход раньше не логировались
+        # вообще — когда v2 молча падал на legacy fuzzy-matching пайплайн (тот
+        # самый источник бага "ответ попал не в ту ячейку", ради которого весь
+        # v2 и писался), в логах не оставалось НИ СЛЕДА причины, и диагностика
+        # требовала гадать. Теперь причина конкретного отказа видна в логе.
+        logger.warning("_try_schema_fill: no donor_template in project_data — falling back to legacy pipeline")
         return None  # структура формы вообще не известна — нечего читать по схеме
 
     tmp_dir = tempfile.mkdtemp()
     donor_doc_path, _ = _resolve_donor_doc_path(session, tmp_dir)
     if not donor_doc_path:
-        return None  # реального файла нет — это как раз тот случай, что ловит
-        # проверка в agent_engine.py ДО вызова build_final_document; сюда
-        # доходить не должны, но на всякий случай не падаем, а честно молчим
+        logger.warning(
+            "_try_schema_fill: donor form file unavailable (chosen_donor_form=%r, "
+            "saved_donor_files=%d) — falling back to legacy pipeline",
+            session.get("chosen_donor_form"), len(session.get("saved_donor_files") or []),
+        )
+        return None
 
     try:
         from docx_schema_fill import fill_donor_docx_template_v2
@@ -82,8 +91,9 @@ async def _try_schema_fill(session: dict) -> str | None:
         return None
 
     if not success:
-        logger.info("_try_schema_fill: schema-based fill did not succeed, falling back to legacy pipeline")
+        logger.warning("_try_schema_fill: schema-based fill did not succeed, falling back to legacy pipeline")
         return None
+    logger.info("_try_schema_fill: schema-based fill succeeded — used for %s", donor_doc_path)
 
     session["final_document_text"] = text_for_check
     session["_prebuilt_docx_path"] = path

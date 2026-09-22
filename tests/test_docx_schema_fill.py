@@ -89,8 +89,12 @@ def test_full_pipeline_with_mocked_llm_preserves_structure_and_places_answers_co
     async def fake_call_claude(system_prompt, user_message, history=None, max_tokens=2000, prefer_anthropic=False):
         if user_message.strip().startswith("Вопрос формы:"):
             # fill_table_field-запрос — ждёт JSON-массив массивов, не dict.
-            return json.dumps([["1", "TABLE-ROW-1-COL2", "TABLE-ROW-1-COL3", "100"],
-                                ["2", "TABLE-ROW-2-COL2", "TABLE-ROW-2-COL3", "200"]], ensure_ascii=False)
+            # Суммы намеренно НЕ круглые (103+211=314) — круглая сумма
+            # запускает _nudge_round_total и меняет одну из строк (см.
+            # test_round_budget_total_gets_nudged_to_a_non_round_number
+            # ниже), это отдельная проверка, не должна путаться с этой.
+            return json.dumps([["1", "TABLE-ROW-1-COL2", "TABLE-ROW-1-COL3", "103"],
+                                ["2", "TABLE-ROW-2-COL2", "TABLE-ROW-2-COL3", "211"]], ensure_ascii=False)
         answers = {}
         for line in user_message.strip().split("\n"):
             fid = line.split(" ", 1)[0]
@@ -148,7 +152,7 @@ def test_full_pipeline_with_mocked_llm_preserves_structure_and_places_answers_co
             budget_field = next(f for f in fields if "подробный бюджет проекта" in f.question)
             b_nested, _, _ = budget_field.target
             total_row_text = " ".join(c.text.strip() for c in b_nested.rows[-1].cells)
-            assert "300" in total_row_text, f"ИТОГО row should sum written amounts (100+200=300), got: {total_row_text!r}"
+            assert "314" in total_row_text, f"ИТОГО row should sum written amounts (103+211=314), got: {total_row_text!r}"
 
             assert len(doc.tables) == 15, "top-level template structure (table count) must survive filling untouched"
             print(
@@ -263,6 +267,42 @@ def test_truncated_table_json_keeps_complete_rows():
     print("OK: truncated table JSON still yields complete rows")
 
 
+def test_round_budget_total_gets_nudged_to_a_non_round_number():
+    """Жалоба пользователя: бюджет заканчивается РОВНО на 5000 — для донора
+    это выглядит как «заявитель не считал, подогнал под лимит». Если модель
+    всё же вернула круглую (кратную 100) сумму, код должен молча поправить
+    одну строку так, чтобы итог стал НЕ круглым (…5140/…5250 из примера
+    пользователя), а не тем же ровным числом."""
+    from docx_schema_fill import _nudge_round_total, _extract_number
+
+    columns = ["№", "Мероприятие, статья расходов", "Единица измерения, количество", "Стоимость"]
+    rows = [
+        ["1", "Контейнеры", "9 шт", "$1 800"],
+        ["2", "Таблички", "20 шт", "$400"],
+        ["3", "Экостандарт", "1 комплект", "$600"],
+        ["4", "Семинар", "1 семинар", "$800"],
+        ["5", "Встречи", "3 встречи", "$250"],
+        ["6", "Админ расходы", "12% от бюджета", "$600"],
+        ["7", "M&E", "6% от бюджета", "$300"],
+        ["8", "Контингенси", "4% от бюджета", "$250"],
+    ]
+    total_before = sum(_extract_number(r[-1]) for r in rows)
+    assert total_before == 5000, total_before  # круглая — как в реальной жалобе
+
+    _nudge_round_total(rows, columns)
+
+    total_after = sum(_extract_number(r[-1]) for r in rows)
+    assert total_after != 5000, "total must no longer be the suspiciously round number"
+    assert total_after % 100 != 0, f"nudged total should not still be round, got {total_after}"
+    assert 5000 < total_after < 5300, f"nudge should be a small realistic adjustment, got {total_after}"
+    # Не денежная колонка (план мероприятий) — не трогаем вообще.
+    plan_rows = [["1", "Тренинг", "март", "20 чел."]]
+    plan_before = list(plan_rows)
+    _nudge_round_total(plan_rows, ["№", "Мероприятие", "Срок", "Ожидаемый результат"])
+    assert plan_rows == plan_before, "non-money table must be left untouched"
+    print(f"OK: round budget total {total_before} nudged to non-round {total_after}")
+
+
 if __name__ == "__main__":
     test_extract_template_schema_finds_all_real_fields()
     test_donor_only_fields_are_filtered_before_llm_call()
@@ -271,4 +311,5 @@ if __name__ == "__main__":
     test_all_providers_down_rolls_back_history_and_flags_outage()
     test_project_prose_goes_above_plan_table_and_contacts_are_sanitized()
     test_truncated_table_json_keeps_complete_rows()
+    test_round_budget_total_gets_nudged_to_a_non_round_number()
     print("\nAll tests passed.")

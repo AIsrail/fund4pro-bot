@@ -189,6 +189,7 @@ async def build_table_answers(fields: list[FieldSpec], session_data: dict) -> di
             logger.warning("build_table_answers: field %s failed", f.field_id, exc_info=True)
             rows = []
         if rows:
+            _nudge_round_total(rows, f.columns)
             answers[f.field_id] = rows
     return answers
 
@@ -307,6 +308,39 @@ def _append_section_answer(cell, content: str, before_table: bool = False) -> No
 
 
 _NUMBER_RE = re.compile(r"[\d\s]+(?:[.,]\d+)?")
+_MONEY_COL_RE = re.compile(r"стоимост|сумма|amount|cost|usd|\$", re.IGNORECASE)
+
+
+def _nudge_round_total(rows: list[list[str]], columns: list[str] | None) -> None:
+    """РЕАЛЬНЫЙ ИНЦИДЕНТ (жалоба пользователя): итоговая сумма бюджета вышла
+    ровно 5000 — для донора это красный флаг «заявитель не считал, подогнал
+    под лимит» (это правило уже было в SYSTEM_PROMPT текстом, но слабо
+    соблюдается, когда строки бюджета — это проценты от лимита: админ 12% +
+    M&E 6% + контингенси 4% от РОВНОЙ суммы гранта механически дают ровный
+    итог). Промпт-инструкцию усилили (см. fill_table_field в llm.py), но
+    результат зависит от модели — здесь код детерминированно подстраховывает:
+    если сумма всё равно кратна 100, чуть меняет САМУЮ КРУПНУЮ строку, чтобы
+    итог выглядел как реальный расчёт (…5140/…5250), а не подгонка под лимit.
+    Мутирует rows на месте; молча ничего не делает, если это не денежная
+    колонка (план мероприятий) или сумма и так не подозрительно круглая."""
+    if not columns or not _MONEY_COL_RE.search(columns[-1]):
+        return
+    valid = [(i, v) for i, r in enumerate(rows) if (v := _extract_number(r[-1])) is not None and v > 0]
+    if len(valid) < 2:
+        return
+    total = sum(v for _, v in valid)
+    if total <= 0 or total % 100 != 0:
+        return  # не подозрительно круглая — не трогаем реальный ответ модели
+    idx, biggest = max(valid, key=lambda iv: iv[1])
+    # Детерминированная (не одинаковая для любой суммы) добавка ~1-5% от
+    # крупнейшей строки, диапазон 20-260 — по составу самих строк, не по total.
+    seed = sum(len(c) for r in rows for c in r) + len(rows)
+    delta = 20 + (seed * 37) % 240
+    new_val = biggest + delta
+    original = rows[idx][-1]
+    prefix = "$" if "$" in original else ""
+    formatted = f"{new_val:,.0f}".replace(",", " ") if new_val >= 1000 else f"{new_val:.0f}"
+    rows[idx][-1] = f"{prefix}{formatted}"
 
 
 def _extract_number(text: str) -> float | None:
