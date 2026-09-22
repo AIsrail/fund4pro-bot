@@ -303,6 +303,38 @@ def test_round_budget_total_gets_nudged_to_a_non_round_number():
     print(f"OK: round budget total {total_before} nudged to non-round {total_after}")
 
 
+def test_truncated_form_fields_batch_recovers_complete_fields_not_the_whole_batch():
+    """РЕАЛЬНЫЙ ИНЦИДЕНТ (Render, эта же сессия): батч из 12 полей на
+    max_tokens=4000 обрезался ДО закрывающей "}" — весь батч (включая раздел
+    КОНТЕКСТ, историю, цели организации) терялся целиком. Проверяем прямо
+    воспроизведённый фрагмент того самого обрезанного ответа из лога."""
+    from llm import _parse_json_object
+
+    raw = (
+        '```json\n{\n'
+        '  "f25": "2019 год",\n'
+        '  "f26": "г. Ош",\n'
+        '  "f27": "Да, зарегистрирована",\n'
+        '  "f28": "",\n'
+        '  "f29": "Цель ОО «Дестинация'
+    )
+    result = _parse_json_object(raw)
+    assert result["f25"] == "2019 год"
+    assert result["f26"] == "г. Ош"
+    assert result["f27"] == "Да, зарегистрирована"
+    assert result["f28"] == ""
+    assert "f29" not in result, "the field cut off mid-string must not be recovered as garbage"
+    assert len(result) == 4, f"expected the 4 complete fields before the cut, got {result}"
+
+    try:
+        _parse_json_object("это не JSON вообще, скобок тоже нет")
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised, "garbage input with no '{' must raise, not silently return {}"
+    print("OK: truncated fill_form_fields_batch response recovers complete fields, not the whole batch")
+
+
 if __name__ == "__main__":
     test_extract_template_schema_finds_all_real_fields()
     test_donor_only_fields_are_filtered_before_llm_call()
@@ -312,4 +344,5 @@ if __name__ == "__main__":
     test_project_prose_goes_above_plan_table_and_contacts_are_sanitized()
     test_truncated_table_json_keeps_complete_rows()
     test_round_budget_total_gets_nudged_to_a_non_round_number()
+    test_truncated_form_fields_batch_recovers_complete_fields_not_the_whole_batch()
     print("\nAll tests passed.")

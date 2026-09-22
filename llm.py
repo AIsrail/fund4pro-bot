@@ -1764,22 +1764,54 @@ def _today_line() -> str:
 
 
 def _session_summary(session_data: dict) -> str:
+    """Собирает контекст проекта для LLM-вызова.
+
+    РЕАЛЬНЫЙ ИНЦИДЕНТ: эта функция читала ТОЛЬКО верхнеуровневые ключи вида
+    session_data["org_info"] — но в актуальной агентной архитектуре
+    (agent_engine.py) все эти поля лежат ВНУТРИ session_data["project_data"],
+    а не на верхнем уровне. session_data.get("org_info") давал None для
+    КАЖДОГО отдельного поля. Функция не была совсем пустой только по
+    случайности: "project_data" тоже входит в перечисляемый список ключей,
+    так что весь вложенный словарь целиком подставлялся ОДНОЙ строкой через
+    неявный str(dict) — рабочий, но нечитаемый для модели сырой Python-repr
+    с вложенными кавычками, БЕЗ обрезки длинных полей (та обрезка была
+    написана для ключа "donor_forms_text", которого в новой схеме просто нет
+    — вместо него donor_info/donor_template, которые эта функция никогда не
+    обрезала). Возможное следствие: важный факт, упомянутый где-то в
+    середине длинного donor_info (например ограничение донора по бюджету),
+    тонул в нечитаемом дампе словаря, а не пропадал явно.
+
+    Теперь явно разворачиваем project_data (с обратной совместимостью для
+    старого плоского формата — на случай, если снова вызовется старым путём,
+    generate_final_document) и форматируем каждое поле отдельно."""
     parts = [_today_line()]
+    nested = session_data.get("project_data")
+    # Мёрдж, не замена: legacy-путь кладёт поля прямо на верхнем уровне (и
+    # "project_data" там вообще нет), новый агентный путь — только внутри
+    # project_data; нестандартная смесь обоих (бывает в тестах/переходных
+    # состояниях сессии) не должна тихо терять верхнеуровневые поля.
+    flat = {**session_data, **(nested if isinstance(nested, dict) else {})}
     for key in (
-        "org_info", "donor_info", "donor_forms_text", "selected_idea", "project_data",
-        "goal_and_objectives", "action_trees", "concept_text", "budget_text",
+        "org_info", "donor_info", "donor_template", "problem_and_idea",
+        "goal_and_objectives", "activities_and_budget", "other_notes",
+        # Ключи старого (legacy) плоского формата — держим для обратной
+        # совместимости, если этот путь снова понадобится.
+        "donor_forms_text", "selected_idea", "action_trees", "concept_text", "budget_text",
     ):
-        value = session_data.get(key)
+        value = flat.get(key)
         if not value:
             continue
-        # donor_forms_text может содержать несколько скачанных PDF/DOCX
-        # (до ~6000 символов каждый) — структура формы уже вытащена
-        # отдельно в donor_template, так что здесь достаточно урезанной
-        # версии как справочного контекста, не раздувая промпт до отказа
-        # модели отвечать (пустой текст при max_tokens, съеденном длинным
-        # контекстом/reasoning до появления первого текстового блока).
-        if key == "donor_forms_text" and len(value) > 3000:
-            value = value[:3000] + "\n[...текст формы обрезан, полная структура уже учтена отдельно...]"
+        value = str(value)
+        # Длинные поля (полный текст донорской страницы/формы) обрезаем, не
+        # раздувая промпт до отказа модели отвечать (пустой текст при
+        # max_tokens, съеденном длинным контекстом/reasoning до появления
+        # первого текстового блока) — но с запасом побольше старого лимита
+        # 3000: именно в donor_info/donor_template часто лежат конкретные
+        # условия донора (лимиты бюджета, дедлайны, исключённые статьи
+        # расходов) — обрезать их слишком коротко значит терять реальные
+        # факты, а не только "лишний" текст.
+        if key in ("donor_forms_text", "donor_info", "donor_template") and len(value) > 6000:
+            value = value[:6000] + "\n[...текст обрезан, полная структура формы уже учтена отдельно...]"
         parts.append(f"{key}: {value}")
     return "\n\n".join(parts)
 
@@ -2072,25 +2104,34 @@ async def fill_form_fields_batch(
     )
     user_message = items
 
-    try:
-        raw = await call_claude(system_prompt, user_message, max_tokens=4000, prefer_anthropic=True)
-    except Exception as exc:
-        logger.warning("fill_form_fields_batch: call_claude failed: %s: %s", type(exc).__name__, exc)
-        return {}
-
-    try:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end == -1 or end < start:
-            raise ValueError("no JSON object found in response")
-        parsed = json.loads(raw[start:end + 1])
-        if not isinstance(parsed, dict):
-            raise ValueError("unexpected shape")
-    except Exception as exc:
-        logger.warning(
-            "fill_form_fields_batch: JSON parse failed: %s: %s | raw[:200]=%r",
-            type(exc).__name__, exc, raw[:200],
-        )
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ: батч из 12 полей (несколько из них — "section",
+    # каждый по 100-200 слов: КОНТЕКСТ, история, цели, сети) на max_tokens=4000
+    # ОБРЕЗАЛСЯ ДО ЗАКРЫВАЮЩЕЙ "}" — raw.rfind("}") не находил закрывающую
+    # скобку вообще (ValueError "no JSON object found"), и весь батч терялся
+    # ЦЕЛИКОМ: пользователь получил заявку без раздела КОНТЕКСТ (самого
+    # важного раздела формы) и ещё 7 полей, хотя часть из них модель успела
+    # полностью дописать до обрыва. Теперь: (1) max_tokens поднят и есть
+    # повтор с ещё большим лимитом при неудаче — как в fill_table_field; (2)
+    # даже если внешний json.loads не собрался (ответ обрезан), _parse_json_object
+    # регэкспом достаёт все ПОЛНОСТЬЮ дописанные "field_id": "значение" пары
+    # ДО места обрыва — теряется в худшем случае последнее недописанное поле,
+    # а не все 12.
+    parsed = None
+    for attempt, tokens in enumerate((6000, 8000), start=1):
+        try:
+            raw = await call_claude(system_prompt, user_message, max_tokens=tokens, prefer_anthropic=True)
+        except Exception as exc:
+            logger.warning("fill_form_fields_batch: call_claude failed (attempt %d): %s: %s", attempt, type(exc).__name__, exc)
+            continue
+        try:
+            parsed = _parse_json_object(raw)
+            break
+        except Exception as exc:
+            logger.warning(
+                "fill_form_fields_batch: JSON parse failed (attempt %d): %s: %s | raw[:200]=%r | raw[-200:]=%r",
+                attempt, type(exc).__name__, exc, raw[:200], raw[-200:],
+            )
+    if parsed is None:
         return {}
 
     answers: dict[str, str] = {}
@@ -2098,7 +2139,46 @@ async def fill_form_fields_batch(
         val = str(parsed.get(f["field_id"], "") or "").strip()
         if val:
             answers[f["field_id"]] = val
+    missing = [f["field_id"] for f in fields if f["field_id"] not in answers]
+    if missing:
+        logger.warning("fill_form_fields_batch: %d/%d fields unanswered after parsing: %s", len(missing), len(fields), missing)
     return answers
+
+
+def _parse_json_object(raw: str) -> dict:
+    """Достаёт {field_id: значение} из ответа модели. Сперва пробует честный
+    json.loads (снимая markdown-обрамление ```json, если есть). Если ответ
+    обрезан по max_tokens до закрывающей скобки — регэкспом вытаскивает все
+    ПОЛНОСТЬЮ записанные "ключ": "значение"-пары (само значение декодируется
+    через json.loads обратно в python-строку, чтобы юникод/экранирование
+    отработали как надо) — теряется максимум последнее недописанное поле,
+    а не весь батч. Пустой словарь — валидный, но НЕ ошибочный результат
+    (все поля были явно "" — это не то же самое, что "ничего не разобралось",
+    отличаем через отдельный ValueError, если СОВСЕМ ничего не нашли)."""
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
+    if fence:
+        raw = fence.group(1)
+    start = raw.find("{")
+    if start != -1:
+        end = raw.rfind("}")
+        if end != -1 and end > start:
+            try:
+                parsed = json.loads(raw[start:end + 1])
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+    if start == -1:
+        raise ValueError("no '{' found in response")
+    recovered: dict = {}
+    for m in re.finditer(r'"(f\d+)"\s*:\s*"((?:[^"\\]|\\.)*)"', raw[start:]):
+        try:
+            recovered[m.group(1)] = json.loads('"' + m.group(2) + '"')
+        except Exception:
+            recovered[m.group(1)] = m.group(2)
+    if not recovered:
+        raise ValueError("no complete field_id/value pairs recovered from truncated response")
+    return recovered
 
 
 async def fill_missing_donor_fields(
