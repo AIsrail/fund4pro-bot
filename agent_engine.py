@@ -28,6 +28,63 @@ PROJECT_DATA_FIELDS = (
 )
 
 
+def _classify_donor_documents(saved_files: list[dict]) -> list[dict]:
+    """РЕАЛЬНАЯ ЖАЛОБА ("новичок полностью доверяет боту, а бот заполнил одну
+    форму из четырёх и забыл про остальные, пока ему не напомнили"): раньше
+    единственным "реестром" документов донора была память модели внутри
+    разговора — ход за ходом, без кода, который бы явно считал "сколько
+    всего, сколько готово". Слабая модель (сейчас на проекте — единственная
+    реально доступная, см. компанию заметок про лимиты Anthropic/Gemini)
+    регулярно "забывала" про недособранные документы, пока пользователь не
+    напоминал вручную — то же самое, что раньше было с этапом разговора
+    (compute_next_step), просто теперь для документов.
+
+    Строит реестр КОДОМ, а не памятью модели, сразу при скачивании — без
+    единого вызова LLM: и extract_template_schema (.docx), и
+    extract_pdf_form_schema (.pdf), и extract_xlsx_structure (.xlsx) уже
+    чисто программные (только запись значений полей — отдельный, платный
+    шаг). "kind" определяет, какой из трёх пайплайнов заполнения (docx/pdf/
+    xlsx) сможет сам заполнить документ, а какой — чисто содержательный
+    (гайдлайны без полей, где нет смысла звать pdf/docx-схему, а нужен
+    generate_document с donor_template = структура этих разделов).
+    Возвращает список {filename, kind, status: "pending"} — status потом
+    обновляет _execute_tool после каждого успешного generate_document."""
+    import io
+
+    docs = []
+    for f in saved_files:
+        filename = f.get("filename", "")
+        b64 = f.get("content_b64")
+        if not b64:
+            continue
+        try:
+            content = base64.b64decode(b64)
+        except Exception:
+            continue
+        lower = filename.lower()
+        kind = "unknown"
+        try:
+            if lower.endswith(".xlsx"):
+                from excel_fill import extract_xlsx_structure
+                kind = "budget" if extract_xlsx_structure(content).strip() else "unknown"
+            elif lower.endswith(".pdf"):
+                from pdf_form_fill import extract_pdf_form_schema
+                kind = "form" if extract_pdf_form_schema(content) else "narrative"
+            elif lower.endswith(".docx"):
+                import docx
+                from docx_schema_fill import extract_template_schema
+                doc = docx.Document(io.BytesIO(content))
+                fields = extract_template_schema(doc)
+                # >=3 полей в таблицах — реальная форма с местами для ответа;
+                # 0-2 — почти наверняка гайдлайны/инструкция (заголовки
+                # разделов без ячеек-заполнителей, как у NED).
+                kind = "form" if len(fields) >= 3 else "narrative"
+        except Exception:
+            logger.warning("_classify_donor_documents: could not classify %r", filename, exc_info=True)
+        docs.append({"filename": filename, "kind": kind, "status": "pending"})
+    return docs
+
+
 class AgentTurnResult:
     def __init__(
         self,
@@ -127,6 +184,16 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
                 })
         session["saved_donor_files"] = saved_files
         session["_pending_file_attachments"] = pending_att
+
+        # Реестр документов донора — считает КОД, не модель (см. докстринг
+        # _classify_donor_documents). Не перезаписываем уже известные записи
+        # (по filename), чтобы не сбросить status="filled" при повторном
+        # fetch_donor_page той же страницы в этой же сессии.
+        existing_docs = {d["filename"]: d for d in (project_data.get("donor_documents") or [])}
+        for d in _classify_donor_documents(saved_files):
+            if d["filename"] not in existing_docs:
+                existing_docs[d["filename"]] = d
+        project_data["donor_documents"] = list(existing_docs.values())
 
         readable = [f for f in forms if f.get("text", "").strip()]
         session["donor_form_candidates"] = [
@@ -1122,7 +1189,41 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                         )
                     else:
                         document_ready = True
-                        result_str = "Документ собран и отправлен пользователю файлом — не пересказывай его содержимое текстом, просто кратко подтверди, что документ готов, и что дальше делать (проверить перед отправкой, можно попросить правки)."
+                        # Реестр документов донора (см. _classify_donor_documents) —
+                        # отмечаем именно ЭТОТ файл готовым, кодом, а не памятью
+                        # модели, и сразу же явно говорим модели, сколько ещё
+                        # осталось — иначе слабая модель (сейчас единственная
+                        # реально доступная) может "забыть" и остановиться,
+                        # решив, что раз ЭТОТ документ готов, то и всё готово.
+                        docs = project_data.get("donor_documents") or []
+                        has_xyz = "XYZ" in document_text
+                        for d in docs:
+                            if d.get("filename") == chosen_fn:
+                                d["status"] = "filled_with_gaps" if has_xyz else "filled"
+                                break
+                        remaining = [d for d in docs if d.get("status") == "pending"]
+                        if remaining:
+                            names = ", ".join(f"«{d['filename']}»" for d in remaining)
+                            result_str = (
+                                f"Документ '{chosen_fn}' собран и отправлен пользователю файлом. "
+                                f"У донора ЕЩЁ {len(remaining)} несобранных документ(ов): {names}. "
+                                f"НЕ говори пользователю, что заявка готова. В этом же ответе кратко "
+                                f"подтверди, что этот файл готов, и СРАЗУ переходи к следующему: вызови "
+                                f"select_donor_form на первом из оставшихся, затем generate_document."
+                            )
+                        else:
+                            gaps = [d["filename"] for d in docs if d.get("status") == "filled_with_gaps"]
+                            gap_note = (
+                                f" В файлах есть незаполненные места (XYZ) — перечисли пользователю, "
+                                f"в каких именно документах ({', '.join(gaps)}) и что нужно вписать "
+                                f"самому перед отправкой."
+                            ) if gaps else ""
+                            result_str = (
+                                "Документ собран и отправлен пользователю файлом. Это ПОСЛЕДНИЙ "
+                                "недостающий документ донора — весь пакет теперь собран." + gap_note +
+                                " Не пересказывай содержимое текстом, просто кратко подтверди готовность "
+                                "всего пакета."
+                            )
 
             history.append({
                 "role": "tool",

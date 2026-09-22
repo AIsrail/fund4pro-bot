@@ -584,14 +584,48 @@ def compute_next_step(project_data: dict, flow: str = "grant") -> str:
                 "мероприятия ПОД выбранную сумму (деньги -> количество -> результат). "
                 "Сохрани update_project(activities_and_budget).")
     else:
-        step = ("ЭТАП 7. Всё собрано. Коротко перескажи концепцию и бюджет, спроси подтверждение кнопками "
-                "и при согласии (или прямой команде «собери документ») вызови generate_document. ЕСЛИ у "
-                "донора НЕСКОЛЬКО обязательных документов (формы с полями И/ИЛИ гайдлайны содержания — см. "
-                "donor_form_candidates/saved_donor_files) — заявка НЕ готова после одного вызова "
-                "generate_document: явно перечисли пользователю, какие документы ещё не собраны, и "
-                "продолжи select_donor_form + generate_document по каждому оставшемуся, прежде чем "
-                "сказать, что пакет полный.")
+        docs_step = compute_donor_documents_step(pd)
+        if docs_step:
+            step = "ЭТАП 7. " + docs_step
+        else:
+            step = ("ЭТАП 7. Всё собрано. Коротко перескажи концепцию и бюджет, спроси подтверждение "
+                    "кнопками и при согласии (или прямой команде «собери документ») вызови "
+                    "generate_document.")
     return header + step
+
+
+def compute_donor_documents_step(project_data: dict) -> str | None:
+    """РЕАЛЬНАЯ ЖАЛОБА: "новичок полностью доверяет боту — а бот заполнил
+    одну форму из нескольких и остановился, пока пользователь не напомнил".
+    Раньше единственный "реестр" найденных у донора документов жил в памяти
+    модели внутри разговора — слабая модель (сейчас единственная реально
+    доступная, Anthropic/Gemini недоступны) регулярно теряла этот список
+    между ходами. Реестр (project_data["donor_documents"]) теперь строит и
+    обновляет КОД (agent_engine._classify_donor_documents/_execute_tool), не
+    модель — эта функция просто читает его и возвращает ДЕТЕРМИНИРОВАННУЮ
+    директиву на следующий документ, тем же приёмом, что уже работает для
+    этапов 1-7 выше. None — либо документов у донора нет вообще, либо все
+    уже закрыты (тогда ЭТАП 7 выше сам переходит на обычное "всё собрано")."""
+    docs = project_data.get("donor_documents") or []
+    pending = [d for d in docs if d.get("status") == "pending"]
+    if not pending:
+        return None
+    total = len(docs)
+    done = total - len(pending)
+    nxt = pending[0]
+    kind_hint = {
+        "form": "форма с короткими полями — заполняй фактами напрямую",
+        "budget": "бюджетный Excel-шаблон — заполняй суммами из уже согласованного бюджета, формулы донора не трогай",
+        "narrative": "гайдлайны содержания (без полей для заполнения) — donor_template станет СТРУКТУРОЙ для generate_document, который напишет содержательный текст строго по её разделам",
+        "unknown": "структуру нужно будет посмотреть по факту",
+    }.get(nxt.get("kind"), "документ")
+    return (
+        f"У донора {total} документ(ов), собрано {done}/{total}. Следующий необработанный: "
+        f"«{nxt['filename']}» ({kind_hint}). В ЭТОМ ходу вызови select_donor_form(\"{nxt['filename']}\"), "
+        f"затем сразу generate_document — НЕ объясняй пользователю, как заполнить самому, заполни сам "
+        f"инструментами. Если для части полей данных действительно нет — они станут XYZ в готовом файле, "
+        f"это нормально, не повод останавливаться и спрашивать вместо того чтобы собрать документ."
+    )
 
 
 LITE_CORE_RULES = """
@@ -645,8 +679,25 @@ def _format_project_data_lines(project_data: dict, truncate: int | None = None) 
             "используй их НАПРЯМУЮ, НИКОГДА не проси продиктовать их заново "
             "и не ставь вместо них XYZ):\n" + contact_lines
         )
+    # Тот же класс проблемы, что и с org_contacts выше (словарь/список,
+    # тонущий в общем дампе project_data.items()) — donor_documents ещё и
+    # проверяется отдельно в ЭТАП 7 (compute_donor_documents_step), но
+    # явный, подписанный блок здесь — вторая линия защиты для слабой модели,
+    # видна на каждом ходу, а не только в момент, когда directive пересчитан.
+    docs = project_data.get("donor_documents")
+    if isinstance(docs, list) and docs:
+        status_ru = {"pending": "НЕ СОБРАН", "filled": "готов", "filled_with_gaps": "готов, но есть XYZ-пропуски"}
+        doc_lines = "\n".join(
+            f"  - {d.get('filename')}: {status_ru.get(d.get('status'), d.get('status'))}" for d in docs
+        )
+        n_pending = sum(1 for d in docs if d.get("status") == "pending")
+        parts.append(
+            f"ДОКУМЕНТЫ ДОНОРА, {len(docs)} всего, {n_pending} ещё НЕ СОБРАНО (см. ЭТАП ниже — "
+            f"какой именно): каждый несобранный требует select_donor_form + generate_document, "
+            f"заявка не готова, пока не собран каждый:\n" + doc_lines
+        )
     for k, v in project_data.items():
-        if not v or k == "org_contacts":
+        if not v or k in ("org_contacts", "donor_documents"):
             continue
         text = str(v)
         if truncate:
