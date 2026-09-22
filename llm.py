@@ -11,7 +11,6 @@ import logging
 import json
 import re
 
-import httpx
 from anthropic import AsyncAnthropic
 
 try:
@@ -37,7 +36,18 @@ logger = logging.getLogger("fund4pro.llm")
 # упадёт ошибкой, тогда сработает уже существующий фолбэк на следующего
 # провайдера (agent_engine._anthropic_turn -> _chatgpt_turn -> ...), вместо
 # того чтобы просто бесконечно ждать одного зависшего запроса.
-_LLM_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+#
+# РЕАЛЬНЫЙ ИНЦИДЕНТ #2 (тем же вечером): первая версия этого фикса передавала
+# httpx.Timeout(...) — и деплой на Render тут же упал с TypeError при старте:
+# "httpx.Timeout is from the httpx package, but this SDK uses httpx2. Use
+# httpx2.Timeout instead." Установленная на Render версия anthropic-SDK
+# внутри использует переименованный форк httpx (модуль httpx2), не сам
+# httpx — а pip у нас в requirements.txt не пинит версию anthropic жёстко,
+# так что локально и на проде могут стоять разные версии SDK с разными
+# требованиями к типу timeout. Простое число (float) принимают ОБЕ версии
+# (и anthropic, и openai SDK) одинаково — им всё равно, какой httpx-модуль
+# используется внутри, SDK сам оборачивает float в свой Timeout-класс.
+_LLM_TIMEOUT = 60.0
 
 _client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY, timeout=_LLM_TIMEOUT)
 
