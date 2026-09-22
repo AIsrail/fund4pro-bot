@@ -11,6 +11,7 @@ import logging
 import json
 import re
 
+import httpx
 from anthropic import AsyncAnthropic
 
 try:
@@ -21,7 +22,24 @@ except ImportError:
 import config
 
 logger = logging.getLogger("fund4pro.llm")
-_client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+
+# РЕАЛЬНЫЙ ИНЦИДЕНТ: пользователь пожаловался, что бот "завис" — в логах
+# Render это видно буквально: последний Update обработан, дальше НИ ОДНОЙ
+# строки лога (ни ошибки, ни нового httpx-запроса) несколько минут подряд,
+# хотя health-check в этот же момент отвечал нормально (процесс жив, завис
+# не весь event loop, а конкретный await). Причина — у всех четырёх клиентов
+# ниже не было задан timeout вообще: SDK по умолчанию ждёт ответ провайдера
+# до 10 минут, и всё это время НЕЧЕГО логировать, потому что запрос формально
+# ещё не завершился ни успехом, ни ошибкой — с точки зрения пользователя это
+# неотличимо от зависания. httpx-клиенты в data_search.py/donor_scrape.py
+# таймаут уже задают, а эти четыре — исторически нет. 60 секунд с лихвой
+# хватает на обычный ответ модели; если провайдер не уложился — пусть быстро
+# упадёт ошибкой, тогда сработает уже существующий фолбэк на следующего
+# провайдера (agent_engine._anthropic_turn -> _chatgpt_turn -> ...), вместо
+# того чтобы просто бесконечно ждать одного зависшего запроса.
+_LLM_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+
+_client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY, timeout=_LLM_TIMEOUT)
 
 # Порядок фолбэка (по явному запросу пользователя, 2026-09-18): Anthropic ->
 # ChatGPT (OpenAI) -> Gemini -> DeepSeek последним. Раньше DeepSeek шёл вторым
@@ -31,7 +49,7 @@ _client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 _chatgpt_client = None
 if getattr(config, "OPENAI_API_KEY", None) and AsyncOpenAI is not None:
     try:
-        _chatgpt_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+        _chatgpt_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY, timeout=_LLM_TIMEOUT)
         logger.info("ChatGPT (OpenAI) client initialized successfully (model=%s)", config.OPENAI_MODEL)
     except Exception as _oe:
         logger.warning("Failed to initialize ChatGPT client: %s", _oe)
@@ -42,6 +60,7 @@ if getattr(config, "GEMINI_API_KEY", None) and AsyncOpenAI is not None:
         _fallback_client = AsyncOpenAI(
             api_key=config.GEMINI_API_KEY,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            timeout=_LLM_TIMEOUT,
         )
         logger.info("Fallback Gemini client initialized successfully (model=%s)", config.FALLBACK_LLM_MODEL)
     except Exception as _fe:
@@ -53,6 +72,7 @@ if getattr(config, "DEEPSEEK_API_KEY", None) and AsyncOpenAI is not None:
         _deepseek_client = AsyncOpenAI(
             api_key=config.DEEPSEEK_API_KEY,
             base_url="https://api.deepseek.com",
+            timeout=_LLM_TIMEOUT,
         )
         logger.info("DeepSeek client initialized successfully (model=%s)", config.DEEPSEEK_MODEL)
     except Exception as _de:
