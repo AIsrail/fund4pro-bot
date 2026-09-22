@@ -419,6 +419,46 @@ def _fill_table_field(field: FieldSpec, rows: list[list[str]]) -> bool:
     return True
 
 
+def _collapse_empty_paragraphs(cell, keep: int = 1) -> None:
+    """Ужимает подряд идущие ПОЛНОСТЬЮ пустые абзацы в ячейке до `keep` штук.
+
+    РЕАЛЬНАЯ ЖАЛОБА: "после вопроса идёт 3-7 пустых строк, хватило бы 1-2".
+    Источник — не наш код: оригинальный шаблон донора САМ содержит несколько
+    пустых абзацев подряд (визуально оставленное место под рукописный ответ
+    на распечатанной форме) — до 4-6 штук подряд в реальных полях ГГФ,
+    подтверждено сравнением с нетронутым шаблоном в tests/fixtures. Пока
+    ответ не вписан, это не бросается в глаза; как только туда попадает
+    реальный текст, это место становится чистым визуальным мусором. Считаем
+    ТОЛЬКО абзацы без единого символа текста (не трогаем абзацы с реальным
+    содержимым) и НИКОГДА не трогаем последний дочерний элемент ячейки —
+    OOXML ожидает завершающий блочный элемент, особенно если в ячейке ещё и
+    вложенная таблица (см. before_table/"table"-поля): удаление последнего
+    абзаца после таблицы может сделать файл невалидным для Word."""
+    from docx.oxml.ns import qn
+
+    tc = cell._tc
+    children = list(tc.iterchildren())
+    if len(children) <= 1:
+        return
+    run: list = []
+    to_remove: list = []
+
+    def flush():
+        if len(run) > keep:
+            to_remove.extend(run[keep:])
+        run.clear()
+
+    last_idx = len(children) - 1
+    for i, el in enumerate(children):
+        if i != last_idx and el.tag == qn("w:p") and not "".join(el.itertext()).strip():
+            run.append(el)
+        else:
+            flush()
+    flush()
+    for el in to_remove:
+        el.getparent().remove(el)
+
+
 def write_answers_to_template(
     fields: list[FieldSpec], answers: dict[str, str], table_answers: dict[str, list[list[str]]] | None = None,
 ) -> tuple[int, int, int]:
@@ -441,10 +481,12 @@ def write_answers_to_template(
             continue
         if f.kind == "kv":
             _fill_kv_cell(f.target, val)
+            _collapse_empty_paragraphs(f.target)
             filled_kv += 1
         else:
             if val not in f.target.text:
                 _append_section_answer(f.target, val, before_table=f.before_table)
+                _collapse_empty_paragraphs(f.target)
                 filled_sections += 1
     return filled_kv, filled_sections, filled_tables
 

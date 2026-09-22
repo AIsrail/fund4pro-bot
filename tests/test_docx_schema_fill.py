@@ -335,6 +335,56 @@ def test_truncated_form_fields_batch_recovers_complete_fields_not_the_whole_batc
     print("OK: truncated fill_form_fields_batch response recovers complete fields, not the whole batch")
 
 
+def test_excess_blank_paragraphs_are_collapsed_after_writing_an_answer():
+    """РЕАЛЬНАЯ ЖАЛОБА: "после вопроса 3-7 пустых строк, хватило бы 1-2".
+    Причина — не наш код: сам шаблон ГГФ оставляет несколько пустых абзацев
+    подряд (место под рукописный ответ на бумаге). Раз реальный ответ вписан
+    — это место больше не нужно. Проверяем на настоящей ячейке фикстуры
+    (ПРОЕКТ: с вложенным планом), что подряд идущие пустые абзацы сжимаются,
+    а структура (вложенная таблица, реальный текст) не страдает."""
+    from docx_schema_fill import extract_template_schema, write_answers_to_template
+    from docx.oxml.ns import qn
+
+    doc = docx.Document(FIXTURE)
+    fields = extract_template_schema(doc)
+    table_field = next(f for f in fields if f.question.startswith("ПРОЕКТ:") and f.kind == "table")
+    prose_field = next(f for f in fields if f.before_table)
+    cell = prose_field.target
+
+    def empty_paragraph_runs(cell):
+        """Длины подряд идущих ПОЛНОСТЬЮ пустых <w:p> (не считая самого
+        последнего дочернего элемента ячейки — он защищён от удаления)."""
+        children = list(cell._tc.iterchildren())
+        runs, cur = [], 0
+        for i, el in enumerate(children):
+            is_last = i == len(children) - 1
+            if not is_last and el.tag == qn("w:p") and not "".join(el.itertext()).strip():
+                cur += 1
+            else:
+                if cur:
+                    runs.append(cur)
+                cur = 0
+        if cur:
+            runs.append(cur)
+        return runs
+
+    before_runs = empty_paragraph_runs(cell)
+    assert max(before_runs, default=0) >= 3, f"fixture must have a real multi-blank run to test against, got {before_runs}"
+
+    write_answers_to_template(
+        fields,
+        {prose_field.field_id: "PROSE ANSWER TEXT"},
+        {table_field.field_id: [["1", "a", "b", "c"]]},
+    )
+
+    after_runs = empty_paragraph_runs(cell)
+    assert max(after_runs, default=0) <= 1, f"no run of consecutive blank paragraphs should exceed 1 after collapsing, got {after_runs}"
+    assert "PROSE ANSWER TEXT" in cell.text
+    assert len(cell.tables) == 1, "the nested plan table must survive untouched"
+    assert len(doc.tables) == 15, "top-level template structure must survive untouched"
+    print(f"OK: blank paragraph runs collapsed from {before_runs} to {after_runs}")
+
+
 if __name__ == "__main__":
     test_extract_template_schema_finds_all_real_fields()
     test_donor_only_fields_are_filtered_before_llm_call()
@@ -345,4 +395,5 @@ if __name__ == "__main__":
     test_truncated_table_json_keeps_complete_rows()
     test_round_budget_total_gets_nudged_to_a_non_round_number()
     test_truncated_form_fields_batch_recovers_complete_fields_not_the_whole_batch()
+    test_excess_blank_paragraphs_are_collapsed_after_writing_an_answer()
     print("\nAll tests passed.")
