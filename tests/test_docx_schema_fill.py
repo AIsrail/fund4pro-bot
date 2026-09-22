@@ -385,6 +385,62 @@ def test_excess_blank_paragraphs_are_collapsed_after_writing_an_answer():
     print(f"OK: blank paragraph runs collapsed from {before_runs} to {after_runs}")
 
 
+def test_extract_contact_facts_reads_real_org_profile():
+    """РЕАЛЬНАЯ ЖАЛОБА: контакты (телефон/email/сайт/адрес) пропали из
+    готовой заявки, хотя были в присланном профиле организации. Проверяем
+    детерминированный (без модели) экстрактор на реалистичном профиле в том
+    же формате "Метка: значение", что и настоящий файл пользователя."""
+    from document_reader import extract_contact_facts
+
+    text = (
+        "Профиль организации ОО «Дестинация Ош»\n"
+        "Контактные данные:\n"
+        "Юридический адрес: Кыргызская Республика, г. Ош, ул. Ломоносова, д. 25\n"
+        "Фактический адрес: Кыргызская Республика, г. Ош, ул. Курманжан Датка, 128\n"
+        "Телефоны: +996 555 770090 / +996 776 770090\n"
+        "E-mail: destination.osh@gmail.com\n"
+        "Веб-сайт: www.destinationosh.com\n"
+        "Instagram: @destination.osh\n"
+    )
+    facts = extract_contact_facts(text)
+    assert facts["org_email"] == "destination.osh@gmail.com"
+    assert facts["org_website"] == "www.destinationosh.com"
+    assert facts["org_phone"] == "+996 555 770090 / +996 776 770090"
+    assert facts["org_address_legal"].startswith("Кыргызская Республика, г. Ош, ул. Ломоносова")
+    assert facts["org_address_actual"].startswith("Кыргызская Республика, г. Ош, ул. Курманжан")
+    print("OK: extract_contact_facts reads phone/email/website/address from a labeled org profile")
+
+
+def test_apply_known_org_contacts_overrides_model_answer_with_data_room_fact():
+    """Даже если модель для контактного поля вернула XYZ или что-то другое —
+    достоверный факт из data room (org_contacts) подставляется поверх."""
+    from docx_schema_fill import extract_template_schema, apply_known_org_contacts
+
+    doc = docx.Document(FIXTURE)
+    fields = extract_template_schema(doc)
+    phone = next(f for f in fields if f.kind == "kv" and "телефон" in f.question.lower())
+    email = next(f for f in fields if f.kind == "kv" and "электронной почты" in f.question.lower())
+    website = next(f for f in fields if f.kind == "kv" and "вебсайт" in f.question.lower())
+
+    answers = {phone.field_id: "XYZ", email.field_id: "XYZ", website.field_id: "какой-то неверный ответ"}
+    org_contacts = {
+        "org_phone": "+996 555 770090",
+        "org_email": "destination.osh@gmail.com",
+        "org_website": "www.destinationosh.com",
+    }
+    applied = apply_known_org_contacts(fields, answers, org_contacts)
+    assert applied == 3, f"expected all 3 contact fields overridden, got {applied}"
+    assert answers[phone.field_id] == "+996 555 770090"
+    assert answers[email.field_id] == "destination.osh@gmail.com"
+    assert answers[website.field_id] == "www.destinationosh.com"
+
+    # Без org_contacts — no-op, ничего не падает и не меняется.
+    untouched = dict(answers)
+    assert apply_known_org_contacts(fields, untouched, None) == 0
+    assert untouched == answers
+    print("OK: known org contacts (data room) override the model's contact-field answers")
+
+
 if __name__ == "__main__":
     test_extract_template_schema_finds_all_real_fields()
     test_donor_only_fields_are_filtered_before_llm_call()
@@ -396,4 +452,6 @@ if __name__ == "__main__":
     test_round_budget_total_gets_nudged_to_a_non_round_number()
     test_truncated_form_fields_batch_recovers_complete_fields_not_the_whole_batch()
     test_excess_blank_paragraphs_are_collapsed_after_writing_an_answer()
+    test_extract_contact_facts_reads_real_org_profile()
+    test_apply_known_org_contacts_overrides_model_answer_with_data_room_fact()
     print("\nAll tests passed.")

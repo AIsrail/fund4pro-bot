@@ -1791,6 +1791,22 @@ def _session_summary(session_data: dict) -> str:
     # project_data; нестандартная смесь обоих (бывает в тестах/переходных
     # состояниях сессии) не должна тихо терять верхнеуровневые поля.
     flat = {**session_data, **(nested if isinstance(nested, dict) else {})}
+
+    # org_contacts — детерминированно (регэкспом/по меткам, БЕЗ модели)
+    # извлечённая при загрузке файла картотека контактов организации (см.
+    # document_reader.extract_contact_facts) — печатаем ОТДЕЛЬНЫМ явным
+    # блоком, помеченным как надёжный источник, а не даём этим фактам
+    # затеряться среди свободного текста org_info.
+    contacts = flat.get("org_contacts")
+    if isinstance(contacts, dict) and contacts:
+        contact_lines = "\n".join(f"- {k}: {v}" for k, v in contacts.items())
+        parts.append(
+            "ИЗВЛЕЧЁННЫЕ КОНТАКТЫ ОРГАНИЗАЦИИ (надёжный источник, взято "
+            "дословно из присланного файла — используй ИМЕНАМИ ниже, не "
+            "перефразируй и не выдумывай другое значение для того же поля):\n"
+            + contact_lines
+        )
+
     for key in (
         "org_info", "donor_info", "donor_template", "problem_and_idea",
         "goal_and_objectives", "activities_and_budget", "other_notes",

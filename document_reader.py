@@ -16,6 +16,7 @@ re-export as .docx/.pdf.
 """
 
 import io
+import re
 
 MAX_CHARS = 8000  # keep a single attached doc from blowing the LLM context
 
@@ -60,6 +61,79 @@ async def extract_text_from_telegram_file(bot, document) -> str:
     except Exception:
         return ""
     return ""
+
+
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_WEBSITE_RE = re.compile(r"(?:https?://)?(?:www\.)?[\w-]+\.[a-zA-Z]{2,}(?:/[^\s,;]*)?")
+_PHONE_RE = re.compile(r"(?:\+?\d[\d\s\-()]{6,}\d)")
+
+# Метка в профиле организации -> наше поле. Ищем построчно "Метка: значение"
+# — почти все реальные профили организаций (как и этот) оформлены именно
+# так, это надёжнее генеративного пересказа моделью.
+_LABEL_MAP = {
+    "org_email": ("e-mail", "email", "эл. почта", "электронная почта", "почта"),
+    "org_website": ("веб-сайт", "вебсайт", "сайт", "website"),
+    "org_phone": ("телефон", "тел.", "тел:", "phone"),
+    "org_address_legal": ("юридический адрес",),
+    "org_address_actual": ("фактический адрес",),
+    "org_address": ("адрес",),
+    "org_founded": ("дата основания", "создана", "основана"),
+}
+
+
+def extract_contact_facts(text: str) -> dict[str, str]:
+    """Детерминированно (регэкспами/по меткам, БЕЗ модели) вытаскивает
+    контактные факты организации из текста профиля/приложенного файла.
+
+    РЕАЛЬНАЯ ЖАЛОБА: "абсолютное большинство доноров просят контактные
+    данные, бот должен заранее выносить их в отдельный data-room по
+    организации, а не полагаться на то, что перескажет модель". Раньше
+    текст файла шёл прямо в чат единым куском, и то, попадут ли телефон/
+    email/сайт в org_info, зависело от того, не срежет ли их модель при
+    свободном пересказе в update_project — реальный инцидент: телефон/email/
+    сайт/адрес пропали из готовой заявки, хотя были в приложенном профиле.
+    Эта функция — надёжная "картотека" сбоку от свободного текста: сначала
+    построчный поиск по меткам ("Веб-сайт: ...", "E-mail: ...", это
+    надёжнее, точно берёт то же значение, что в файле), затем общий
+    regex-проход по ВСЕМУ тексту как подстраховка для файлов без меток."""
+    facts: dict[str, str] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        label, _, value = line.partition(":")
+        label = label.strip().lower()
+        value = value.strip().strip("/").strip()
+        if not value:
+            continue
+        for field, markers in _LABEL_MAP.items():
+            if field in facts:
+                continue
+            # Подстрокой, не только точным совпадением/суффиксом — метки
+            # склоняются ("Телефоны:" вместо "Телефон:", "E-mail:" сам по
+            # себе уже подстрока в разных написаниях).
+            if any(m in label for m in markers):
+                facts[field] = value
+
+    if "org_email" not in facts:
+        m = _EMAIL_RE.search(text)
+        if m:
+            facts["org_email"] = m.group(0)
+    if "org_phone" not in facts:
+        m = _PHONE_RE.search(text)
+        if m and sum(ch.isdigit() for ch in m.group(0)) >= 7:
+            facts["org_phone"] = m.group(0).strip()
+    if "org_website" not in facts:
+        for m in _WEBSITE_RE.finditer(text):
+            candidate = m.group(0)
+            # Не путаем e-mail-домен или дату (12.03.2025) с сайтом.
+            if "@" in candidate or facts.get("org_email", "") in candidate:
+                continue
+            if re.match(r"^\d", candidate):
+                continue
+            if candidate.count(".") >= 1 and any(c.isalpha() for c in candidate):
+                facts["org_website"] = candidate
+                break
+    return facts
 
 
 def _extract_docx(content: bytes) -> str:

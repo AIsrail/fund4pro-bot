@@ -367,7 +367,7 @@ async def _ensure_active(state: FSMContext) -> dict:
 async def receive_document(message: Message, state: FSMContext):
     """Документ (org profile, форма донора и т.п.) — извлекаем текст и
     отдаём агенту как обычное текстовое сообщение с пометкой источника."""
-    from document_reader import UnsupportedFormatError, extract_text_from_telegram_file
+    from document_reader import UnsupportedFormatError, extract_text_from_telegram_file, extract_contact_facts
 
     await _ensure_active(state)
 
@@ -383,6 +383,34 @@ async def receive_document(message: Message, state: FSMContext):
             "(файл повреждён, пустой, или это скан без текстового слоя)."
         )
         return
+
+    # РЕАЛЬНАЯ ЖАЛОБА: "бот должен заранее выносить контакты в отдельный
+    # data-room по организации, а не полагаться на пересказ модели" — телефон/
+    # email/сайт/адрес пропадали из готовой заявки, хотя были в присланном
+    # профиле: раньше текст файла шёл в чат единым куском, и то, попадут ли
+    # эти факты в org_info, целиком зависело от того, не срежет ли их модель
+    # при свободном пересказе в update_project. Теперь — детерминированная
+    # (без модели) картотека сбоку: извлекаем регэкспами/по меткам СРАЗУ при
+    # загрузке файла, в project_data["org_contacts"], откуда её потом читает
+    # _session_summary и (для kv-полей формы донора) fill_form_fields_batch.
+    # Гейт "пока донор не известен" — намеренно: как только donor_info уже
+    # есть, следующий присланный файл с большей вероятностью САМА форма
+    # донора (и извлечение регэкспом по НЕЙ подставило бы КОНТАКТЫ ДОНОРА
+    # вместо контактов заявителя — например адрес и телефон офиса ГГФ прямо
+    # в шапке их формы). Уже известные факты никогда не перезаписываем —
+    # только дополняем пробелы.
+    session_data = await state.get_data()
+    project_data = session_data.setdefault("project_data", {})
+    if not project_data.get("donor_info"):
+        try:
+            new_facts = extract_contact_facts(doc_text)
+        except Exception:
+            new_facts = {}
+        if new_facts:
+            existing = project_data.setdefault("org_contacts", {})
+            for k, v in new_facts.items():
+                existing.setdefault(k, v)
+            await state.set_data(session_data)
 
     # Если пользователь прислал .docx — сохраняем в кэш для доступности
     # через select_donor_form, но НЕ назначаем автоматически шаблоном.

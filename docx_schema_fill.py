@@ -281,6 +281,52 @@ def sanitize_contact_answers(fields: list[FieldSpec], answers: dict[str, str]) -
     return fixed
 
 
+# Метка вопроса формы -> ключ в org_contacts (см. document_reader.extract_
+# contact_facts). Порядок в списке значений — приоритет при нескольких
+# подходящих фактах (например для общего "Адрес" пробуем сначала
+# фактический, потом юридический).
+_ORG_CONTACT_FIELD_MAP: dict[str, tuple[str, ...]] = {
+    "телефон": ("org_phone",),
+    "e-mail": ("org_email",),
+    "email": ("org_email",),
+    "почт": ("org_email",),
+    "сайт": ("org_website",),
+    "вебсайт": ("org_website",),
+    "website": ("org_website",),
+    "адрес": ("org_address_actual", "org_address_legal", "org_address"),
+}
+
+
+def apply_known_org_contacts(fields: list[FieldSpec], answers: dict[str, str], org_contacts: dict | None) -> int:
+    """Подставляет ДОСТОВЕРНО известные контакты организации (извлечённые
+    детерминированно из присланного файла — см. document_reader.
+    extract_contact_facts) поверх ответа модели, для полей формы, явно про
+    контакты. Работает НЕЗАВИСИМО от того, что вернула модель — не полагается
+    на то, что она правильно перескажет/не забудет факт из своего контекста
+    (см. sanitize_contact_answers выше: та лишь ловит явный мусор, эта —
+    активно подставляет заведомо верное значение, когда оно у нас есть).
+
+    РЕАЛЬНАЯ ЖАЛОБА: "бот должен заранее выносить контакты в отдельный
+    data-room по организации и оттуда их брать" — это ровно то место, где
+    берётся."""
+    if not org_contacts:
+        return 0
+    applied = 0
+    for f in fields:
+        if f.kind != "kv":
+            continue
+        label = f.question.lower()
+        for marker, contact_keys in _ORG_CONTACT_FIELD_MAP.items():
+            if marker not in label:
+                continue
+            value = next((org_contacts[k] for k in contact_keys if org_contacts.get(k)), None)
+            if value and answers.get(f.field_id) != value:
+                answers[f.field_id] = value
+                applied += 1
+            break
+    return applied
+
+
 def _fill_kv_cell(target, val: str) -> None:
     target.text = ""
     p = target.paragraphs[0] if target.paragraphs else target.add_paragraph()
@@ -509,6 +555,10 @@ async def fill_donor_docx_template_v2(template_path: str, output_path: str, sess
         return False, ""
 
     answers = await build_field_answers(fields, session)
+    org_contacts = (session.get("project_data") or {}).get("org_contacts")
+    n_applied = apply_known_org_contacts(fields, answers, org_contacts)
+    if n_applied:
+        logger.info("fill_donor_docx_template_v2: applied %d known org contact(s) from data room", n_applied)
     sanitize_contact_answers(fields, answers)
     table_answers = await build_table_answers(fields, session)
     try:
