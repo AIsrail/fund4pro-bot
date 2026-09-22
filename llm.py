@@ -2161,6 +2161,104 @@ async def fill_form_fields_batch(
     return answers
 
 
+async def fill_pdf_fields_batch(
+    fields: list[dict], session_data: dict, already_answered: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """PDF-аналог fill_form_fields_batch — для AcroForm-полей донорской формы
+    (см. pdf_form_fill.py). Отличие от docx-варианта: нет kv/section (в
+    реальных PDF-формах доноров поля короткие факты, длинное описание
+    проекта донор просит отдельным прикладываемым файлом, не полем формы —
+    см. докстринг pdf_form_fill.py); зато есть "choice"-поля (выпадающий
+    список) с фиксированным набором допустимых значений — модель должна
+    выбрать значение как можно ближе к одному из вариантов, а не придумывать
+    своё, финальную точную сверку со списком делает pdf_form_fill._snap_to_option
+    уже после этого вызова (не полагаемся только на дисциплину модели).
+    Каждый field — {"field_id": str, "question": str, "kind": "text"|"choice",
+    "options": list[str] | None}."""
+    fields = [f for f in fields if looks_like_applicant_field(f["question"])]
+    if not fields:
+        return {}
+
+    lines = []
+    for f in fields:
+        if f["kind"] == "choice" and f.get("options"):
+            opts = f["options"]
+            if len(opts) <= 15:
+                lines.append(f'{f["field_id"]} (choice, варианты: {", ".join(opts)}): {f["question"]}')
+            else:
+                lines.append(f'{f["field_id"]} (choice, длинный список — например страна): {f["question"]}')
+        else:
+            lines.append(f'{f["field_id"]} (text): {f["question"]}')
+    items = "\n".join(lines)
+
+    already_note = ""
+    if already_answered:
+        preview = "\n".join(f"- {v[:150]}" for v in list(already_answered.values())[-8:])
+        already_note = (
+            f"\n\nУЖЕ ОТВЕЧЕНО В ЭТОЙ ЖЕ ФОРМЕ РАНЕЕ (для согласованности цифр/фактов):\n{preview}"
+        )
+
+    system_prompt = (
+        f"{SYSTEM_PROMPT}\n\nТебе дан список полей ОРИГИНАЛЬНОЙ PDF-формы донора — "
+        f"ответь на КАЖДОЕ, по одному короткому ответу на field_id (одна фраза/"
+        f"цифра/дата — это поля официальной формы, не разделы текста заявки).\n\n"
+        f"ВАЖНО:\n"
+        f"- РЕАЛЬНОЕ ОГРАНИЧЕНИЕ PDF-ФОРМ: заполняемые PDF-формы международных "
+        f"доноров почти всегда используют шрифт (обычно Helvetica) БЕЗ "
+        f"кириллических глифов — кириллица в поле формы визуально ломается "
+        f"(нечитаемые символы) в большинстве PDF-читалок, даже если текст "
+        f"технически записан верно. Отвечай на поля этой формы НА АНГЛИЙСКОМ "
+        f"(используй официальное англоязычное название организации, если оно "
+        f"есть в контексте проекта — например из 'Полное название организации "
+        f"на англ.яз.'; адрес и прочие имена собственные — латиницей / "
+        f"транслитерацией, если английского варианта нет).\n"
+        f"- \"choice\"-поле — выпадающий список: ответ должен быть максимально "
+        f"близко к одному из перечисленных вариантов дословно (если вариантов "
+        f"не показано — это длинный список вроде списка стран, назови "
+        f"официальное английское название на английском, как оно принято у "
+        f"международных доноров, например 'Kyrgyz Republic', а не 'Кыргызстан').\n"
+        f"- Правило недостающих данных: если факта нет в контексте проекта — "
+        f"верни ровно \"XYZ\", не выдумывай.\n"
+        f"- КОНТАКТЫ И РЕКВИЗИТЫ (ФИО, телефон, email, сайт, адрес): бери ТОЛЬКО "
+        f"из контекста проекта, дословно. Если в контексте этого нет — верни "
+        f"ровно \"XYZ\". НИКОГДА не подставляй год, название города или другое "
+        f"\"похожее\" слово вместо них.\n"
+        f"- Если поле явно не для заявителя (для донора/офиса/подписи "
+        f"сотрудника фонда) — верни для него пустую строку \"\".\n\n"
+        f"Контекст проекта:\n{_session_summary(session_data)}"
+        f"{already_note}\n\n"
+        f'Верни СТРОГО валидный JSON без markdown-обрамления: {{"p1": "...", '
+        f'"p2": "..."}} — по одному ключу на КАЖДЫЙ field_id из списка ниже, '
+        f"даже если значение — пустая строка."
+    )
+    user_message = items
+
+    parsed = None
+    for attempt, tokens in enumerate((6000, 8000), start=1):
+        try:
+            raw = await call_claude(system_prompt, user_message, max_tokens=tokens, prefer_anthropic=True)
+        except Exception as exc:
+            logger.warning("fill_pdf_fields_batch: call_claude failed (attempt %d): %s: %s", attempt, type(exc).__name__, exc)
+            continue
+        try:
+            parsed = _parse_json_object(raw)
+            break
+        except Exception as exc:
+            logger.warning(
+                "fill_pdf_fields_batch: JSON parse failed (attempt %d): %s: %s | raw[:200]=%r",
+                attempt, type(exc).__name__, exc, raw[:200],
+            )
+    if parsed is None:
+        return {}
+
+    answers: dict[str, str] = {}
+    for f in fields:
+        val = str(parsed.get(f["field_id"], "") or "").strip()
+        if val:
+            answers[f["field_id"]] = val
+    return answers
+
+
 def _parse_json_object(raw: str) -> dict:
     """Достаёт {field_id: значение} из ответа модели. Сперва пробует честный
     json.loads (снимая markdown-обрамление ```json, если есть). Если ответ

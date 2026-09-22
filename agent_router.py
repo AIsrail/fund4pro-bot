@@ -657,6 +657,18 @@ async def _send_docx(message: Message, text: str, session: dict) -> None:
         async with show_working(message, "📄 Формирую Word-файл..."):
             path, official_template = await export_docx(text, session)
         await message.answer_document(FSInputFile(path))
+        if session.pop("_pdf_non_latin_warning", False):
+            # РЕАЛЬНАЯ НАХОДКА: шрифт большинства заполняемых PDF-форм доноров
+            # (Helvetica) не содержит кириллических глифов — поле формы
+            # технически заполнено, но в PDF-читалке может показать нечитаемые
+            # символы вместо кириллицы. Промпт просит отвечать по-английски,
+            # но не гарантирует это на 100% — предупреждаем явно, а не молчим.
+            await message.answer(
+                "⚠️ Форма — заполняемый PDF, и её шрифт не поддерживает кириллицу "
+                "в некоторых полях: если при открытии файла видите нечитаемые "
+                "символы вместо текста в каком-то поле — впишите его вручную "
+                "латиницей/по-английски прямо в PDF перед отправкой."
+            )
         if not official_template:
             await message.answer(
                 "⚠️ Не смог заполнить именно оригинальный файл формы донора (он не найден в текущей "
