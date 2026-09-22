@@ -325,6 +325,27 @@ async def detect_doc_language(text: str) -> str | None:
     return None
 
 
+async def _openai_chat_completion(client, *, max_tokens: int, **kwargs):
+    """Обёртка над client.chat.completions.create — РЕАЛЬНЫЙ ИНЦИДЕНТ:
+    OPENAI_MODEL=gpt-5.1 (никогда не проверялся вживую — см. заметки
+    владельца) на КАЖДОМ вызове падал с 'Unsupported parameter: max_tokens
+    ... Use max_completion_tokens instead' — reasoning-семейство моделей
+    OpenAI (gpt-5/o1/o3 и т.п.) отклоняет старый параметр целиком, тихо
+    выводя ChatGPT из цепочки фолбэка НАВСЕГДА, а не изредка. Пробуем
+    max_tokens первым (подходит большинству моделей), и только при ИМЕННО
+    этой ошибке — один повтор с max_completion_tokens. Не угадываем по
+    имени модели (OPENAI_MODEL настраивается через переменную окружения и
+    может смениться на любую другую в любой момент)."""
+    try:
+        return await client.chat.completions.create(max_tokens=max_tokens, **kwargs)
+    except Exception as exc:
+        msg = str(exc)
+        if "max_tokens" in msg and "max_completion_tokens" in msg:
+            logger.info("_openai_chat_completion: model rejects max_tokens, retrying with max_completion_tokens")
+            return await client.chat.completions.create(max_completion_tokens=max_tokens, **kwargs)
+        raise
+
+
 async def call_fallback_llm(
     system_prompt: str,
     user_message: str,
@@ -346,7 +367,8 @@ async def call_fallback_llm(
     # 1) ChatGPT (OpenAI)
     if _chatgpt_client:
         try:
-            resp = await _chatgpt_client.chat.completions.create(
+            resp = await _openai_chat_completion(
+                _chatgpt_client,
                 model=config.OPENAI_MODEL,
                 messages=messages,
                 max_tokens=effective_max_tokens,

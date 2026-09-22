@@ -484,8 +484,11 @@ async def _chatgpt_turn(system_prompt: str, messages: list[dict]) -> dict | None
     if not _chatgpt_client:
         return None
     try:
+        from llm import _openai_chat_completion
+
         oa_messages = [{"role": "system", "content": system_prompt}] + messages
-        resp = await _chatgpt_client.chat.completions.create(
+        resp = await _openai_chat_completion(
+            _chatgpt_client,
             model=config.OPENAI_MODEL,
             messages=oa_messages,
             tools=TOOLS_OPENAI,
