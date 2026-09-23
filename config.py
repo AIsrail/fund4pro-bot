@@ -23,11 +23,11 @@ OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID", "").strip() or None
 
 # Временные кнопки-рубильники: скрывают "📋 Разработать проект" (грантовый
 # флоу) и/или "💼 Разработать бизнес-план" из стартовой клавиатуры и
-# блокируют соответствующий agentflow:*. ОБА ВРЕМЕННО ВЫКЛЮЧЕНЫ (2026-09) по
-# просьбе владельца — новые проекты не стартуют вообще, пока оба false (уже
-# начатые разговоры это не затрагивает). Включить обратно: GRANT_FLOW_ENABLED
-# / BIZPLAN_FLOW_ENABLED = true в .env/Render, либо поменять default ниже.
-GRANT_FLOW_ENABLED = os.environ.get("GRANT_FLOW_ENABLED", "false").lower() == "true"
+# блокируют соответствующий agentflow:*. ИСПРАВЛЕНО (2026-09-23): владелец
+# просил приостановить ТОЛЬКО бизнес-планы, грантовый флоу должен оставаться
+# включённым — предыдущая версия по ошибке выключала оба. Включить бизнес-планы
+# обратно: BIZPLAN_FLOW_ENABLED=true в .env/Render, либо поменять default ниже.
+GRANT_FLOW_ENABLED = os.environ.get("GRANT_FLOW_ENABLED", "true").lower() == "true"
 BIZPLAN_FLOW_ENABLED = os.environ.get("BIZPLAN_FLOW_ENABLED", "false").lower() == "true"
 
 # Лимит бесплатных ПРОЕКТОВ (не документов — один проект может требовать
