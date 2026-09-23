@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import os
+import time
 
 from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import ErrorEvent
 
 import config
@@ -11,6 +13,68 @@ from handlers import payments_handlers
 from update_dedup import DedupMiddleware
 
 logger = logging.getLogger("fund4pro.bot")
+
+
+# РЕАЛЬНЫЙ ИНЦИДЕНТ (23.09.2026, Render Logs, сервис fund4pro-bot): бот
+# перестал отвечать на сообщения — последний Update обработан в 14:12,
+# дальше 34 МИНУТЫ полная тишина в логе (ни ошибки, ни нового API-запроса),
+# пока не спас случайный редеплой (пуш в этот же день). Health-check в это
+# самое время продолжал отвечать 200 — событийный цикл в целом не завис
+# (health-check — отдельный HTTP-хендлер, ему не помешало), завис именно
+# pending-запрос getUpdates. У aiogram для этого есть встроенная защита
+# (Dispatcher._listen_updates передаёт request_timeout = session.timeout(60)
+# + polling_timeout(30) = 90 сек, после чего запрос должен упасть ошибкой
+# и уйти в backoff-ретрай с логом "Failed to fetch updates") — по факту она
+# не сработала: ни одной строки лога за все 34 минуты. Вероятная причина —
+# "мёртвое" pooled-соединение в сети Render (удалённая сторона молча
+# перестала отвечать без TCP RST/FIN), которое aiohttp's ClientTimeout не
+# всегда ловит вовремя в такой ситуации. Раз это баг сети/aiohttp, а не
+# нашего кода, чинить его изнутри aiogram нет смысла — вместо этого ловим
+# зависание СНАРУЖИ, тем же приёмом, что уже использован для LLM-клиентов
+# в llm.py: явный внешний таймаут вместо доверия таймауту библиотеки.
+#
+# _WatchdogSession обновляет last_activity при завершении КАЖДОГО запроса к
+# Telegram Bot API (успешного или с ошибкой — важно само завершение, а не
+# результат). _polling_watchdog ниже проверяет, не протухла ли эта метка —
+# если ни один запрос не завершился дольше _STALL_THRESHOLD, значит текущий
+# запрос завис так же, как в инциденте выше. Форсированный session.close()
+# обрывает зависшее соединение ошибкой (aiogram сам поймает её в штатном
+# backoff-цикле _listen_updates и передёт заново со свежим соединением —
+# create_session() создаёт новую ClientSession, если старая закрыта), без
+# необходимости убивать и перезапускать весь процесс.
+_STALL_THRESHOLD = 180.0  # 3 минуты без НИ ОДНОГО завершённого API-запроса
+_STALL_CHECK_INTERVAL = 30.0
+
+
+class _WatchdogSession(AiohttpSession):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.last_activity = time.monotonic()
+
+    async def make_request(self, *args, **kwargs):
+        try:
+            return await super().make_request(*args, **kwargs)
+        finally:
+            self.last_activity = time.monotonic()
+
+
+async def _polling_watchdog(session: "_WatchdogSession") -> None:
+    while True:
+        await asyncio.sleep(_STALL_CHECK_INTERVAL)
+        stalled_for = time.monotonic() - session.last_activity
+        if stalled_for > _STALL_THRESHOLD:
+            logger.error(
+                "Polling watchdog: ни один запрос к Telegram Bot API не "
+                "завершился за %.0f сек — похоже на зависшее соединение "
+                "(см. инцидент 23.09.2026 в комментарии выше), принудительно "
+                "закрываю сессию, чтобы освободить зависший запрос.",
+                stalled_for,
+            )
+            try:
+                await session.close()
+            except Exception:
+                logger.exception("Polling watchdog: session.close() тоже упал")
+            session.last_activity = time.monotonic()
 
 
 def _build_storage():
@@ -43,7 +107,7 @@ async def main():
             "использован режим Telegram Stars (currency=XTR)."
         )
 
-    bot = Bot(token=config.BOT_TOKEN)
+    bot = Bot(token=config.BOT_TOKEN, session=_WatchdogSession())
     dp = Dispatcher(storage=_build_storage())
 
     # Защита от повторной обработки одного и того же update_id (см.
@@ -128,6 +192,7 @@ async def main():
     except Exception as e:
         logger.warning("Could not start healthcheck HTTP server on port %d: %s", port, e)
 
+    asyncio.create_task(_polling_watchdog(bot.session))
     await dp.start_polling(bot)
 
 
