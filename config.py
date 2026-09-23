@@ -21,12 +21,22 @@ LLM_MODEL = "claude-sonnet-5"
 # недоступны"). Если не задан — берётся первый из UNLIMITED_USER_IDS.
 OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID", "").strip() or None
 
-# Лимит бесплатных полных версий документа (Шаг 7).
-# ВРЕМЕННО (2026-09): лимит НЕ блокирует правки (см. ENFORCE_FULL_VERSION_LIMIT
-# ниже) — идёт этап свободного тестирования продукта. Число ниже используется
-# только как порог для мягкого предупреждения пользователю, что лимиты скоро
-# появятся по-настоящему. Включить блокировку обратно: ENFORCE_FULL_VERSION_LIMIT=true.
-FULL_VERSION_LIMIT = int(os.environ.get("FULL_VERSION_LIMIT", "2"))
+# Временные кнопки-рубильники: скрывают "📋 Разработать проект" (грантовый
+# флоу) и/или "💼 Разработать бизнес-план" из стартовой клавиатуры и
+# блокируют соответствующий agentflow:*. ОБА ВРЕМЕННО ВЫКЛЮЧЕНЫ (2026-09) по
+# просьбе владельца — новые проекты не стартуют вообще, пока оба false (уже
+# начатые разговоры это не затрагивает). Включить обратно: GRANT_FLOW_ENABLED
+# / BIZPLAN_FLOW_ENABLED = true в .env/Render, либо поменять default ниже.
+GRANT_FLOW_ENABLED = os.environ.get("GRANT_FLOW_ENABLED", "false").lower() == "true"
+BIZPLAN_FLOW_ENABLED = os.environ.get("BIZPLAN_FLOW_ENABLED", "false").lower() == "true"
+
+# Лимит бесплатных ПРОЕКТОВ (не документов — один проект может требовать
+# несколько файлов формы донора, все они входят в одну "попытку"). Считает
+# и применяет billing.py, вызывается из agent_router._paywall_or_consume в
+# момент реального старта нового проекта (не при "Продолжить этот проект").
+# Пока ENFORCE_FULL_VERSION_LIMIT=false — лимит не блокирует никого (этап
+# свободного тестирования). Включить: ENFORCE_FULL_VERSION_LIMIT=true.
+FULL_VERSION_LIMIT = int(os.environ.get("FULL_VERSION_LIMIT", "3"))
 ENFORCE_FULL_VERSION_LIMIT = os.environ.get("ENFORCE_FULL_VERSION_LIMIT", "false").lower() == "true"
 
 # ID пользователей Telegram, для которых лимит бесплатных версий (выше) не
@@ -39,20 +49,27 @@ UNLIMITED_USER_IDS = {
     if uid.strip().isdigit()
 }
 
-# --- Платежи (заготовка, ВЫКЛЮЧЕНО) --------------------------------------
-# Оплата сознательно отложена. Инфраструктура (payments.py, ветки в
-# keyboards.py/final_version.py) уже на месте — включается одной переменной
-# окружения, когда будет готов провайдер (ожидается примерно через месяц):
-#   1. Подключить платёжного провайдера в @BotFather (/mybots -> Payments)
-#      и получить PROVIDER_TOKEN.
-#   2. Прописать PROVIDER_TOKEN и PAYMENT_ENABLED=true в .env.
-#   3. Задать цену через PAID_VERSION_PRICE_XTR (в Telegram Stars) или
-#      адаптировать payments.py под конкретного провайдера (Stripe и т.п.).
-# Пока PAYMENT_ENABLED=false — вся платёжная ветка неактивна, поведение
-# бота идентично версии без оплаты (лимит просто скрывает кнопку правок).
+# --- Платежи (монетизация проектов сверх бесплатного лимита) -------------
+# Telegram Stars "из коробки" (не требует внешнего платёжного провайдера) —
+# живой путь: agent_router._paywall_or_consume -> payments.send_project_invoice
+# -> handlers/payments_handlers.py (pre_checkout/successful_payment) ->
+# billing.add_paid_credit -> agent_router.resume_after_payment (продолжает
+# именно то действие, на котором пользователь упёрся в лимит).
+# Чтобы включить на проде (Render -> Environment):
+#   1. PAYMENT_ENABLED=true
+#   2. ENFORCE_FULL_VERSION_LIMIT=true (без этого флага лимит не блокирует)
+#   3. PROVIDER_TOKEN оставить пустым — оплата пойдёт через Telegram Stars
+#      (currency=XTR, не требует /mybots -> Payments provider). Непустой
+#      токен переключает на классического провайдера (карты и т.п.).
+#   4. При необходимости — PAID_VERSION_PRICE_XTR (цена в Stars).
 PAYMENT_ENABLED = os.environ.get("PAYMENT_ENABLED", "false").lower() == "true"
 PROVIDER_TOKEN = os.environ.get("PROVIDER_TOKEN", "")
-PAID_VERSION_PRICE_XTR = int(os.environ.get("PAID_VERSION_PRICE_XTR", "199"))
+# ~150 Stars ≈ $3 по широко используемому ориентиру ~$0.02/Star (курс
+# Telegram по бандлам плавает — если это принципиально, свериться в
+# @BotFather -> Payments перед стартом продаж). По грубой прикидке из чата
+# ($1.5-4 расход на Anthropic за сложный многофайловый проект) $3 — ближе к
+# окупаемости, чем прежние $1, но всё ещё не гарантированный запас.
+PAID_VERSION_PRICE_XTR = int(os.environ.get("PAID_VERSION_PRICE_XTR", "150"))
 
 # --- Хранилище FSM --------------------------------------------------------
 # Если задан REDIS_URL — состояния переживают рестарт процесса (важно для

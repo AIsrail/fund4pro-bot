@@ -24,19 +24,53 @@ from aiogram.types import CallbackQuery, FSInputFile, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import agent_engine
+import billing
+import config
+import payments
 import project_memory
 from typing_indicator import show_typing, show_working, show_live_progress
 
 router = Router()
 logger = logging.getLogger("fund4pro.agent_router")
 
-WELCOME = (
+_WELCOME_GRANT_AND_BIZPLAN = (
     "Привет! Я помогаю разрабатывать грантовые проекты и бизнес-планы по "
     "методологии «3 деревьев». Пиши свободно, как консультанту — расскажи "
     "об организации, доноре, идее, я сам буду спрашивать, чего не хватает. "
     "Важно: я могу ошибаться — обязательно перепроверяй все данные и цифры "
     "перед подачей."
 )
+_WELCOME_BIZPLAN_ONLY = (
+    "Привет! Я помогаю разрабатывать бизнес-планы по методологии «3 деревьев». "
+    "Пиши свободно, как консультанту — расскажи о бизнесе, идее, я сам буду "
+    "спрашивать, чего не хватает.\n\n"
+    "Разработка грантовых проектов сейчас временно на паузе.\n\n"
+    "Важно: я могу ошибаться — обязательно перепроверяй все данные и цифры "
+    "перед подачей."
+)
+_WELCOME_GRANT_ONLY = (
+    "Привет! Я помогаю разрабатывать грантовые проекты по методологии «3 "
+    "деревьев». Пиши свободно, как консультанту — расскажи об организации, "
+    "доноре, идее, я сам буду спрашивать, чего не хватает.\n\n"
+    "Разработка бизнес-планов сейчас временно на паузе.\n\n"
+    "Важно: я могу ошибаться — обязательно перепроверяй все данные и цифры "
+    "перед подачей."
+)
+_WELCOME_PAUSED = (
+    "Привет! Разработка новых проектов и бизнес-планов сейчас временно "
+    "приостановлена — уже начатые разговоры это не касается. Загляни чуть "
+    "позже."
+)
+
+
+def _welcome_text() -> str:
+    if config.GRANT_FLOW_ENABLED and config.BIZPLAN_FLOW_ENABLED:
+        return _WELCOME_GRANT_AND_BIZPLAN
+    if config.GRANT_FLOW_ENABLED:
+        return _WELCOME_GRANT_ONLY
+    if config.BIZPLAN_FLOW_ENABLED:
+        return _WELCOME_BIZPLAN_ONLY
+    return _WELCOME_PAUSED
 
 import re
 
@@ -72,8 +106,10 @@ class Flow(StatesGroup):
 
 def start_keyboard():
     kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Разработать проект", callback_data="agentflow:grant")
-    kb.button(text="💼 Разработать бизнес-план", callback_data="agentflow:bizplan")
+    if config.GRANT_FLOW_ENABLED:
+        kb.button(text="📋 Разработать проект", callback_data="agentflow:grant")
+    if config.BIZPLAN_FLOW_ENABLED:
+        kb.button(text="💼 Разработать бизнес-план", callback_data="agentflow:bizplan")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -157,12 +193,24 @@ async def handle_channel_post(message: Message):
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(WELCOME, reply_markup=start_keyboard())
+    await message.answer(_welcome_text(), reply_markup=start_keyboard())
 
 
 @router.callback_query(F.data.startswith("agentflow:"))
 async def choose_flow(callback: CallbackQuery, state: FSMContext):
     flow = callback.data.split(":")[1]
+
+    # Кнопки скрыты из start_keyboard() при GRANT_FLOW_ENABLED=false /
+    # BIZPLAN_FLOW_ENABLED=false, но старое сообщение с уже отрисованной
+    # кнопкой могло прийти пользователю ДО отключения — сама клавиатура не
+    # удаляется задним числом. Блокируем и сам callback, а не только его
+    # отображение в новых сообщениях.
+    if flow == "grant" and not config.GRANT_FLOW_ENABLED:
+        await callback.answer("Грантовые проекты временно на паузе.", show_alert=True)
+        return
+    if flow == "bizplan" and not config.BIZPLAN_FLOW_ENABLED:
+        await callback.answer("Разработка бизнес-планов временно на паузе.", show_alert=True)
+        return
 
     # РЕАЛЬНЫЙ ИНЦИДЕНТ: раньше этот хендлер БЕЗУСЛОВНО обнулял project_data
     # ("я то уже 2-ю неделю даю ему инфо про один и тот же конкурс и про ту
@@ -237,11 +285,24 @@ async def resume_project_yes(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "agent:resume:sameorg")
 async def resume_project_same_org(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer()
+    await _do_resume_same_org(callback.message, state)
+
+
+async def _do_resume_same_org(message: Message, state: FSMContext) -> None:
     """Тот же заявитель, новый донор: держим org_info/org_contacts (профиль
     организации + «картотека» контактов), сбрасываем всё донор- и
     проект-специфичное (донор, форма донора, проблема, цели, бюджет) и файлы
     старой формы донора — иначе select_donor_form мог бы попытаться заново
-    использовать форму ПРОШЛОГО донора для нового проекта."""
+    использовать форму ПРОШЛОГО донора для нового проекта.
+
+    Считается новым проектом для лимита бесплатных попыток (см.
+    _paywall_or_consume) — данные организации переносятся, но это всё равно
+    новая заявка новому донору."""
+    if not await _paywall_or_consume(message, state, {"kind": "sameorg"}):
+        return
+
     data = await state.get_data()
     pending = data.get("_pending_resume") or {}
     old_project_data = pending.get("project_data") or {}
@@ -257,11 +318,9 @@ async def resume_project_same_org(callback: CallbackQuery, state: FSMContext):
         "project_data": kept,
         "history_openai": [],
     })
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer()
     await _ensure_active(state)
     await _run_turn_and_reply(
-        callback.message, state,
+        message, state,
         "Начинаем новый проект для той же организации — данные об организации сохранены, "
         "повторно спрашивать их не нужно. Спроси про нового донора/конкурс.",
     )
@@ -277,7 +336,55 @@ async def resume_project_no(callback: CallbackQuery, state: FSMContext):
     await _start_fresh_flow(callback.message, state, flow)
 
 
+async def _paywall_or_consume(message: Message, state: FSMContext, pending: dict) -> bool:
+    """Гейт монетизации (config.ENFORCE_FULL_VERSION_LIMIT + billing.py).
+    Вызывается ПЕРЕД любым реальным стартом нового проекта. Если попытка
+    ещё есть — списывает её (бесплатную либо платный кредит) и возвращает
+    True. Если лимит исчерпан — ничего не списывает, запоминает pending
+    (что доделать после оплаты, см. resume_after_payment), отправляет счёт
+    на Telegram Stars и возвращает False — вызывающий код должен прервать
+    старт проекта (не трогать project_data/state)."""
+    chat_id = message.chat.id
+    if await billing.can_start_project(chat_id):
+        await billing.consume_project_start(chat_id)
+        return True
+
+    await state.update_data(_pending_paid_start=pending)
+    await message.answer(
+        f"🔒 Бесплатные проекты закончились ({config.FULL_VERSION_LIMIT} шт. на аккаунт).\n\n"
+        f"Чтобы начать ещё один, оплати {config.PAID_VERSION_PRICE_XTR} ⭐ Telegram Stars "
+        "по счёту ниже — сразу после оплаты продолжим с того же места."
+    )
+    if config.PAYMENT_ENABLED:
+        await payments.send_project_invoice(message.bot, chat_id)
+    else:
+        logger.warning("Paywall hit for chat %s, но PAYMENT_ENABLED=false — оплатить нельзя", chat_id)
+    return False
+
+
+async def resume_after_payment(message: Message, state: FSMContext) -> None:
+    """Вызывается из handlers/payments_handlers.py сразу после успешной
+    оплаты — автоматически продолжает именно то действие, на котором
+    пользователь упёрся в лимит (см. _paywall_or_consume/_pending_paid_start),
+    без необходимости заново нажимать кнопку."""
+    data = await state.get_data()
+    pending = data.get("_pending_paid_start")
+    await state.update_data(_pending_paid_start=None)
+    if not pending:
+        await message.answer("Нажми кнопку, чтобы начать новый проект 👇", reply_markup=start_keyboard())
+        return
+    kind = pending.get("kind")
+    if kind == "fresh":
+        await _start_fresh_flow(message, state, pending.get("flow", "grant"))
+    elif kind == "sameorg":
+        await _do_resume_same_org(message, state)
+    else:
+        await message.answer("Нажми кнопку, чтобы начать новый проект 👇", reply_markup=start_keyboard())
+
+
 async def _start_fresh_flow(message: Message, state: FSMContext, flow: str) -> None:
+    if not await _paywall_or_consume(message, state, {"kind": "fresh", "flow": flow}):
+        return
     await state.set_state(Flow.active)
     await state.set_data({
         "flow": flow,
@@ -307,7 +414,7 @@ async def _start_fresh_flow(message: Message, state: FSMContext, flow: str) -> N
 @router.callback_query(F.data == "agent:restart")
 async def restart(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.answer(WELCOME, reply_markup=start_keyboard())
+    await callback.message.answer(_welcome_text(), reply_markup=start_keyboard())
     await callback.answer()
 
 
@@ -385,13 +492,13 @@ async def handle_legacy_or_unknown_callback(callback: CallbackQuery, state: FSMC
     # Если пользователь нажал отмену/главное меню
     if data in ("mm", "cancel"):
         await state.clear()
-        await callback.message.answer(WELCOME, reply_markup=start_keyboard())
+        await callback.message.answer(_welcome_text(), reply_markup=start_keyboard())
         return
 
     # Любая другая старая кнопка — подсказываем продолжить текстом
     current_state = await state.get_state()
     if not current_state:
-        await callback.message.answer(WELCOME, reply_markup=start_keyboard())
+        await callback.message.answer(_welcome_text(), reply_markup=start_keyboard())
     else:
         await callback.message.answer("Кнопка от предыдущего шага устарела. Напиши свой ответ или пожелание прямо сообщением в чат 👇")
 
@@ -516,7 +623,7 @@ async def receive_any_message(message: Message, state: FSMContext):
     # Проверка на явный перезапуск
     if is_start_command(raw_text):
         await state.clear()
-        await message.answer(WELCOME, reply_markup=start_keyboard())
+        await message.answer(_welcome_text(), reply_markup=start_keyboard())
         return
 
     # Проверяем, есть ли уже начатый проект
@@ -525,7 +632,7 @@ async def receive_any_message(message: Message, state: FSMContext):
 
     # Если состояния нет и данных нет — показываем приветствие и выбор направления
     if not current_state and not session_data.get("project_data") and not session_data.get("org_info"):
-        await message.answer(WELCOME, reply_markup=start_keyboard())
+        await message.answer(_welcome_text(), reply_markup=start_keyboard())
         return
 
     # Проект уже есть или был — активируем и обрабатываем сообщение
@@ -650,13 +757,25 @@ async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: st
             await send_long(message, result.reply)
 
 
+RESULT_DISCLAIMER = (
+    "⚠️ Перед отправкой донору сверьте этот файл с оригиналом формы/требований — "
+    "при автоматическом анализе отдельные детали могли быть упущены. Если что-то "
+    "разошлось — перенесите нужные данные из этого файла в оригинальные документы "
+    "донора вручную. За итоговый текст и цифры отвечаете вы."
+)
+
+
 async def _send_docx(message: Message, text: str, session: dict) -> None:
     from agent_docgen import export_docx
 
     try:
         async with show_working(message, "📄 Формирую Word-файл..."):
             path, official_template = await export_docx(text, session)
-        await message.answer_document(FSInputFile(path))
+        # Дисклеймер — caption к самому файлу (код, не текст модели): так он
+        # не зависит от того, вспомнит ли модель его написать, и остаётся
+        # виден прямо на файле, даже если пользователь потом перешлёт его
+        # кому-то отдельно от истории чата.
+        await message.answer_document(FSInputFile(path), caption=RESULT_DISCLAIMER)
         if session.pop("_pdf_non_latin_warning", False):
             # РЕАЛЬНАЯ НАХОДКА: шрифт большинства заполняемых PDF-форм доноров
             # (Helvetica) не содержит кириллических глифов — поле формы

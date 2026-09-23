@@ -62,8 +62,16 @@ async def main():
     # (agent_tools.py, agent_engine.py) — код только исполняет её вызовы.
     # Старые handlers/*.py и states.py НЕ удалены (оставлены как référence/
     # откат), но больше не подключаются здесь.
-    dp.include_router(agent_router.router)
+    #
+    # РЕАЛЬНЫЙ БАГ (найден при подключении монетизации): payments_handlers
+    # ДОЛЖЕН идти ПЕРЕД agent_router. agent_router.receive_any_message — это
+    # @router.message() без фильтра, то есть ловит вообще любое сообщение;
+    # апдейт Telegram с successful_payment не содержит .text/.caption, так
+    # что до фикса он попадал в ветку "Не увидел текста в этом сообщении" и
+    # до payments_handlers.successful_payment просто не доходил — оплата
+    # проходила по деньгам, но бот не увидел бы, что платить она перестала.
     dp.include_router(payments_handlers.router)
+    dp.include_router(agent_router.router)
 
     # РЕАЛЬНЫЙ ИНЦИДЕНТ: необработанное исключение в любом хендлере роняло
     # обработку апдейта ПОЛНОСТЬЮ МОЛЧА — пользователь не получал вообще

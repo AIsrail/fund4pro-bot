@@ -46,10 +46,35 @@ async def send_paid_revision_invoice(bot: Bot, chat_id: int) -> None:
     )
 
 
+PAID_PROJECT_PAYLOAD = "paid_new_project"
+
+
+async def send_project_invoice(bot: Bot, chat_id: int) -> None:
+    """Инвойс на покупку ещё одного проекта (донора) сверх бесплатного
+    лимита (config.FULL_VERSION_LIMIT). Вызывается из
+    agent_router._paywall_or_consume, когда лимит исчерпан и
+    config.PAYMENT_ENABLED=true — это живой путь монетизации, в отличие от
+    send_paid_revision_invoice выше (заготовка под старую, неподключённую
+    FSM-архитектуру, оставлена нетронутой на случай отката)."""
+    prices = [LabeledPrice(label="Ещё один проект", amount=config.PAID_VERSION_PRICE_XTR)]
+    await bot.send_invoice(
+        chat_id=chat_id,
+        title="Ещё один проект",
+        description=(
+            "Разработка ещё одного грантового проекта/бизнес-плана сверх "
+            f"бесплатного лимита ({config.FULL_VERSION_LIMIT})."
+        ),
+        payload=PAID_PROJECT_PAYLOAD,
+        provider_token=config.PROVIDER_TOKEN,  # "" => Telegram Stars
+        currency="XTR" if not config.PROVIDER_TOKEN else "USD",
+        prices=prices,
+    )
+
+
 async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
     """Подтверждает оплату перед списанием средств. Telegram требует ответ
     в течение 10 секунд, иначе платёж отклоняется автоматически."""
-    if pre_checkout_query.invoice_payload != PAID_REVISION_PAYLOAD:
+    if pre_checkout_query.invoice_payload not in (PAID_REVISION_PAYLOAD, PAID_PROJECT_PAYLOAD):
         await pre_checkout_query.answer(ok=False, error_message="Неизвестный платёж")
         return
     await pre_checkout_query.answer(ok=True)
