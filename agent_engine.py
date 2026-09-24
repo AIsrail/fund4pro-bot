@@ -21,7 +21,19 @@ from llm import _client, _chatgpt_client, _deepseek_client, _fallback_client
 
 logger = logging.getLogger("fund4pro.agent_engine")
 
-MAX_TOOL_ROUNDS = 5  # защита от зацикливания вызовов инструментов за один ход
+# РЕАЛЬНЫЙ ИНЦИДЕНТ (23.09.2026, живой тест NED): после каждого собранного
+# документа код-инструкция (см. "СРАЗУ переходи к следующему" в _execute_tool
+# ниже) намеренно велит модели заполнить ВСЕ недостающие документы донора в
+# ОДНОМ ходу, без "продолжай" от пользователя между файлами. У NED 4
+# обязательных документа: fetch_donor_page (1) + select_donor_form +
+# generate_document на каждый (4×2=8) = 9 раундов за один ход — почти вдвое
+# больше прежнего лимита 5. Лог подтвердил: "hit MAX_TOOL_ROUNDS (5) without
+# final text" — бот заполнил часть пакета и не дошёл до последнего (самого
+# важного) документа, заявки на грант. Поднято с запасом на донора с ещё
+# большим пакетом документов, не превращая это в бесконечный цикл — реальные
+# защиты от зацикливания (empty_reply_retries, _is_empty_promise, статусы в
+# donor_documents) не зависят от этого числа.
+MAX_TOOL_ROUNDS = 20  # защита от зацикливания вызовов инструментов за один ход
 PROJECT_DATA_FIELDS = (
     "org_info", "donor_info", "donor_template", "problem_and_idea",
     "goal_and_objectives", "activities_and_budget", "other_notes",
