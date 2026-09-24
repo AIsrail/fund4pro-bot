@@ -107,6 +107,7 @@ class AgentTurnResult:
         quick_replies: list[str] | None = None,
         file_attachments: list[dict] | None = None,
         llm_unavailable: bool = False,
+        generated_documents: list[dict] | None = None,
     ):
         self.llm_unavailable = llm_unavailable
         self.reply = reply
@@ -115,6 +116,11 @@ class AgentTurnResult:
         self.tool_log = tool_log or []
         self.quick_replies = quick_replies or []
         self.file_attachments = file_attachments or []
+        # Готовые файлы, собранные ПО ХОДУ (каждый — сразу после своего
+        # generate_document, не одним последним "победителем" в конце хода
+        # — см. комментарий на месте вызова export_docx в run_agent_turn).
+        # [{"path", "filename", "official_template", "non_latin_warning"}, ...]
+        self.generated_documents = generated_documents or []
 
 
 async def _execute_tool(name: str, args: dict, session: dict) -> str:
@@ -1014,6 +1020,7 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
     tool_log: list[str] = []
     document_ready = False
     document_text = ""
+    generated_documents: list[dict] = []
     empty_reply_retries = 0
 
     for round_i in range(MAX_TOOL_ROUNDS):
@@ -1107,6 +1114,7 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                 tool_log=tool_log,
                 quick_replies=quick_replies,
                 file_attachments=file_attachments,
+                generated_documents=generated_documents,
             )
 
         # Модель вызвала инструмент(ы) — фиксируем вызов в истории
@@ -1219,6 +1227,35 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                         )
                     else:
                         document_ready = True
+                        # РЕАЛЬНЫЙ ИНЦИДЕНТ (живой тест NED, 23-24.09.2026): когда
+                        # донор требует НЕСКОЛЬКО документов, этот блок раньше
+                        # только запоминал document_text/document_ready — сам файл
+                        # материализовался ОДИН раз, В КОНЦЕ ВСЕГО ХОДА (agent_router
+                        # ._send_docx -> export_docx), а export_docx читает session
+                        # ["_prebuilt_pdf_path"/"_prebuilt_xlsx_path"/"_prebuilt_docx_
+                        # _path"] — скалярные поля, которые каждый следующий
+                        # generate_document в этом же ходу молча ПЕРЕЗАПИСЫВАЛ. Итог:
+                        # из пакета в 3-4 документов реально уходил пользователю
+                        # только ПОСЛЕДНИЙ (или первый PDF — export_docx проверяет
+                        # pdf/xlsx/docx в этом порядке), хотя каждый предыдущий был
+                        # честно заполнен и отмечен "filled" в реестре — само же
+                        # тело этого result_str заявляло модели "собран и отправлен
+                        # пользователю файлом", хотя физически файл ещё не уходил.
+                        # Фикс: материализуем файл ЭТОГО документа СЕЙЧАС же (пока
+                        # его prebuilt-путь не затёрт следующим вызовом), а не
+                        # откладываем на конец хода — export_docx именно так и
+                        # рассчитан (pop, не read), просто раньше вызывался разом.
+                        from agent_docgen import export_docx
+                        try:
+                            doc_path, official_template = await export_docx(document_text, session)
+                            generated_documents.append({
+                                "path": doc_path,
+                                "filename": chosen_fn,
+                                "official_template": official_template,
+                                "non_latin_warning": session.pop("_pdf_non_latin_warning", False),
+                            })
+                        except Exception:
+                            logger.exception("Failed to materialize document for %r mid-turn", chosen_fn)
                         # Реестр документов донора (см. _classify_donor_documents) —
                         # отмечаем именно ЭТОТ файл готовым, кодом, а не памятью
                         # модели, и сразу же явно говорим модели, сколько ещё
@@ -1331,6 +1368,7 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                 tool_log=tool_log,
                 quick_replies=quick_replies,
                 file_attachments=file_attachments,
+                generated_documents=generated_documents,
             )
 
     # Слишком много раундов инструментов подряд — защита от зацикливания,
@@ -1346,6 +1384,7 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
         document_text=document_text,
         tool_log=tool_log,
         file_attachments=file_attachments,
+        generated_documents=generated_documents,
     )
 
 

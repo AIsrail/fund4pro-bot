@@ -743,7 +743,19 @@ async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: st
                 except Exception as e:
                     logger.warning("Failed to send file attachment %s: %s", p, e)
 
-    if result.document_ready and result.document_text.strip():
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ (живой тест NED, 23-24.09.2026): при пакете из
+    # нескольких документов донора старый путь (_send_docx на весь ход
+    # целиком, один раз) физически мог отправить только ОДИН файл — каждый
+    # generate_document материализуется СРАЗУ (см. agent_engine.run_agent_turn,
+    # export_docx вызывается внутри цикла инструментов) и попадает в
+    # result.generated_documents; если список непуст — рассылаем каждый файл
+    # оттуда. Старый _send_docx остаётся резервным путём на случай, если
+    # список почему-то пуст, а document_ready всё равно True (не должно
+    # случаться в норме, но лучше отправить хоть что-то, чем ничего).
+    if getattr(result, "generated_documents", None):
+        for doc in result.generated_documents:
+            await _send_generated_document(message, doc)
+    elif result.document_ready and result.document_text.strip():
         await _send_docx(message, result.document_text, session)
 
     if result.reply.strip():
@@ -763,6 +775,45 @@ RESULT_DISCLAIMER = (
     "разошлось — перенесите нужные данные из этого файла в оригинальные документы "
     "донора вручную. За итоговый текст и цифры отвечаете вы."
 )
+
+
+async def _send_generated_document(message: Message, doc: dict) -> None:
+    """Отправляет ОДИН уже материализованный файл из result.generated_documents
+    (см. agent_engine.run_agent_turn — файл собран сразу после своего
+    generate_document, не в конце всего хода) — та же логика предупреждений/
+    дисклеймера/очистки tmp, что раньше жила только внутри _send_docx,
+    вынесенная сюда, чтобы применяться к КАЖДОМУ документу пакета, а не
+    только к одному "победителю" на весь ход."""
+    path = doc.get("path")
+    if not path or not os.path.exists(path):
+        logger.warning("_send_generated_document: path missing or gone: %r", path)
+        return
+    try:
+        await message.answer_document(FSInputFile(path), caption=RESULT_DISCLAIMER)
+        if doc.get("non_latin_warning"):
+            await message.answer(
+                "⚠️ Форма — заполняемый PDF, и её шрифт не поддерживает кириллицу "
+                "в некоторых полях: если при открытии файла видите нечитаемые "
+                "символы вместо текста в каком-то поле — впишите его вручную "
+                "латиницей/по-английски прямо в PDF перед отправкой."
+            )
+        if not doc.get("official_template"):
+            await message.answer(
+                "⚠️ Не смог заполнить именно оригинальный файл формы донора (он не найден в текущей "
+                "сессии — например, после перезапуска бота) — выше документ с тем же содержанием, но "
+                "собранный в свободном формате. Пришли ещё раз файл шаблона донора, и я соберу заявку "
+                "строго в нём, прежде чем отправлять донору."
+            )
+    except Exception as e:
+        logger.exception("Failed to send generated document %s: %s", path, e)
+        await message.answer("⚠️ Не удалось отправить один из собранных файлов. Попробуй ещё раз написать 'собери документ'.")
+    finally:
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+                os.rmdir(os.path.dirname(path))
+        except Exception:
+            pass
 
 
 async def _send_docx(message: Message, text: str, session: dict) -> None:
