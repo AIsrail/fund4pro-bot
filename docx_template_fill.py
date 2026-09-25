@@ -378,15 +378,23 @@ async def fill_donor_docx_template(template_path: str, markdown_text: str, outpu
     logger.info("fill_donor_docx_template filled %d fields and %d sections in %s",
                 filled_count, filled_sections_count, template_path)
 
-    # ЖЁСТКАЯ ПРОВЕРКА КАЧЕСТВА: если шаблон имеет много таблиц (> 5),
-    # но заполнено менее 5 полей или 0 развёрнутых секций — считаем, что
-    # шаблон НЕ заполнился! Возвращаем False, чтобы сработал fallback
-    # на markdown_to_docx, который гарантированно выдаст ПОЛНЫЙ документ.
-    if len(doc.tables) >= 5:
-        if filled_count < 5 or filled_sections_count < 1:
-            logger.warning("fill_donor_docx_template: only %d fields and %d sections filled in %s — rejecting partial fill, falling back to markdown_to_docx",
-                           filled_count, filled_sections_count, template_path)
-            return False
+    # ЖЁСТКАЯ ПРОВЕРКА КАЧЕСТВА: если шаблон имеет много таблиц (> 5), но
+    # заполнено почти ничего — считаем, что шаблон НЕ заполнился! Возвращаем
+    # False, чтобы сработал fallback на markdown_to_docx.
+    #
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ (25.09.2026, тот же баг что в docx_schema_fill.py):
+    # было "ИЛИ" — форма БЕЗ развёрнутых текстовых разделов (0 секций по
+    # дизайну, не по сбою) с любым числом полностью заполненных полей всё
+    # равно отбраковывалась, потому что filled_sections_count < 1 истинно
+    # всегда, когда у формы просто нет разделов. Порог теперь — общее число
+    # заполненного относительно общего числа доступного (kv+секции, которые
+    # реально были в тексте модели), а не жёсткое требование ненулевых секций.
+    total_available = len(key_values) + len(sections)
+    total_filled = filled_count + filled_sections_count
+    if len(doc.tables) >= 5 and total_available > 0 and total_filled < min(5, total_available):
+        logger.warning("fill_donor_docx_template: only %d/%d fields+sections filled in %s — rejecting partial fill, falling back to markdown_to_docx",
+                       total_filled, total_available, template_path)
+        return False
 
     if filled_count > 0:
         doc.save(output_path)

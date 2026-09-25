@@ -1248,14 +1248,36 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                         from agent_docgen import export_docx
                         try:
                             doc_path, official_template = await export_docx(document_text, session)
+                        except Exception:
+                            logger.exception("Failed to materialize document for %r mid-turn", chosen_fn)
+                        else:
+                            # "Собеседник-эксперт, который смотрит на доки глазами
+                            # донора" (просьба владельца) — отдельный вызов БЕЗ
+                            # истории разговора (llm.donor_perspective_review), см.
+                            # её докстринг. Только для документов с реальным
+                            # содержательным текстом — короткая PDF-форма из чистых
+                            # kv-полей (имя/сумма/дата) не даёт рецензенту ничего
+                            # содержательного проверять, а лишний вызов на неё —
+                            # чистая трата времени и денег. Отдельный try/except:
+                            # сбой обзора не должен топить уже готовый документ —
+                            # donor_perspective_review и сама ловит свои ошибки
+                            # (возвращает ""), но не полагаемся на это здесь.
+                            donor_review = ""
+                            if len(document_text) > 500:
+                                try:
+                                    from llm import donor_perspective_review
+                                    donor_review = await donor_perspective_review(
+                                        document_text, project_data.get("donor_info", ""),
+                                    )
+                                except Exception:
+                                    logger.warning("donor_perspective_review call failed", exc_info=True)
                             generated_documents.append({
                                 "path": doc_path,
                                 "filename": chosen_fn,
                                 "official_template": official_template,
                                 "non_latin_warning": session.pop("_pdf_non_latin_warning", False),
+                                "donor_review": donor_review,
                             })
-                        except Exception:
-                            logger.exception("Failed to materialize document for %r mid-turn", chosen_fn)
                         # Реестр документов донора (см. _classify_donor_documents) —
                         # отмечаем именно ЭТОТ файл готовым, кодом, а не памятью
                         # модели, и сразу же явно говорим модели, сколько ещё

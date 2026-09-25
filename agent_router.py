@@ -804,6 +804,14 @@ async def _send_generated_document(message: Message, doc: dict) -> None:
                 "собранный в свободном формате. Пришли ещё раз файл шаблона донора, и я соберу заявку "
                 "строго в нём, прежде чем отправлять донору."
             )
+        # "Собеседник-эксперт глазами донора" (llm.donor_perspective_review,
+        # см. agent_engine.py) — код-driven, не зависит от того, вспомнит ли
+        # модель это упомянуть. Пустая строка = либо документ без содержательного
+        # текста (чистая kv-форма), либо сам обзор не нашёл серьёзных пробелов.
+        donor_review = (doc.get("donor_review") or "").strip()
+        if donor_review:
+            from telegram_text import send_long
+            await send_long(message, f"👀 Взгляд донора на этот документ:\n\n{donor_review}")
     except Exception as e:
         logger.exception("Failed to send generated document %s: %s", path, e)
         await message.answer("⚠️ Не удалось отправить один из собранных файлов. Попробуй ещё раз написать 'собери документ'.")

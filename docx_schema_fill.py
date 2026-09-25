@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import docx
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Pt
 from docx.table import _Row
 
@@ -464,6 +466,59 @@ def _duplicate_row_after(nested_table, anchor_tr, template_tr) -> "_Row":
     return _Row(new_tr, nested_table)
 
 
+def _lock_table_layout(nested_table) -> None:
+    """После добавления строк в таблицу с автоматической шириной колонок
+    (tblW type="auto" — так устроены почти все вложенные таблицы донора,
+    пока в них 1-2 строки-шаблона) Word при открытии файла пересчитывает
+    ширину столбцов ПО СОДЕРЖИМОМУ текста и может увести таблицу за правое
+    поле страницы/ячейки, как только строк становится много (план/бюджет
+    из шаблона на 10+ реальных пунктов). Это дефект геометрии — число
+    таблиц/строк/ячеек при этом не меняется, так что НИКАКАЯ структурная
+    проверка (что уже есть в этом файле и в тестах) его не ловит, только
+    открыть готовый файл глазами. Известная, отдельно задокументированная
+    ловушка python-docx (не наша гипотеза — воспроизведена и вылечена на
+    реальных заявках donor-формы).
+
+    Фикс: переключить layout на fixed и явно прописать ширину каждой ячейки
+    по столбцам ИЗ ТЕКУЩЕГО tblGrid (та раскладка, которую Word использовал,
+    пока строк было мало и автоширина ещё не съезжала) — тогда при открытии
+    файла Word обязан подчиниться заданным размерам, а не пересчитывать их
+    по тексту заново."""
+    tbl = nested_table._tbl
+    tblPr = tbl.tblPr
+    if tblPr is None:
+        return
+    grid = tbl.find(qn("w:tblGrid"))
+    if grid is None:
+        return
+    cols = grid.findall(qn("w:gridCol"))
+    widths = [int(c.get(qn("w:w")) or 0) for c in cols]
+    if not widths or not any(widths):
+        return
+
+    existing_layout = tblPr.find(qn("w:tblLayout"))
+    if existing_layout is not None:
+        tblPr.remove(existing_layout)
+    layout = OxmlElement("w:tblLayout")
+    layout.set(qn("w:type"), "fixed")
+    tblPr.append(layout)
+
+    for row in nested_table.rows:
+        for i, tc in enumerate(row._tr.findall(qn("w:tc"))):
+            if i >= len(widths):
+                break
+            tcPr = tc.find(qn("w:tcPr"))
+            if tcPr is None:
+                tcPr = OxmlElement("w:tcPr")
+                tc.insert(0, tcPr)
+            w_el = tcPr.find(qn("w:tcW"))
+            if w_el is None:
+                w_el = OxmlElement("w:tcW")
+                tcPr.append(w_el)
+            w_el.set(qn("w:w"), str(widths[i]))
+            w_el.set(qn("w:type"), "dxa")
+
+
 def _fill_row_cells(row: "_Row", values: list[str]) -> None:
     for cell, val in zip(row.cells, values):
         cell.text = ""
@@ -507,6 +562,17 @@ def _fill_table_field(field: FieldSpec, rows: list[list[str]]) -> bool:
                 run.font.size = Pt(10)
         except IndexError:
             logger.warning("_fill_table_field: could not locate ИТОГО row after cloning")
+
+    # Строк стало больше, чем в исходном шаблоне донора — на автоширине
+    # (по умолчанию у большинства вложенных таблиц) Word может увести
+    # таблицу за правое поле при открытии файла (см. докстринг
+    # _lock_table_layout). Число строк/ячеек эта правка не меняет — только
+    # геометрию, так что она безопасна независимо от остального заполнения.
+    if len(rows) > 1:
+        try:
+            _lock_table_layout(nested_table)
+        except Exception:
+            logger.warning("_fill_table_field: _lock_table_layout failed, leaving auto width", exc_info=True)
     return True
 
 
@@ -625,10 +691,24 @@ async def fill_donor_docx_template_v2(template_path: str, output_path: str, sess
     # Та же защита, что была в старом пайплайне: форма с солидным числом
     # таблиц, но почти ничем не заполненная — считаем неуспехом, а не тихо
     # сохраняем полупустой файл.
-    if len(doc.tables) >= 5 and (filled_kv < 5 or filled_sections < 1):
+    #
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ (живой тест, 25.09.2026): было "ИЛИ" вместо "И" —
+    # донорский шаблон с 41 kv-полем и НОЛЬ полей-секций (сам по себе,
+    # по дизайну — не все формы имеют развёрнутые текстовые разделы)
+    # заполнился на 100% (41/41 kv), но filled_sections < 1 всё равно
+    # истинно (0 < 1) — весь результат выбрасывался как "частичное
+    # заполнение", несмотря на полный успех, откатывался на legacy-пайплайн
+    # (тот же класс бага независимо), и в итоге документ уходил пользователю
+    # НЕ по форме донора (markdown_to_docx). Порог теперь смотрит на ОБЩЕЕ
+    # число заполненных полей относительно общего числа полей в схеме —
+    # "почти ничего не заполнено" при любом соотношении kv/section, а не
+    # "одна из двух категорий случайно оказалась нулевой по дизайну формы".
+    total_fields = sum(1 for f in fields if f.kind in ("kv", "section"))
+    total_filled = filled_kv + filled_sections
+    if len(doc.tables) >= 5 and total_fields > 0 and total_filled < min(5, total_fields):
         logger.warning(
-            "fill_donor_docx_template_v2: only %d kv + %d sections filled — rejecting partial fill",
-            filled_kv, filled_sections,
+            "fill_donor_docx_template_v2: only %d/%d kv+section fields filled — rejecting partial fill",
+            total_filled, total_fields,
         )
         return False, ""
 
