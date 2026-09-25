@@ -328,6 +328,95 @@ def sanitize_contact_answers(fields: list[FieldSpec], answers: dict[str, str]) -
     return fixed
 
 
+# Донор часто задаёт лимит слов прямо в тексте вопроса ("не более 200 слов",
+# "maximum 150 words") — до этой правки заполнение полностью полагалось на
+# то, что модель сама уложится: ни одной программной проверки не было. Тот
+# же класс риска, что уже чинили в других местах пайплайна (реестр
+# документов, число раундов инструментов) — доверие к модели вместо кода,
+# особенно рискованно на слабом фолбэк-провайдере (см. README/память
+# проекта про надёжность DeepSeek на детальных инструкциях промпта).
+_WORD_LIMIT_RE = re.compile(
+    r"(?:не\s+более|максимум|до|not\s+more\s+than|no\s+more\s+than|max(?:imum)?)\s*[:\-]?\s*"
+    r"(\d{2,4})\s*(?:слов(?:а)?|words?)",
+    re.IGNORECASE,
+)
+# Допуск перед тем, как считать превышение существенным — сама модель почти
+# всегда чуть промахивается мимо ровного числа, пересчитывать из-за 1-2
+# слов не стоит (лишний вызов модели ради косметики).
+_WORD_LIMIT_TOLERANCE = 1.2
+
+
+def _count_words(text: str) -> int:
+    """Считает слова В ОТВЕТЕ. XYZ-плейсхолдер не считается словом лимита —
+    поле с несколькими содержательными XYZ-показателями ("XYZ обращений
+    подано, из них XYZ рассмотрено") не должно ложно казаться превышающим
+    лимит из-за самих маркеров пропуска."""
+    words = re.findall(r"[А-Яа-яЁёA-Za-z0-9]+", text or "")
+    return sum(1 for w in words if w.upper() != "XYZ")
+
+
+def _extract_word_limit(question: str) -> int | None:
+    m = _WORD_LIMIT_RE.search(question or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+async def enforce_word_limits(fields: list[FieldSpec], answers: dict[str, str]) -> int:
+    """Для каждого section-поля с явным лимитом слов В САМОМ ВОПРОСЕ донора
+    — если ответ модели превышает лимит больше чем на _WORD_LIMIT_TOLERANCE,
+    просит ОДИН точечный пересказ короче. Не блокирует заполнение при
+    неудаче сжатия (сеть недоступна, провайдер отказал, сжатый вариант
+    всё равно длинный) — оставляет исходный ответ как есть и логирует;
+    лучше отдать чуть длинный текст, чем ничего. Возвращает число реально
+    сжатых полей (для лога вызывающего кода)."""
+    from llm import call_claude
+
+    shortened_count = 0
+    for f in fields:
+        if f.kind != "section":
+            continue
+        limit = _extract_word_limit(f.question)
+        if not limit:
+            continue
+        answer = (answers.get(f.field_id) or "").strip()
+        if not answer:
+            continue
+        count = _count_words(answer)
+        if count <= limit * _WORD_LIMIT_TOLERANCE:
+            continue
+        try:
+            system_prompt = (
+                f"Сожми следующий текст до НЕ БОЛЕЕ {limit} слов, сохранив ключевые "
+                f"факты, цифры и структуру (подзаголовки/порядок пунктов, если они "
+                f"есть) — убирай повторы и второстепенные детали, не смысл. Без "
+                f"мета-комментариев вроде 'сократил до лимита'. Верни только сам "
+                f"сжатый текст."
+            )
+            shortened = await call_claude(system_prompt, answer, max_tokens=min(2000, limit * 8))
+            shortened = shortened.strip()
+            new_count = _count_words(shortened)
+            if shortened and new_count <= limit * _WORD_LIMIT_TOLERANCE:
+                answers[f.field_id] = shortened
+                shortened_count += 1
+                logger.info(
+                    "enforce_word_limits: %s сжато с %d до %d слов (лимит %d)",
+                    f.field_id, count, new_count, limit,
+                )
+            else:
+                logger.warning(
+                    "enforce_word_limits: %s превышает лимит (%d/%d слов), сжатие не "
+                    "уложилось (%d слов) — оставляю исходный ответ",
+                    f.field_id, count, limit, new_count,
+                )
+        except Exception:
+            logger.warning("enforce_word_limits: compression call failed for %s", f.field_id, exc_info=True)
+    return shortened_count
+
+
 # Метка вопроса формы -> ключ в org_contacts (см. document_reader.extract_
 # contact_facts). Порядок в списке значений — приоритет при нескольких
 # подходящих фактах (например для общего "Адрес" пробуем сначала
@@ -671,6 +760,10 @@ async def fill_donor_docx_template_v2(template_path: str, output_path: str, sess
     if n_applied:
         logger.info("fill_donor_docx_template_v2: applied %d known org contact(s) from data room", n_applied)
     sanitize_contact_answers(fields, answers)
+    try:
+        await enforce_word_limits(fields, answers)
+    except Exception:
+        logger.warning("enforce_word_limits failed, continuing with unshortened answers", exc_info=True)
     table_answers = await build_table_answers(fields, session)
     try:
         await enforce_xyz_budget(answers, table_answers, session)
