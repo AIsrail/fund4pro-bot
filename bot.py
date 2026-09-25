@@ -9,6 +9,7 @@ from aiogram.types import ErrorEvent
 
 import config
 import agent_router
+from chat_serialization import ChatSerializationMiddleware
 from handlers import payments_handlers
 from update_dedup import DedupMiddleware
 
@@ -115,6 +116,15 @@ async def main():
     # один и тот же апдейт (например файл от пользователя) отрабатывался
     # дважды параллельно и второй ответ агента противоречил первому.
     dp.update.outer_middleware(DedupMiddleware())
+
+    # РЕАЛЬНАЯ ЖАЛОБА (25.09.2026): 3 файла подряд об организации -> 3
+    # ОДИНАКОВЫХ ответа, и параллельно с этим бот успел ответить на донора
+    # (ссылку), присланную следом. Это РАЗНЫЕ апдейты (не повтор одного и
+    # того же — DedupMiddleware выше тут ни при чём), которые aiogram по
+    # умолчанию обрабатывает параллельно (handle_as_tasks=True), даже если
+    # они от одного и того же чата — см. докстринг chat_serialization.py.
+    # Сериализует апдейты ВНУТРИ чата, апдейты разных чатов не трогает.
+    dp.update.outer_middleware(ChatSerializationMiddleware())
 
     # РЕДИЗАЙН (v3): единый агентный роутер вместо ~13 файлов handlers/*.py,
     # каждый из которых был изолированным FSM-шагом с узким LLM-промптом на
