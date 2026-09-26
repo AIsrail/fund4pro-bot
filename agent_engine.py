@@ -14,6 +14,7 @@ import base64
 import json
 import logging
 
+import billing
 import config
 from agent_roadmap import build_lite_system_prompt, build_system_prompt
 from agent_tools import TOOLS_OPENAI, to_anthropic_tools
@@ -161,8 +162,24 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
                 return f"Страница загружена, файлов формы не найдено. Текст страницы:\n{summary}"
             return "Не удалось получить содержимое страницы (защита от ботов или пустой ответ)."
 
-        # Сохраняем все найденные файлы на диск и готовим их отправку в чат Telegram пользователю
+        # РЕАЛЬНАЯ ПРОСЬБА ВЛАДЕЛЬЦА (25.09.2026): 1-е скачивание официального
+        # шаблона донора бесплатно, дальше платно — НО списывать/просить
+        # оплату можно только ПОСЛЕ того, как скачивание реально удалось
+        # (мы уже здесь — forms непусты), иначе в части случаев бот примет
+        # деньги, а отдать скачанный файл не сможет. Гейтится именно ВЫДАЧА
+        # сырого файла пользователю (_pending_file_attachments) — свою же
+        # копию для извлечения структуры/заполнения бот сохраняет всегда,
+        # платность не должна ломать бесплатную генерацию текста заявки.
+        chat_id = session.get("_chat_id")
+        allow_download = True
+        if chat_id is not None:
+            try:
+                allow_download = await billing.can_use(chat_id, "template_download")
+            except Exception:
+                logger.warning("billing.can_use(template_download) failed, defaulting to allow", exc_info=True)
+
         saved_files = []
+        withheld_files = []
         pending_att = session.get("_pending_file_attachments", [])
         for f in forms:
             content = f.get("content") or b""
@@ -196,12 +213,39 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
                     "content_b64": base64.b64encode(content).decode("ascii"),
                 }
                 saved_files.append(f_entry)
-                pending_att.append({
-                    "path": path,
-                    "caption": f"📎 Форма донора: {f['filename']}",
-                })
+                if allow_download:
+                    pending_att.append({
+                        "path": path,
+                        "caption": f"📎 Форма донора: {f['filename']}",
+                    })
+                else:
+                    withheld_files.append({"filename": f["filename"], "content_b64": f_entry["content_b64"]})
         session["saved_donor_files"] = saved_files
         session["_pending_file_attachments"] = pending_att
+
+        extra_note = ""
+        if allow_download and chat_id is not None:
+            try:
+                await billing.consume(chat_id, "template_download")
+            except Exception:
+                logger.warning("billing.consume(template_download) failed", exc_info=True)
+        elif not allow_download and withheld_files:
+            # Файлы бот всё равно сохранил себе (saved_files выше) — для
+            # генерации ТЕКСТА заявки это ничего не стоит и остаётся
+            # бесплатным. Платно — именно копия сырого файла пользователю;
+            # придерживаем её до оплаты (см. payments.send_template_download_
+            # invoice + handlers/payments_handlers.py -> agent_router.
+            # resume_after_template_payment).
+            session["_pending_paid_template_files"] = withheld_files
+            session["_pending_invoice"] = "template_download"
+            names = ", ".join(f["filename"] for f in withheld_files)
+            extra_note = (
+                f" ВАЖНО: бесплатный лимит на скачивание шаблона донора исчерпан — "
+                f"копия файла(ов) ({names}) пользователю НЕ отправлена, ему сейчас "
+                f"придёт отдельный счёт на оплату. Скажи об этом честно, но продолжай "
+                f"работать с содержимым формы как обычно (структура/вопросы донора "
+                f"тебе уже доступны для написания текста заявки)."
+            )
 
         # Реестр документов донора — считает КОД, не модель (см. докстринг
         # _classify_donor_documents). Не перезаписываем уже известные записи
@@ -221,7 +265,7 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
             return (
                 f"Страница загружена. Найдено {len(forms)} файл(а), они скачаны и отправляются пользователю в чат, "
                 f"но не удалось автоматически извлечь текст (сканы или защищённый формат)."
-            )
+            ) + extra_note
 
         from llm import extract_donor_template_structure, detect_doc_language, label_donor_form
 
@@ -239,8 +283,8 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
                     f"Форма '{readable[0]['filename']}' скачана, отправлена пользователю файлом в чат и её официальная структура "
                     f"извлечена (сохранена как donor_template) — при generate_document заполняй строго её.\n\n"
                     f"Структура:\n{structure[:1500]}"
-                )
-            return f"Форма '{readable[0]['filename']}' скачана и отправлена в чат, но не похожа на официальную форму заявки."
+                ) + extra_note
+            return f"Форма '{readable[0]['filename']}' скачана и отправлена в чат, но не похожа на официальную форму заявки." + extra_note
 
         # Несколько форм (например main + travel) — определяем их назначение
         labels = []
@@ -292,7 +336,7 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
             f"и только если содержательных вопросов действительно нигде нет — прямо скажи пользователю: "
             f"содержательные вопросы заявки, похоже, есть только в личном кабинете донора, попроси "
             f"зарегистрироваться там и прислать текст этих вопросов (можно скриншотом или копипастой)."
-        )
+        ) + extra_note
 
     if name == "select_donor_form":
         keyword = str(args.get("filename_or_keyword", "")).strip().lower()
@@ -994,6 +1038,94 @@ def _trim_history(history: list[dict]) -> None:
         del history[:cut]
 
 
+async def _deliver_generated_document(
+    chosen_fn: str, document_text: str, project_data: dict, session: dict, generated_documents: list[dict],
+) -> bool:
+    """Решает, как ИМЕННО доставить только что готовый документ — файлом по
+    официальному шаблону донора (export_docx, платно, см. ниже) или пока
+    только текстом в чате (всегда бесплатно) — и делает это. Возвращает
+    True, если документ ушёл ФАЙЛОМ (delivered_as_file).
+
+    РЕАЛЬНАЯ ПРОСЬБА ВЛАДЕЛЬЦА (25.09.2026): бесплатно — готовый ТЕКСТ
+    заявки в чате; сборка в ОФИЦИАЛЬНЫЙ ФАЙЛ шаблона донора — отдельная
+    платная услуга (независимо от лимита на число проектов). Проверяем ДО
+    экспорта — если не оплачено, export_docx вообще не вызываем, текст всё
+    равно уходит пользователю (кодом через session["_pending_text_documents"],
+    не пересказом модели — та же дисциплина, что и для остальных
+    доставляемых пользователю артефактов в этом файле).
+
+    Вынесено в отдельную функцию (была инлайн-веткой в run_agent_turn) ради
+    тестируемости — это код, который берёт реальные деньги, и должен
+    проверяться без необходимости гонять весь LLM tool-calling цикл."""
+    chat_id = session.get("_chat_id")
+    file_export_allowed = True
+    if chat_id is not None:
+        try:
+            file_export_allowed = await billing.can_use(chat_id, "file_export")
+        except Exception:
+            logger.warning("billing.can_use(file_export) failed, defaulting to allow", exc_info=True)
+
+    if not file_export_allowed:
+        session.setdefault("_pending_text_documents", []).append({
+            "filename": chosen_fn, "text": document_text,
+        })
+        session["_pending_invoice"] = "file_export"
+        # В отличие от _pending_text_documents (одноразовый, текст уже
+        # отправлен), это должно пережить ожидание оплаты пользователем —
+        # agent_router.resume_after_file_export_payment пересобирает
+        # документ заново (текст мог устареть к моменту оплаты, если
+        # пользователь успел уйти дальше по проекту) и наконец
+        # материализует файл.
+        session["_pending_file_export"] = {"filename": chosen_fn}
+        return False
+
+    if chat_id is not None:
+        try:
+            await billing.consume(chat_id, "file_export")
+        except Exception:
+            logger.warning("billing.consume(file_export) failed", exc_info=True)
+
+    # РЕАЛЬНЫЙ ИНЦИДЕНТ (живой тест NED, 23-24.09.2026): когда донор требует
+    # НЕСКОЛЬКО документов, файл раньше материализовался ОДИН раз, В КОНЦЕ
+    # ВСЕГО ХОДА (agent_router._send_docx -> export_docx), а export_docx
+    # читает session["_prebuilt_pdf_path"/"_prebuilt_xlsx_path"/
+    # "_prebuilt_docx_path"] — скалярные поля, которые каждый следующий
+    # generate_document в этом же ходу молча ПЕРЕЗАПИСЫВАЛ. Фикс:
+    # материализуем файл ЭТОГО документа СЕЙЧАС же (пока его prebuilt-путь
+    # не затёрт следующим вызовом), не откладываем на конец хода.
+    from agent_docgen import export_docx
+    try:
+        doc_path, official_template = await export_docx(document_text, session)
+    except Exception:
+        logger.exception("Failed to materialize document for %r mid-turn", chosen_fn)
+        return False
+
+    # "Собеседник-эксперт, который смотрит на доки глазами донора" (просьба
+    # владельца) — отдельный вызов БЕЗ истории разговора
+    # (llm.donor_perspective_review), см. её докстринг. Только для
+    # документов с реальным содержательным текстом — короткая PDF-форма из
+    # чистых kv-полей (имя/сумма/дата) не даёт рецензенту ничего
+    # содержательного проверять, а лишний вызов на неё — чистая трата
+    # времени и денег. Отдельный try/except: сбой обзора не должен топить
+    # уже готовый документ — donor_perspective_review и сама ловит свои
+    # ошибки (возвращает ""), но не полагаемся на это здесь.
+    donor_review = ""
+    if len(document_text) > 500:
+        try:
+            from llm import donor_perspective_review
+            donor_review = await donor_perspective_review(document_text, project_data.get("donor_info", ""))
+        except Exception:
+            logger.warning("donor_perspective_review call failed", exc_info=True)
+    generated_documents.append({
+        "path": doc_path,
+        "filename": chosen_fn,
+        "official_template": official_template,
+        "non_latin_warning": session.pop("_pdf_non_latin_warning", False),
+        "donor_review": donor_review,
+    })
+    return True
+
+
 async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
     """Главная точка входа — один ход диалога: добавляет сообщение
     пользователя, крутит цикл модель<->инструменты до финального текстового
@@ -1227,60 +1359,16 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                         )
                     else:
                         document_ready = True
-                        # РЕАЛЬНЫЙ ИНЦИДЕНТ (живой тест NED, 23-24.09.2026): когда
-                        # донор требует НЕСКОЛЬКО документов, этот блок раньше
-                        # только запоминал document_text/document_ready — сам файл
-                        # материализовался ОДИН раз, В КОНЦЕ ВСЕГО ХОДА (agent_router
-                        # ._send_docx -> export_docx), а export_docx читает session
-                        # ["_prebuilt_pdf_path"/"_prebuilt_xlsx_path"/"_prebuilt_docx_
-                        # _path"] — скалярные поля, которые каждый следующий
-                        # generate_document в этом же ходу молча ПЕРЕЗАПИСЫВАЛ. Итог:
-                        # из пакета в 3-4 документов реально уходил пользователю
-                        # только ПОСЛЕДНИЙ (или первый PDF — export_docx проверяет
-                        # pdf/xlsx/docx в этом порядке), хотя каждый предыдущий был
-                        # честно заполнен и отмечен "filled" в реестре — само же
-                        # тело этого result_str заявляло модели "собран и отправлен
-                        # пользователю файлом", хотя физически файл ещё не уходил.
-                        # Фикс: материализуем файл ЭТОГО документа СЕЙЧАС же (пока
-                        # его prebuilt-путь не затёрт следующим вызовом), а не
-                        # откладываем на конец хода — export_docx именно так и
-                        # рассчитан (pop, не read), просто раньше вызывался разом.
-                        from agent_docgen import export_docx
-                        try:
-                            doc_path, official_template = await export_docx(document_text, session)
-                        except Exception:
-                            logger.exception("Failed to materialize document for %r mid-turn", chosen_fn)
-                        else:
-                            # "Собеседник-эксперт, который смотрит на доки глазами
-                            # донора" (просьба владельца) — отдельный вызов БЕЗ
-                            # истории разговора (llm.donor_perspective_review), см.
-                            # её докстринг. Только для документов с реальным
-                            # содержательным текстом — короткая PDF-форма из чистых
-                            # kv-полей (имя/сумма/дата) не даёт рецензенту ничего
-                            # содержательного проверять, а лишний вызов на неё —
-                            # чистая трата времени и денег. Отдельный try/except:
-                            # сбой обзора не должен топить уже готовый документ —
-                            # donor_perspective_review и сама ловит свои ошибки
-                            # (возвращает ""), но не полагаемся на это здесь.
-                            donor_review = ""
-                            if len(document_text) > 500:
-                                try:
-                                    from llm import donor_perspective_review
-                                    donor_review = await donor_perspective_review(
-                                        document_text, project_data.get("donor_info", ""),
-                                    )
-                                except Exception:
-                                    logger.warning("donor_perspective_review call failed", exc_info=True)
-                            generated_documents.append({
-                                "path": doc_path,
-                                "filename": chosen_fn,
-                                "official_template": official_template,
-                                "non_latin_warning": session.pop("_pdf_non_latin_warning", False),
-                                "donor_review": donor_review,
-                            })
+                        # Файлом или пока только текстом — и списание платного
+                        # лимита, если применимо — см. _deliver_generated_document.
+                        delivered_as_file = await _deliver_generated_document(
+                            chosen_fn, document_text, project_data, session, generated_documents,
+                        )
+
                         # Реестр документов донора (см. _classify_donor_documents) —
-                        # отмечаем именно ЭТОТ файл готовым, кодом, а не памятью
-                        # модели, и сразу же явно говорим модели, сколько ещё
+                        # отмечаем именно ЭТОТ документ готовым, кодом, а не памятью
+                        # модели (готовность ТЕКСТА не зависит от того, оплачен ли
+                        # файл-экспорт), и сразу же явно говорим модели, сколько ещё
                         # осталось — иначе слабая модель (сейчас единственная
                         # реально доступная) может "забыть" и остановиться,
                         # решив, что раз ЭТОТ документ готов, то и всё готово.
@@ -1291,13 +1379,18 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                                 d["status"] = "filled_with_gaps" if has_xyz else "filled"
                                 break
                         remaining = [d for d in docs if d.get("status") == "pending"]
+                        delivery_phrase = (
+                            "собран и отправлен пользователю файлом" if delivered_as_file else
+                            "готов текстом и уже показан пользователю в чате (сборка в официальный "
+                            "файл донора — платная услуга, счёт выставлен отдельно)"
+                        )
                         if remaining:
                             names = ", ".join(f"«{d['filename']}»" for d in remaining)
                             result_str = (
-                                f"Документ '{chosen_fn}' собран и отправлен пользователю файлом. "
+                                f"Документ '{chosen_fn}' {delivery_phrase}. "
                                 f"У донора ЕЩЁ {len(remaining)} несобранных документ(ов): {names}. "
                                 f"НЕ говори пользователю, что заявка готова. В этом же ответе кратко "
-                                f"подтверди, что этот файл готов, и СРАЗУ переходи к следующему: вызови "
+                                f"подтверди, что этот документ готов, и СРАЗУ переходи к следующему: вызови "
                                 f"select_donor_form на первом из оставшихся, затем generate_document."
                             )
                         else:
@@ -1318,7 +1411,7 @@ async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:
                                 f"недостающее позже — тогда update_project и пересобери документ."
                             ) if gaps else ""
                             result_str = (
-                                "Документ собран и отправлен пользователю файлом. Это ПОСЛЕДНИЙ "
+                                f"Документ {delivery_phrase}. Это ПОСЛЕДНИЙ "
                                 "недостающий документ донора — весь пакет теперь собран." + gap_note +
                                 " Не пересказывай содержимое текстом, просто кратко подтверди готовность "
                                 "всего пакета."

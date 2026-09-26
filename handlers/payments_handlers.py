@@ -15,7 +15,13 @@ import billing
 from aiogram import Router
 from aiogram.types import Message, PreCheckoutQuery
 
-from payments import PAID_PROJECT_PAYLOAD, PAID_REVISION_PAYLOAD, handle_pre_checkout
+from payments import (
+    PAID_FILE_EXPORT_PAYLOAD,
+    PAID_PROJECT_PAYLOAD,
+    PAID_REVISION_PAYLOAD,
+    PAID_TEMPLATE_DOWNLOAD_PAYLOAD,
+    handle_pre_checkout,
+)
 
 router = Router()
 
@@ -45,9 +51,30 @@ async def successful_payment(message: Message, state):
         # (см. billing.py, agent_router._paywall_or_consume).
         import agent_router
 
-        await billing.add_paid_credit(message.chat.id)
+        await billing.add_paid_credit(message.chat.id, "project")
         await message.answer(PAID_PROJECT_THANK_YOU)
         await agent_router.resume_after_payment(message, state)
+        return
+
+    if payload == PAID_TEMPLATE_DOWNLOAD_PAYLOAD:
+        # Оплата скачивания шаблона донора сверх бесплатного лимита — файл
+        # бот уже скачал ДО выставления счёта (см. agent_engine.py), здесь
+        # только начисляем кредит и отдаём придержанную копию.
+        import agent_router
+
+        await billing.add_paid_credit(message.chat.id, "template_download")
+        await message.answer("✅ Оплата прошла — вот шаблон:")
+        await agent_router.resume_after_template_payment(message, state)
+        return
+
+    if payload == PAID_FILE_EXPORT_PAYLOAD:
+        # Оплата сборки документа в официальный файл шаблона донора (по
+        # умолчанию бесплатно — только текст в чате).
+        import agent_router
+
+        await billing.add_paid_credit(message.chat.id, "file_export")
+        await message.answer("✅ Оплата прошла — собираю файл:")
+        await agent_router.resume_after_file_export_payment(message, state)
         return
 
     if payload == PAID_REVISION_PAYLOAD:

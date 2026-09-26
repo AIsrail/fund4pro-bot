@@ -382,6 +382,80 @@ async def resume_after_payment(message: Message, state: FSMContext) -> None:
         await message.answer("Нажми кнопку, чтобы начать новый проект 👇", reply_markup=start_keyboard())
 
 
+async def resume_after_template_payment(message: Message, state: FSMContext) -> None:
+    """Вызывается из handlers/payments_handlers.py после оплаты скачивания
+    шаблона донора — отдаёт файл(ы), которые agent_engine.py придержал в
+    session["_pending_paid_template_files"] (см. её докстринг у
+    fetch_donor_page: скачивание уже удалось ДО того, как был выставлен
+    счёт, само содержимое хранится как content_b64, как и в
+    saved_donor_files, — восстанавливаем во временный файл и отправляем."""
+    import base64
+    import os
+    import tempfile
+
+    data = await state.get_data()
+    pending_files = data.get("_pending_paid_template_files") or []
+    await state.update_data(_pending_paid_template_files=None)
+    if not pending_files:
+        await message.answer("✅ Оплата прошла, но не нашёл, какой файл отдать — напиши, что нужно, ещё раз.")
+        return
+    for f in pending_files:
+        try:
+            raw = base64.b64decode(f["content_b64"])
+            tmp_dir = tempfile.mkdtemp()
+            path = os.path.join(tmp_dir, f["filename"])
+            with open(path, "wb") as fh:
+                fh.write(raw)
+            await message.answer_document(FSInputFile(path), caption=f"📎 Форма донора: {f['filename']}")
+            os.unlink(path)
+            os.rmdir(tmp_dir)
+        except Exception:
+            logger.exception("resume_after_template_payment: failed to send %r", f.get("filename"))
+            await message.answer(f"⚠️ Не удалось отправить файл «{f.get('filename', '?')}» — напиши, я попробую ещё раз.")
+
+
+async def resume_after_file_export_payment(message: Message, state: FSMContext) -> None:
+    """Вызывается из handlers/payments_handlers.py после оплаты сборки
+    документа в официальный файл шаблона донора (см. agent_engine.py,
+    session["_pending_file_export"]). Пересобирает документ ЗАНОВО (текст
+    мог устареть, если пользователь успел продолжить проект, пока ждал
+    оплаты) и наконец материализует файл — тот же export_docx, что и в
+    бесплатном пути, просто без повторной проверки billing (уже оплачено)."""
+    from agent_docgen import build_final_document, export_docx
+
+    data = await state.get_data()
+    pending = data.get("_pending_file_export")
+    await state.update_data(_pending_file_export=None)
+    if not pending:
+        await message.answer("✅ Оплата прошла — напиши 'собери документ', чтобы я собрал файл.")
+        return
+
+    filename = pending.get("filename")
+    if filename:
+        data["chosen_donor_form"] = filename
+    try:
+        async with show_working(message, "📄 Собираю файл по шаблону донора..."):
+            text = await build_final_document(data)
+            path, official_template = await export_docx(text, data)
+        await state.set_data(data)
+        await message.answer_document(FSInputFile(path), caption=RESULT_DISCLAIMER)
+        if not official_template:
+            await message.answer(
+                "⚠️ Не смог заполнить именно оригинальный файл формы донора (он не найден в текущей "
+                "сессии) — выше документ с тем же содержанием, но собранный в свободном формате."
+            )
+    except Exception:
+        logger.exception("resume_after_file_export_payment: failed to build/export document")
+        await message.answer("⚠️ Оплата прошла, но собрать файл не удалось — напиши 'собери документ' ещё раз, я попробую снова.")
+    finally:
+        try:
+            if 'path' in locals() and os.path.exists(path):
+                os.unlink(path)
+                os.rmdir(os.path.dirname(path))
+        except Exception:
+            pass
+
+
 async def _start_fresh_flow(message: Message, state: FSMContext, flow: str) -> None:
     if not await _paywall_or_consume(message, state, {"kind": "fresh", "flow": flow}):
         return
@@ -679,6 +753,10 @@ async def _alert_owner_llm_down(message: Message) -> None:
 
 async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: str) -> None:
     session = await state.get_data()
+    # Нужен глубоко внутри цикла инструментов (agent_engine._execute_tool)
+    # для проверки платных лимитов на скачивание шаблона/сборку файла —
+    # run_agent_turn получает только session, не message/chat_id напрямую.
+    session["_chat_id"] = message.chat.id
     try:
         async with show_live_progress(message, "💭 Думаю..."):
             result = await agent_engine.run_agent_turn(session, user_text)
@@ -693,10 +771,37 @@ async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: st
         return
 
     found_notes = session.pop("_found_data_notes", [])
+    # Флаг-триггер "отправь счёт СЕЙЧАС" (см. agent_engine._execute_tool,
+    # fetch_donor_page/GENERATE_DOCUMENT) — сам по себе не персистентный, не
+    # сохраняем его в FSM-данные; то, ЗА ЧТО платят (_pending_paid_template_
+    # files) наоборот должно пережить ожидание оплаты пользователем — оно НЕ
+    # выше в pop. _pending_text_documents — наоборот одноразовый: текст либо
+    # уходит пользователю прямо сейчас, либо теряет смысл (документ можно
+    # пересобрать заново по требованию), персистить его не нужно.
+    pending_invoice = session.pop("_pending_invoice", None)
+    pending_text_documents = session.pop("_pending_text_documents", [])
     await state.set_data(session)  # сохраняем актуализированные данные
 
     if getattr(result, "llm_unavailable", False):
         await _alert_owner_llm_down(message)
+
+    if pending_text_documents:
+        from telegram_text import send_long
+        for doc in pending_text_documents:
+            try:
+                await send_long(message, f"📄 «{doc['filename']}» — готовый текст:\n\n{doc['text']}")
+            except Exception:
+                logger.warning("Failed to send free-tier text document %r", doc.get("filename"), exc_info=True)
+
+    if pending_invoice and config.PAYMENT_ENABLED:
+        import payments
+        try:
+            if pending_invoice == "template_download":
+                await payments.send_template_download_invoice(message.bot, message.chat.id)
+            elif pending_invoice == "file_export":
+                await payments.send_file_export_invoice(message.bot, message.chat.id)
+        except Exception:
+            logger.warning("Failed to send %s invoice", pending_invoice, exc_info=True)
 
     # Пользователь должен видеть, ЧТО именно бот нашёл в сети и на чём
     # строит цифры — раньше находки уходили только модели (в скрытый

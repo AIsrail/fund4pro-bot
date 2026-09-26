@@ -71,10 +71,61 @@ async def send_project_invoice(bot: Bot, chat_id: int) -> None:
     )
 
 
+PAID_TEMPLATE_DOWNLOAD_PAYLOAD = "paid_template_download"
+
+
+async def send_template_download_invoice(bot: Bot, chat_id: int) -> None:
+    """Инвойс на скачивание ещё одного официального шаблона формы донора
+    сверх бесплатного лимита (config.FREE_TEMPLATE_DOWNLOADS). Вызывается
+    ТОЛЬКО после того, как бот уже успешно скачал шаблон (см.
+    agent_engine._execute_tool) — по прямой просьбе владельца: если сначала
+    брать деньги, а потом скачивание не удастся (антибот донора, 404 и
+    т.п.), пользователь платит за то, чего не получит. Файл при этом
+    придерживается в сессии (не отправляется) до успешной оплаты."""
+    prices = [LabeledPrice(label="Скачивание шаблона донора", amount=config.PAID_TEMPLATE_DOWNLOAD_PRICE_XTR)]
+    await bot.send_invoice(
+        chat_id=chat_id,
+        title="Скачивание шаблона донора",
+        description=(
+            "Официальный шаблон формы донора уже найден и скачан — сверх "
+            f"бесплатного лимита ({config.FREE_TEMPLATE_DOWNLOADS} шаблон)."
+        ),
+        payload=PAID_TEMPLATE_DOWNLOAD_PAYLOAD,
+        provider_token=config.PROVIDER_TOKEN,
+        currency="XTR" if not config.PROVIDER_TOKEN else "USD",
+        prices=prices,
+    )
+
+
+PAID_FILE_EXPORT_PAYLOAD = "paid_file_export"
+
+
+async def send_file_export_invoice(bot: Bot, chat_id: int) -> None:
+    """Инвойс на сборку итогового документа В ОФИЦИАЛЬНЫЙ ФАЙЛ шаблона
+    донора (не текст в чате) — по просьбе владельца платно с первого раза,
+    отдельно от лимита на количество проектов: бесплатно пользователь
+    получает готовый ТЕКСТ заявки в чате, файл по форме донора — платная
+    услуга поверх него."""
+    prices = [LabeledPrice(label="Сборка документа в файл шаблона донора", amount=config.PAID_FILE_EXPORT_PRICE_XTR)]
+    await bot.send_invoice(
+        chat_id=chat_id,
+        title="Сборка в официальный файл донора",
+        description="Готовый текст заявки уже собран — соберу его в официальный файл формы донора.",
+        payload=PAID_FILE_EXPORT_PAYLOAD,
+        provider_token=config.PROVIDER_TOKEN,
+        currency="XTR" if not config.PROVIDER_TOKEN else "USD",
+        prices=prices,
+    )
+
+
 async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
     """Подтверждает оплату перед списанием средств. Telegram требует ответ
     в течение 10 секунд, иначе платёж отклоняется автоматически."""
-    if pre_checkout_query.invoice_payload not in (PAID_REVISION_PAYLOAD, PAID_PROJECT_PAYLOAD):
+    known_payloads = (
+        PAID_REVISION_PAYLOAD, PAID_PROJECT_PAYLOAD,
+        PAID_TEMPLATE_DOWNLOAD_PAYLOAD, PAID_FILE_EXPORT_PAYLOAD,
+    )
+    if pre_checkout_query.invoice_payload not in known_payloads:
         await pre_checkout_query.answer(ok=False, error_message="Неизвестный платёж")
         return
     await pre_checkout_query.answer(ok=True)
