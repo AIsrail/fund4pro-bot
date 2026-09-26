@@ -82,29 +82,65 @@ def test_unlabeled_small_grid_like_risks_gets_fully_extended():
     print("OK: a small unlabeled risk-style grid gets every cell in every row extracted as its own field")
 
 
-def test_large_table_with_many_unlabeled_blank_rows_is_not_exploded():
-    """Защита от противоположной крайности: построчный бюджет с ДЕСЯТКАМИ
+def test_large_non_budget_table_with_many_unlabeled_blank_rows_is_not_exploded():
+    """Защита от противоположной крайности: НЕ-бюджетная таблица с ДЕСЯТКАМИ
     пустых безымянных под-строк (растущий список 'добавь свои позиции при
-    необходимости') НЕ должен превратиться в десятки придуманных строк —
-    только именованные (категорийные) строки достраиваются."""
+    необходимости') НЕ должна превратиться в десятки придуманных строк —
+    только именованные строки достраиваются. Бюджетные таблицы — исключение,
+    см. test_budget_grid_always_gets_itemized_continuation_rows ниже."""
     from docx_schema_fill import extract_template_schema
 
     doc = docx.Document()
-    header = ["Статьи", "Ед.", "Стоимость за ед.", "Количество", "ВСЕГО"]
-    rows = [["Оборудование", "", "", "", ""]] + [["", "", "", "", ""] for _ in range(20)]
+    header = ["Дата", "Событие", "Участники", "Заметки"]
+    rows = [["Запись 1", "", "", ""]] + [["", "", "", ""] for _ in range(20)]
     _add_grid_table(doc, header, rows)
 
     fields = extract_template_schema(doc)
     questions = [f.question for f in fields]
 
-    # Именованная строка "Оборудование" достроена (4 пустые колонки).
-    assert sum(1 for q in questions if "«Оборудование»" in q) == 4, questions
+    # Именованная строка "Запись 1" достроена (3 пустые колонки).
+    assert sum(1 for q in questions if "«Запись 1»" in q) == 3, questions
     # Ни одно поле не создано для 20 безымянных пустых строк большой таблицы.
     assert not any("пункт" in q for q in questions), (
-        f"unlabeled blank rows in a large (>6 rows) table must NOT be auto-extended "
-        f"(risk of fabricating budget line items the donor never asked to be filled), got: {questions}"
+        f"unlabeled blank rows in a large (>6 rows) NON-budget table must NOT be auto-extended, "
+        f"got: {questions}"
     )
-    print("OK: a large table's many unlabeled blank rows are left alone — only named rows get extended")
+    print("OK: a large non-budget table's many unlabeled blank rows are left alone — only named rows get extended")
+
+
+def test_budget_grid_always_gets_itemized_continuation_rows_regardless_of_table_size():
+    """РЕАЛЬНАЯ ПРОСЬБА ВЛАДЕЛЬЦА (26.09.2026): "бюджет надо всегда писать
+    детально... никогда не обобщайте по категориям". Пустые строки-продолжения
+    ПОД категорией в построчном бюджете должны доставаться в поля независимо
+    от размера таблицы (в отличие от обычных нет-бюджетных таблиц выше) —
+    донор сам ограничивает их число своим шаблоном, плодить бесконечно нечем."""
+    from docx_schema_fill import extract_template_schema
+
+    doc = docx.Document()
+    header = ["Статьи", "Ед.", "Стоимость за ед.", "Количество", "ВСЕГО"]
+    rows = (
+        [["Оборудование", "", "", "", ""]] + [["", "", "", "", ""] for _ in range(3)]
+        + [["Публикации", "", "", "", ""]] + [["", "", "", "", ""] for _ in range(2)]
+    )
+    _add_grid_table(doc, header, rows)
+
+    fields = extract_template_schema(doc)
+    questions = [f.question for f in fields]
+
+    # "Оборудование": 1 категорийная строка + 3 пустых продолжения = 4 строки,
+    # по 4 обычных поля на строку (Ед./Стоимость/Количество/ВСЕГО) + 1
+    # "конкретная позиция" поле для col[0] в каждой из 3 строк-продолжений.
+    assert sum(1 for q in questions if "«Оборудование»" in q and "конкретная позиция" not in q) == 16, questions
+    equipment_continuation = [q for q in questions if "Оборудование" in q and "конкретная позиция" in q]
+    assert len(equipment_continuation) == 3, (
+        f"expected one 'Статьи — конкретная позиция...' field per continuation row under "
+        f"'Оборудование' (3 rows), got {len(equipment_continuation)}: {questions}"
+    )
+    # "Публикации": 1 категорийная строка + 2 пустых продолжения = 3 строки x 4 = 12.
+    assert sum(1 for q in questions if "«Публикации»" in q and "конкретная позиция" not in q) == 12, questions
+    publications_continuation = [q for q in questions if "Публикации" in q and "конкретная позиция" in q]
+    assert len(publications_continuation) == 2, questions
+    print("OK: a budget grid's blank continuation rows under each category are always itemized, any table size")
 
 
 def test_non_grid_label_value_table_is_unaffected():
@@ -131,6 +167,7 @@ def test_non_grid_label_value_table_is_unaffected():
 if __name__ == "__main__":
     test_activity_plan_grid_gets_a_field_for_every_empty_column_not_just_the_first()
     test_unlabeled_small_grid_like_risks_gets_fully_extended()
-    test_large_table_with_many_unlabeled_blank_rows_is_not_exploded()
+    test_large_non_budget_table_with_many_unlabeled_blank_rows_is_not_exploded()
+    test_budget_grid_always_gets_itemized_continuation_rows_regardless_of_table_size()
     test_non_grid_label_value_table_is_unaffected()
     print("\nAll grid-table-schema-extraction tests passed.")

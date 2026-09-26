@@ -95,13 +95,24 @@ def extract_template_schema(doc: "docx.Document") -> list[FieldSpec]:
                 seen_hdr.add(id(c._tc))
                 header_cells.append(c.text.strip())
         is_grid = len(header_cells) >= 2 and all(header_cells)
-        # Полностью безымянные строки (нет метки в col[0] вообще — как у
-        # таблицы рисков) достраиваем только в некрупных таблицах: список
-        # рисков из 3 строк — почти наверняка чек-лист "заполни все", а вот
-        # десятки пустых под-строк построчного бюджета — скорее "добавь
-        # СВОИ строки при необходимости", плодить туда придуманные статьи
-        # рискованнее, чем оставить как есть.
-        extend_blank_rows = is_grid and len(table.rows) <= 6
+        # РЕАЛЬНАЯ ПРОСЬБА ВЛАДЕЛЬЦА (26.09.2026): "бюджет надо всегда
+        # писать детально... никогда не обобщайте по категориям" — одна
+        # строка "Проектные расходы — $25 000" на всю категорию недостаточна,
+        # даже если это сама по себе честный ответ. Бюджетную таблицу (по
+        # ключевым словам в заголовке колонок) детализируем ВСЕГДА — пустые
+        # строки-продолжения под категорией достраиваются независимо от
+        # размера таблицы. Для остальных grid-таблиц БЕЗ родной метки в
+        # строке (например чек-лист рисков) — только в некрупных таблицах:
+        # список из 3 строк почти наверняка "заполни все", а десятки пустых
+        # строк большой НЕ-бюджетной таблицы куда чаще значат "добавь свои
+        # при необходимости", плодить туда придуманное рискованнее, чем
+        # оставить как есть.
+        _BUDGET_HEADER_MARKERS = ("стоимост", "смета", "статьи", "бюджет", "cost", "budget", "amount")
+        is_budget_grid = is_grid and any(
+            any(m in h.lower() for m in _BUDGET_HEADER_MARKERS) for h in header_cells
+        )
+        extend_blank_rows = is_grid and (is_budget_grid or len(table.rows) <= 6)
+        last_category_label = None  # последняя встреченная метка col[0] — для строк-продолжений бюджетной категории
 
         for row_idx, row in enumerate(table.rows):
             unique_cells = []
@@ -121,21 +132,34 @@ def extract_template_schema(doc: "docx.Document") -> list[FieldSpec]:
                 # заполненной формы превращала уже вписанный длинный текст
                 # мероприятия в "метку" для соседней ячейки со сроками,
                 # то есть вопрос модели по факту становился нечитаемым).
-                # Если в col[0] есть своя метка (номер пункта, статья
-                # бюджета) — она сама не поле, это просто идентификатор
-                # строки; если col[0] пуст (как у таблицы рисков без
-                # нумерации) — он тоже часть данных для заполнения.
-                row_label = unique_cells[0].text.strip()
-                if row_label or extend_blank_rows:
-                    row_ref = row_label or f"пункт {row_idx}"
+                row_own_label = unique_cells[0].text.strip()
+                if row_own_label:
+                    last_category_label = row_own_label
+                # category_ref — метка ДЛЯ КОНТЕКСТА вопроса (своя, если
+                # есть; иначе, у бюджетных продолжений — унаследованная от
+                # последней категории, чтобы модель знала, к какой статье
+                # относится эта пустая строка-продолжение).
+                category_ref = row_own_label or (last_category_label if is_budget_grid else "")
+                if category_ref or extend_blank_rows:
+                    row_ref = category_ref or f"пункт {row_idx}"
                     for j, cell in enumerate(unique_cells):
-                        if j == 0 and row_label:
-                            continue
+                        if j == 0 and row_own_label:
+                            continue  # col[0] уже несёт СВОЮ метку этой строки
                         if cell.text.strip():
                             continue
                         header_name = header_cells[j] if j < len(header_cells) else f"колонка {j + 1}"
+                        if j == 0 and is_budget_grid and not row_own_label and last_category_label:
+                            # Пустая строка-продолжение категории: col[0] —
+                            # тоже поле, но нужна КОНКРЕТНАЯ позиция внутри
+                            # категории, не повтор названия самой категории.
+                            question = (
+                                f"{header_name} — конкретная позиция по статье "
+                                f"«{last_category_label}» (не повторяй название категории)"
+                            )
+                        else:
+                            question = f"{header_name} — «{row_ref}»"
                         counter += 1
-                        fields.append(FieldSpec(f"f{counter}", f"{header_name} — «{row_ref}»", "kv", cell))
+                        fields.append(FieldSpec(f"f{counter}", question, "kv", cell))
             elif len(unique_cells) >= 2:
                 # НЕ-грид таблица (обычный список "метка: значение", как в
                 # форме профиля организации) — прежняя логика без изменений:
