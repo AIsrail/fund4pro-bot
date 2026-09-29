@@ -86,15 +86,35 @@ def extract_template_schema(doc: "docx.Document") -> list[FieldSpec]:
         # заполнялся только в колонке "Мероприятие" ("Сроки"/"Ответственный"
         # пустые НАВСЕГДА), а таблицы без родной метки в col[0] (риски,
         # построчный бюджет) не заполнялись НИ ОДНИМ полем.
-        header_cells = []
-        if table.rows:
+        # РЕАЛЬНЫЙ ИНЦИДЕНТ (живой тест AEIF/US Embassy, 29.09.2026): проверка
+        # заголовка смотрела ТОЛЬКО на table.rows[0] — но в реальных формах
+        # донора перед строкой с именами колонок сплошь и рядом идут ещё 1-3
+        # служебные строки (общий заголовок таблицы, "Goal/s:", "Objective
+        # 1:" и т.п.), каждая — не грид-заголовок (не все ячейки заполнены,
+        # либо это одна сплошь смёрженная ячейка-título). Из-за этого
+        # реальная строка заголовков ("Activity | Output | Indicator |
+        # Outcome | ...") не находилась вообще, is_grid оставался False, и
+        # вся 20+-строчная таблица (план мониторинга и оценки — критическая
+        # часть заявки) получала НОЛЬ полей. Теперь ищем первую подходящую
+        # строку-заголовок в пределах первых нескольких строк таблицы, а не
+        # жёстко строку 0; строки ДО неё по-прежнему уходят в обычную
+        # (не-грид) ветку ниже — так "Goal/s:"/"Objective N:" продолжают
+        # заполняться как раньше, просто саму грид-часть теперь тоже видно.
+        header_cells: list[str] = []
+        header_row_idx: int | None = None
+        for idx in range(min(len(table.rows), 8)):
             seen_hdr = set()
-            for c in table.rows[0].cells:
+            cand_cells = []
+            for c in table.rows[idx].cells:
                 if id(c._tc) in seen_hdr:
                     continue
                 seen_hdr.add(id(c._tc))
-                header_cells.append(c.text.strip())
-        is_grid = len(header_cells) >= 2 and all(header_cells)
+                cand_cells.append(c.text.strip())
+            if len(cand_cells) >= 2 and all(cand_cells):
+                header_cells = cand_cells
+                header_row_idx = idx
+                break
+        is_grid = header_row_idx is not None
         # РЕАЛЬНАЯ ПРОСЬБА ВЛАДЕЛЬЦА (26.09.2026): "бюджет надо всегда
         # писать детально... никогда не обобщайте по категориям" — одна
         # строка "Проектные расходы — $25 000" на всю категорию недостаточна,
@@ -111,7 +131,25 @@ def extract_template_schema(doc: "docx.Document") -> list[FieldSpec]:
         is_budget_grid = is_grid and any(
             any(m in h.lower() for m in _BUDGET_HEADER_MARKERS) for h in header_cells
         )
-        extend_blank_rows = is_grid and (is_budget_grid or len(table.rows) <= 6)
+        # РЕАЛЬНЫЙ ИНЦИДЕНТ (живой тест AEIF, 29.09.2026): тот же класс
+        # проблемы, что и с бюджетом — таблица "Monitoring & Evaluation"
+        # (Activity | Output | Indicator | Outcome | ...), 23 пустые строки,
+        # БЕЗ родной метки в col[0] (Activity — это то, что нужно ВПИСАТЬ, а
+        # не готовая метка строки). Без явного маркера она подпадала под
+        # общий лимит "≤6 строк" для не-бюджетных гридов и оставалась НОЛЬ
+        # заполненной — хотя это не факультативный чек-лист "добавь при
+        # необходимости" (как таблица рисков), а обязательная часть формы,
+        # которую донор явно ждёт заполненной построчно по своим же
+        # Objectives. Отдельный маркерный список (без "risk"/"риск" —
+        # чек-лист рисков по-прежнему ограничен ≤6 строками намеренно).
+        _PLAN_HEADER_MARKERS = (
+            "мероприят", "деятельност", "activity", "output", "indicator",
+            "outcome", "результат", "milestone", "monitoring", "мониторинг",
+        )
+        is_plan_grid = is_grid and any(
+            any(m in h.lower() for m in _PLAN_HEADER_MARKERS) for h in header_cells
+        )
+        extend_blank_rows = is_grid and (is_budget_grid or is_plan_grid or len(table.rows) <= 6)
         last_category_label = None  # последняя встреченная метка col[0] — для строк-продолжений бюджетной категории
 
         for row_idx, row in enumerate(table.rows):
@@ -120,10 +158,10 @@ def extract_template_schema(doc: "docx.Document") -> list[FieldSpec]:
                 if not any(c._tc == u._tc for u in unique_cells):
                     unique_cells.append(c)
 
-            if is_grid and row_idx == 0:
+            if is_grid and row_idx == header_row_idx:
                 continue  # сама строка заголовка — не поле
 
-            if is_grid and len(unique_cells) >= 2:
+            if is_grid and row_idx > header_row_idx and len(unique_cells) >= 2:
                 # ГРИД-таблица: каждая НЕПУСТАЯ ячейка колонки >=1 в этой
                 # строке — отдельное поле, названное по заголовку СВОЕЙ
                 # колонки + метке строки (не по случайному соседнему
@@ -147,7 +185,26 @@ def extract_template_schema(doc: "docx.Document") -> list[FieldSpec]:
                             continue  # col[0] уже несёт СВОЮ метку этой строки
                         if cell.text.strip():
                             continue
-                        header_name = header_cells[j] if j < len(header_cells) else f"колонка {j + 1}"
+                        # РЕАЛЬНЫЙ ИНЦИДЕНТ (живой тест US Embassy, 29.09.2026):
+                        # заголовок иногда смёрживает (gridSpan) соседние
+                        # колонки в ОДНУ ячейку ("Implementation Activities"
+                        # на 2 колонки), а строки данных под ним — обычные,
+                        # НЕ смёрженные (3 отдельные ячейки). header_cells
+                        # короче unique_cells на эту разницу, и лишняя
+                        # колонка раньше получала бессмысленный фолбэк
+                        # "колонка N" ЖЁСТКО НА РУССКОМ — даже в форме,
+                        # которая целиком на английском (или любом другом
+                        # языке донора). Ближайший реальный заголовок слева
+                        # (последний известный header_cells[i]) — разумное
+                        # приближение к тому, что донор имел в виду под этой
+                        # колонкой, и не тянет за собой русский текст в
+                        # неродственную форму.
+                        if j < len(header_cells):
+                            header_name = header_cells[j]
+                        elif header_cells:
+                            header_name = header_cells[-1]
+                        else:
+                            header_name = f"field {j + 1}"
                         if j == 0 and is_budget_grid and not row_own_label and last_category_label:
                             # Пустая строка-продолжение категории: col[0] —
                             # тоже поле, но нужна КОНКРЕТНАЯ позиция внутри

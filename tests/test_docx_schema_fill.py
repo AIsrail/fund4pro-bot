@@ -481,6 +481,51 @@ def test_apply_known_org_contacts_overrides_model_answer_with_data_room_fact():
     print("OK: known org contacts (data room) override the model's contact-field answers")
 
 
+def test_field_answering_calls_carry_the_donor_form_language_instruction():
+    """РЕАЛЬНЫЙ ИНЦИДЕНТ (живой тест на 2 реальных конкурсах US Embassy,
+    29.09.2026, форсированный DeepSeek): весь заполненный документ —
+    ВКЛЮЧАЯ форму, где донор прямо требует "All documents are in English" —
+    вышел ЦЕЛИКОМ НА РУССКОМ. session["doc_language"] корректно
+    определяется при скачивании формы донора (agent_engine.py) и доходит до
+    legacy generate_final_document, но fill_form_fields_batch/fill_table_field
+    (новый, ОСНОВНОЙ пайплайн) никогда не упоминали язык вообще — только
+    вопрос самой формы, чего недостаточно для модели с русским
+    system_prompt. Оба вызова теперь обязаны нести doc_language_clause."""
+    import json
+
+    import llm
+
+    captured_prompts = []
+
+    async def fake_call_claude(system_prompt, user_message, history=None, max_tokens=2000, prefer_anthropic=False):
+        captured_prompts.append(system_prompt)
+        if user_message.strip().startswith("Вопрос формы:"):
+            return json.dumps([["1", "x", "y"]], ensure_ascii=False)
+        return json.dumps({"f1": "answer"}, ensure_ascii=False)
+
+    original_call_claude = llm.call_claude
+    llm.call_claude = fake_call_claude
+    try:
+        async def run():
+            session_data = {"doc_language": "en", "project_data": {}}
+            await llm.fill_form_fields_batch(
+                [{"field_id": "f1", "question": "Organization name:", "kind": "kv"}], session_data,
+            )
+            await llm.fill_table_field("Work plan", ["#", "Activity"], session_data)
+
+        asyncio.run(run())
+    finally:
+        llm.call_claude = original_call_claude
+
+    assert len(captured_prompts) == 2, captured_prompts
+    for prompt in captured_prompts:
+        assert "английском" in prompt.lower() or "english" in prompt.lower(), (
+            f"expected the donor form's required language (English) to be instructed explicitly, "
+            f"prompt tail: {prompt[-400:]!r}"
+        )
+    print("OK: fill_form_fields_batch and fill_table_field both carry the donor form's required language")
+
+
 if __name__ == "__main__":
     test_extract_template_schema_finds_all_real_fields()
     test_donor_only_fields_are_filtered_before_llm_call()
@@ -495,4 +540,5 @@ if __name__ == "__main__":
     test_excess_blank_paragraphs_are_collapsed_after_writing_an_answer()
     test_extract_contact_facts_reads_real_org_profile()
     test_apply_known_org_contacts_overrides_model_answer_with_data_room_fact()
+    test_field_answering_calls_carry_the_donor_form_language_instruction()
     print("\nAll tests passed.")

@@ -164,10 +164,101 @@ def test_non_grid_label_value_table_is_unaffected():
     print("OK: a plain label:value profile table is untouched by the grid-extraction logic")
 
 
+def test_header_row_found_below_title_and_context_rows_not_only_at_row_zero():
+    """РЕАЛЬНЫЙ ИНЦИДЕНТ (живой тест US Embassy AEIF, 29.09.2026): грид-
+    детекция смотрела ТОЛЬКО на table.rows[0]. В реальной форме AEIF перед
+    строкой заголовков ("Activity | Output | Indicator | ...") идут 3
+    служебные строки — общий заголовок таблицы (одна смёрженная на всю
+    ширину ячейка) и две строки "Goal/s:"/"Objective 1:" (не все ячейки
+    заполнены). is_grid оставался False, и вся 20+-строчная таблица
+    мониторинга и оценки — обязательная часть заявки — получала НОЛЬ полей.
+    Строки ДО настоящего заголовка по-прежнему должны заполняться обычной
+    (не-грид) логикой label:value, как раньше."""
+    from docx_schema_fill import extract_template_schema
+
+    doc = docx.Document()
+    header = ["Activity", "Output", "Indicator"]
+    table = doc.add_table(rows=3 + 2, cols=len(header))
+    table.cell(0, 0).merge(table.cell(0, len(header) - 1))
+    table.rows[0].cells[0].text = "M&E Template"
+    table.rows[1].cells[0].text = "Goal/s of your project:"
+    table.rows[1].cells[1].text = ""
+    for ci, h in enumerate(header):
+        table.rows[2].cells[ci].text = h
+    for ri in (3, 4):
+        for ci in range(len(header)):
+            table.rows[ri].cells[ci].text = ""
+
+    fields = extract_template_schema(doc)
+    questions = {f.question: f for f in fields}
+
+    # Строка ДО заголовка — обычная label:value пара, как раньше.
+    assert "Goal/s of your project:" in questions, questions
+    # Реальный заголовок (строка 2, не строка 0) распознан как грид —
+    # каждая ячейка каждой строки данных стала отдельным полем.
+    assert any(q.startswith("Activity — ") for q in questions), questions
+    assert any(q.startswith("Output — ") for q in questions), questions
+    assert any(q.startswith("Indicator — ") for q in questions), questions
+    print("OK: a grid header several rows below title/context rows is still found, not just at row 0")
+
+
+def test_plan_and_me_grid_markers_extend_blank_rows_like_budget_does():
+    """Тот же класс защиты, что и для бюджета (см. тест выше) — таблица
+    Activity/Output/Indicator без родной метки в col[0] должна ВСЕГДА
+    достраивать пустые строки, а не только в таблицах ≤6 строк: это
+    обязательная часть заявки (план + M&E), а не факультативный чек-лист
+    вроде таблицы рисков."""
+    from docx_schema_fill import extract_template_schema
+
+    doc = docx.Document()
+    header = ["Activity", "Output", "Indicator"]
+    rows = [["", "", ""] for _ in range(10)]  # 10 unlabeled rows, well over the 6-row cap
+    _add_grid_table(doc, header, rows)
+
+    fields = extract_template_schema(doc)
+    questions = [f.question for f in fields]
+
+    assert len(fields) == 30, f"expected 3 columns x 10 unlabeled rows = 30 fields, got {len(fields)}: {questions}"
+    print("OK: Activity/Output/Indicator-style grids extend blank rows regardless of table size, like budgets")
+
+
+def test_gridspan_header_shorter_than_data_row_reuses_last_header_name_not_russian_fallback():
+    """РЕАЛЬНЫЙ ИНЦИДЕНТ (живой тест US Embassy Commercial Partnerships,
+    29.09.2026): заголовок иногда смёрживает (gridSpan) соседние колонки в
+    ОДНУ ячейку ("Implementation Activities" на 2 колонки), а строки данных
+    под ним — обычные, НЕ смёрженные (3 отдельные ячейки). header_cells
+    короче unique_cells на эту разницу; лишняя колонка раньше получала
+    фолбэк "колонка N" ЖЁСТКО НА РУССКОМ — даже в форме целиком на
+    английском. Теперь берётся ближайший реальный заголовок слева, без
+    языковой примеси."""
+    from docx_schema_fill import extract_template_schema
+
+    doc = docx.Document()
+    table = doc.add_table(rows=2, cols=3)
+    table.cell(0, 0).merge(table.cell(0, 1))
+    table.rows[0].cells[0].text = "Implementation Activities"
+    table.rows[0].cells[2].text = "Time Period"
+    table.rows[1].cells[0].text = "Planning Activities"
+    table.rows[1].cells[1].text = ""
+    table.rows[1].cells[2].text = ""
+
+    fields = extract_template_schema(doc)
+    questions = [f.question for f in fields]
+
+    assert not any("колонка" in q for q in questions), (
+        f"must never leak a hardcoded Russian fallback label into a non-Russian donor form: {questions}"
+    )
+    assert any(q == "Time Period — «Planning Activities»" for q in questions), questions
+    print("OK: a gridSpan-shrunk header reuses the nearest real header name, not a hardcoded Russian fallback")
+
+
 if __name__ == "__main__":
     test_activity_plan_grid_gets_a_field_for_every_empty_column_not_just_the_first()
     test_unlabeled_small_grid_like_risks_gets_fully_extended()
     test_large_non_budget_table_with_many_unlabeled_blank_rows_is_not_exploded()
     test_budget_grid_always_gets_itemized_continuation_rows_regardless_of_table_size()
     test_non_grid_label_value_table_is_unaffected()
+    test_header_row_found_below_title_and_context_rows_not_only_at_row_zero()
+    test_plan_and_me_grid_markers_extend_blank_rows_like_budget_does()
+    test_gridspan_header_shorter_than_data_row_reuses_last_header_name_not_russian_fallback()
     print("\nAll grid-table-schema-extraction tests passed.")

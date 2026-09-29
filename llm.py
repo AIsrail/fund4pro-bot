@@ -2064,6 +2064,7 @@ async def fill_table_field(question: str, columns: list[str], session_data: dict
         f"Контекст проекта:\n{_session_summary(session_data)}\n\n"
         f'Верни СТРОГО валидный JSON без markdown-обрамления, массив '
         f'массивов строк: [["1", "...", "...", "..."], ["2", "...", "...", "..."]]'
+        f"{doc_language_clause(session_data)}"
     )
     user_message = f"Вопрос формы: {question}"
 
@@ -2146,7 +2147,22 @@ async def fill_form_fields_batch(
 
     Развитие того же приёма, что уже был в fill_missing_donor_fields ниже
     (батч JSON по короткому id) — здесь он применяется КО ВСЕЙ форме сразу,
-    а не только к тому, что осталось непонятым после fuzzy-matching."""
+    а не только к тому, что осталось непонятым после fuzzy-matching.
+
+    РЕАЛЬНЫЙ ИНЦИДЕНТ (живой тест на двух реальных конкурсах US Embassy,
+    29.09.2026, форсированный DeepSeek): весь заполненный документ —
+    ВКЛЮЧАЯ форму, где донор прямо требует "All documents are in English" —
+    вышел ЦЕЛИКОМ НА РУССКОМ. Причина: session["doc_language"] корректно
+    определяется в agent_engine.py при скачивании формы донора и доходит до
+    СТАРОГО generate_final_document (через doc_language_clause), но НИКОГДА
+    не доходил до этого, НОВОГО (основного) пайплайна — ни один из вызовов
+    здесь не упоминал требуемый язык вообще, только вопрос самой формы
+    (который тоже на английском, но одного этого недостаточно — модель, у
+    которой system_prompt целиком на русском, охотно отвечает по-русски на
+    английский вопрос, особенно DeepSeek). session_data здесь — тот же
+    верхнеуровневый словарь сессии, что и в generate_final_document, так
+    что doc_language_clause(session_data) применяется без дополнительного
+    прокидывания данных."""
     fields = [f for f in fields if looks_like_applicant_field(f["question"])]
     if not fields:
         return {}
@@ -2210,6 +2226,7 @@ async def fill_form_fields_batch(
         f'Верни СТРОГО валидный JSON без markdown-обрамления: {{"f1": "...", '
         f'"f2": "..."}} — по одному ключу на КАЖДЫЙ field_id из списка ниже, '
         f"даже если значение — пустая строка."
+        f"{doc_language_clause(session_data)}"
     )
     user_message = items
 
