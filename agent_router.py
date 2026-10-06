@@ -379,6 +379,8 @@ async def resume_after_payment(message: Message, state: FSMContext) -> None:
         await _start_fresh_flow(message, state, pending.get("flow", "grant"))
     elif kind == "sameorg":
         await _do_resume_same_org(message, state)
+    elif kind == "from_budget":
+        await _do_start_from_budget(message, state, pending.get("handoff") or {})
     else:
         await message.answer("Нажми кнопку, чтобы начать новый проект 👇", reply_markup=start_keyboard())
 
@@ -476,6 +478,21 @@ async def _start_fresh_flow(message: Message, state: FSMContext, flow: str) -> N
         "project_data": {},
         "history_openai": [],
     })
+
+    # Показываем дорожную карту разработки
+    roadmap = (
+        "📋 **6 шагов разработки проекта:**\n\n"
+        "1️⃣ **Организация** — рассказ о вас, опыте, команде\n"
+        "2️⃣ **Фонд/Грант** — ссылка или описание конкурса\n"
+        "3️⃣ **Проблема & Идея** — что решаем и как\n"
+        "4️⃣ **Данные** — статистика, факты, источники\n"
+        "5️⃣ **План & Бюджет** — цель, задачи, мероприятия, сумма\n"
+        "6️⃣ **Документ** — готовая заявка в Word\n\n"
+        "**Результат:** Полная грантовая заявка, готовая к отправке.\n"
+        "⚠️ Проверьте все цифры перед подачей — я могу ошибаться."
+    )
+    await message.answer(roadmap, parse_mode="Markdown")
+
     if flow == "grant":
         msg = (
             "Отлично! Начинаем разработку грантового проекта по методологии «3 деревьев».\n\n"
@@ -491,6 +508,59 @@ async def _start_fresh_flow(message: Message, state: FSMContext, flow: str) -> N
         )
         opts = ["1. Действующий бизнес", "2. Стартап с нуля", "3. Опишу текстом"]
 
+    await state.update_data(_active_quick_replies=opts)
+    await message.answer(msg, reply_markup=quick_reply_keyboard(opts), parse_mode="Markdown")
+
+
+async def start_application_from_budget(message: Message, state: FSMContext, handoff: dict) -> None:
+    """Из режима «Составить бюджет» — к заполнению заявки: готовый бюджет и
+    донор переносятся в project_data, поэтому основной сценарий (код-
+    определяемый этап, см. agent_roadmap.compute_next_step) начнёт с организации
+    и не будет заново спрашивать бюджет; форму донора он скачает по сохранённой
+    ссылке на этапе 2б. Считается новым проектом для лимита (_paywall_or_consume)."""
+    if not await _paywall_or_consume(message, state, {"kind": "from_budget", "handoff": handoff}):
+        return
+    await _do_start_from_budget(message, state, handoff)
+
+
+async def _do_start_from_budget(message: Message, state: FSMContext, handoff: dict) -> None:
+    from urllib.parse import urlparse
+
+    urls = handoff.get("donor_urls") or []
+    facts = handoff.get("donor_facts") or []
+    parts = ["Донор — тот же, под которого составлен бюджет (из режима «Бюджет»)."]
+    if urls:
+        parts.append("Ссылка на конкурс/донора: " + ", ".join(urls) + ".")
+    if facts:
+        parts.append("Условия донора: " + "; ".join(facts) + ".")
+    if handoff.get("donor_context"):
+        parts.append("Материалы донора (из чата):\n" + handoff["donor_context"][:2500])
+    notes = (
+        "ПЕРЕНОС ИЗ РЕЖИМА «БЮДЖЕТ»: бюджет (activities_and_budget) уже согласован с пользователем — не "
+        "составляй его заново и не предлагай суммы; мероприятия и задачи проекта (ЭТАПЫ 4-5) должны "
+        "соответствовать статьям этого бюджета. Донор уже известен (donor_info) — не спрашивай его заново."
+    )
+    await state.set_state(Flow.active)
+    await state.set_data({
+        "flow": "grant",
+        "ui_language": "ru",
+        "project_data": {
+            "donor_info": "\n".join(parts),
+            "activities_and_budget": handoff.get("budget_text", ""),
+            "other_notes": notes,
+        },
+        "history_openai": [],
+    })
+    await _ensure_active(state)
+    label = urlparse(urls[0]).netloc if urls else "донор из ваших материалов"
+    label = re.sub(r"[_*\[\]`]", "", label)
+    msg = (
+        f"Отлично! Бюджет сохранён, донор — {label}: подаём заявку ему, переходим к заявке.\n\n"
+        "📌 **Шаг 1 из 5: Кто заявитель?**\n"
+        "Расскажите о вашей организации или инициативной группе: название, город/регион, сфера деятельности и опыт "
+        "(можно кратко написать текстом или прислать файл с описанием организации)."
+    )
+    opts = ["1. Опишу текстом", "2. Прикреплю файл", "3. Мы новая группа"]
     await state.update_data(_active_quick_replies=opts)
     await message.answer(msg, reply_markup=quick_reply_keyboard(opts), parse_mode="Markdown")
 
