@@ -29,6 +29,7 @@ BUDGET_DEFAULTS = {
         "supplies": {"capital": 2, "region": 1},             # канцтовары на мероприятие
         "handouts": {"capital": 3, "region": 2},             # раздатка на человека
         "certificates": {"capital": 1, "region": 1},         # сертификат на человека
+        "accommodation": {"capital": 50, "region": 30},      # местная гостиница, ночь с завтраком
     },
     "publications": {
         "brochure": {"capital": 1, "region": 0.5},           # цветной экз

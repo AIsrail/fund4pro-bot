@@ -31,7 +31,9 @@ from donor_files import discover_page_files, download_direct, sniff_kind
 from fx import get_usd_rate, normalize_currency
 from keyboards import (
     budget_admin_confirm_keyboard,
+    budget_accept_rates_keyboard,
     budget_all_usd_keyboard,
+    budget_cofunding_keyboard,
     budget_donor_next_keyboard,
     budget_export_keyboard,
     budget_fx_keyboard,
@@ -97,16 +99,12 @@ def _parse_number(text: str) -> float | None:
     return value
 
 
-def _section_prompt(key: str, d: dict) -> str:
-    loc = d.get("location", "capital")
-    cur = d.get("currency", "USD")
-    where = "столица" if loc == "capital" else "регион"
-    ov = BUDGET_DEFAULTS["admin_overhead"]
-    act = BUDGET_DEFAULTS["activities"]
-    pub = BUDGET_DEFAULTS["publications"]
-    fees = BUDGET_DEFAULTS["consultant_fees"]
-    usd_note = "\n(ориентиры в долларах США; в итоговом бюджете пересчитаю по курсу)" if cur != "USD" else ""
+HINT_KEYS = {"admin_overhead", "consultant_fees", "activities", "publications"}
 
+
+def _section_prompt(key: str, d: dict) -> str:
+    """Сначала спрашиваем ДАННЫЕ пользователя; ориентиры — только по кнопке
+    «подскажи» (см. _section_hint)."""
     if key == "admin_team":
         return (
             "👥 Проектная команда\n\n"
@@ -126,41 +124,30 @@ def _section_prompt(key: str, d: dict) -> str:
         )
     if key == "admin_overhead":
         return (
-            f"🏢 Админ-расходы (ориентиры на месяц, {where}, USD)\n\n"
-            f"• аренда офиса: {_money(_pick(ov['office_rent'], loc))}\n"
-            f"• транспорт для офиса: {_money(_pick(ov['office_transport'], loc))}\n"
-            f"• коммунальные услуги: {_money(_pick(ov['utilities'], loc))}\n"
-            f"• связь и интернет: {_money(_pick(ov['communications'], loc))}\n"
-            f"• канцтовары: {_money(_pick(ov['office_supplies'], loc))}\n\n"
-            "Напишите свои цифры или «по ориентирам». Если офис не нужен "
-            "(работаете удалённо / из офиса организации) — «Продолжить»."
+            "🏢 Админ-расходы\n\n"
+            "Какие у вас расходы на содержание офиса в месяц: аренда, транспорт, коммунальные "
+            "услуги, связь и интернет, канцтовары? Напишите ваши цифры — какие знаете.\n\n"
+            "Если офис не нужен (работаете удалённо / из офиса организации) — «Продолжить». "
+            "Если не знаете цифры — «Подскажи ориентиры»."
         )
     if key == "consultant_fees":
         return (
             "🎓 Гонорары консультантов и экспертов\n\n"
-            f"Ориентиры за день (USD): начинающий — {fees['beginner']}, опытный — "
-            f"{fees['experienced']}, профи — 250–300 и выше.\n\n"
-            "Кого привлекаете, какого уровня и на сколько дней? Если никого — «Продолжить»."
+            "Кого планируете привлекать, какого уровня (начинающий / опытный / профи), на сколько "
+            "дней и по какой ставке? Если никого — «Продолжить». Не знаете ставки — «Подскажи ориентиры»."
         )
     if key == "activities":
         return (
-            f"🎯 Мероприятия (тренинги, встречи, форумы), ориентиры на 1 человека, {where}, USD:\n\n"
-            f"• кофе-брейк: {_money(_pick(act['coffee'], loc))}\n"
-            f"• обед: {_money(_pick(act['meals'], loc))}\n"
-            f"• командировочные в день: {_money(_pick(act['perdiem'], loc))}\n"
-            f"• канцтовары: {_money(_pick(act['supplies'], loc))}, раздатка: "
-            f"{_money(_pick(act['handouts'], loc))}, сертификат: {_money(_pick(act['certificates'], loc))}\n"
-            f"• транспорт бенефициаров: авиабилет туда-обратно ~{act['transport_flight']}, "
-            f"такси или маршрутка ~{act['transport_local']}\n\n"
-            "Сколько мероприятий, сколько участников, сколько дней, где проходят "
-            "и нужен ли участникам проезд/проживание?"
+            "🎯 Мероприятия (тренинги, встречи, форумы)\n\n"
+            "Сколько мероприятий, сколько участников, сколько дней, где проходят? Нужны ли участникам "
+            "проезд и проживание, питание (кофе-брейки, обеды), материалы? Напишите, что знаете, "
+            "и ваши цены, если они есть. Не знаете цены — «Подскажи ориентиры»."
         )
     if key == "publications":
         return (
             "📚 Публикации и печать\n\n"
-            f"Ориентиры за экземпляр ({where}, USD): цветной буклет — "
-            f"{_money(_pick(pub['brochure'], loc))}, книга/брошюра — {_money(_pick(pub['book'], loc))}.\n\n"
-            "Что и каким тиражом печатаете? Если ничего — «Продолжить»."
+            "Что и каким тиражом печатаете (буклеты, брошюры, книги)? Если у вас есть цена "
+            "печати — напишите. Если ничего не печатаете — «Продолжить». Не знаете цены — «Подскажи ориентиры»."
         )
     if key == "equipment":
         return (
@@ -179,6 +166,51 @@ def _section_prompt(key: str, d: dict) -> str:
             "да — напишите максимальный процент, если нет или не уверены — «Продолжить»."
         )
     return ""
+
+
+def _section_hint(key: str, d: dict) -> str:
+    """Ориентировочные расценки (USD) — показываются, только если пользователь
+    попросил подсказку."""
+    loc = d.get("location", "capital")
+    where = "столица" if loc == "capital" else "регион"
+    ov = BUDGET_DEFAULTS["admin_overhead"]
+    act = BUDGET_DEFAULTS["activities"]
+    pub = BUDGET_DEFAULTS["publications"]
+    fees = BUDGET_DEFAULTS["consultant_fees"]
+    note = "\n\n(ориентиры в долларах США; в итоговом бюджете пересчитаю по курсу)" if d.get("currency", "USD") != "USD" else ""
+    if key == "admin_overhead":
+        text = (
+            f"💡 Ориентиры на месяц ({where}, USD):\n"
+            f"• аренда офиса: {_money(_pick(ov['office_rent'], loc))}\n"
+            f"• транспорт для офиса: {_money(_pick(ov['office_transport'], loc))}\n"
+            f"• коммунальные услуги: {_money(_pick(ov['utilities'], loc))}\n"
+            f"• связь и интернет: {_money(_pick(ov['communications'], loc))}\n"
+            f"• канцтовары: {_money(_pick(ov['office_supplies'], loc))}"
+        )
+    elif key == "consultant_fees":
+        text = (
+            f"💡 Ориентиры за день (USD): начинающий — {fees['beginner']}, опытный — "
+            f"{fees['experienced']}, профи — 250–300 и выше."
+        )
+    elif key == "activities":
+        text = (
+            f"💡 Ориентиры на 1 человека ({where}, USD):\n"
+            f"• кофе-брейк: {_money(_pick(act['coffee'], loc))}\n"
+            f"• обед: {_money(_pick(act['meals'], loc))}\n"
+            f"• проживание: {_money(_pick(act['accommodation'], loc))} за ночь с завтраком (местная гостиница)\n"
+            f"• командировочные в день: {_money(_pick(act['perdiem'], loc))}\n"
+            f"• канцтовары: {_money(_pick(act['supplies'], loc))}, раздатка: "
+            f"{_money(_pick(act['handouts'], loc))}, сертификат: {_money(_pick(act['certificates'], loc))}\n"
+            f"• проезд: авиабилет туда-обратно ~{act['transport_flight']}, такси или маршрутка ~{act['transport_local']}"
+        )
+    elif key == "publications":
+        text = (
+            f"💡 Ориентиры за экземпляр ({where}, USD): цветной буклет — "
+            f"{_money(_pick(pub['brochure'], loc))}, книга/брошюра — {_money(_pick(pub['book'], loc))}."
+        )
+    else:
+        return ""
+    return text + note + "\n\nНапишите свои цифры или нажмите «Беру ориентиры»."
 
 
 # ============================================================================
@@ -284,6 +316,14 @@ def _summary_of_donor(d: dict, urls_total: int, page_ok: bool, names: list[str],
         lines.append(f"⚠️ {n}.")
     if a.get("admin_share_pct") is not None:
         lines.append(f"Админ-расходы по донору: не более {a['admin_share_pct']:g}%.")
+    cf = a.get("cofunding") or {}
+    if cf.get("required") is True:
+        bits = []
+        if cf.get("min_pct"):
+            bits.append(f"не менее {cf['min_pct']:g}% {_cofunding_basis_ru(cf)}")
+        if cf.get("types"):
+            bits.append("виды: " + ", ".join(COFUND_TYPE_RU[t] for t in cf["types"]))
+        lines.append("Со-вклад заявителя требуется" + (": " + "; ".join(bits) if bits else "") + ".")
     if a.get("contingency") == "forbidden":
         lines.append("Непредвиденные расходы донор не допускает.")
     elif a.get("contingency") == "allowed":
@@ -522,6 +562,86 @@ async def _ask_admin_share(message: Message, state: FSMContext) -> None:
         )
 
 
+COFUND_TYPE_RU = {"cash": "денежный", "material": "материальный", "intangible": "нематериальный"}
+_PCT_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")
+
+
+def _cofunding_required(d: dict) -> dict | None:
+    cf = (d.get("donor_analysis") or {}).get("cofunding") or {}
+    return cf if cf.get("required") is True else None
+
+
+def _cofunding_basis_ru(cf: dict) -> str:
+    return {"total": "от общей стоимости проекта", "grant": "от суммы гранта"}.get(cf.get("basis"), "от бюджета")
+
+
+async def _after_admin_share(message: Message, state: FSMContext) -> None:
+    """Со-вклад считаем ТОЛЬКО если его требует донор (или пользователь сам
+    попросит — через свободный текст/правки, см. _build_brief)."""
+    cf = _cofunding_required(await state.get_data())
+    if cf:
+        await _ask_cofunding(message, state, cf)
+    else:
+        await _ask_duration(message, state)
+
+
+async def _ask_cofunding(message: Message, state: FSMContext, cf: dict) -> None:
+    await state.set_state(S.ask_cofunding)
+    if cf.get("min_pct") and cf.get("max_pct"):
+        share = f"от {cf['min_pct']:g}% до {cf['max_pct']:g}%"
+    elif cf.get("min_pct"):
+        share = f"не менее {cf['min_pct']:g}%"
+    else:
+        share = "(доля в материалах донора не названа)"
+    types = ", ".join(COFUND_TYPE_RU[t] for t in cf.get("types") or []) or "виды не уточнены"
+    quote = f"\n«{cf['quote']}»" if cf.get("quote") else ""
+    await message.answer(
+        f"🤝 Со-вклад заявителя\n\nДонор требует со-вклад: {share} {_cofunding_basis_ru(cf)}. "
+        f"Допустимые виды: {types}.{quote}\n\n"
+        "Какой процент и в какой форме вы готовы внести? Например: «30%: часть зарплаты менеджера, "
+        "админ-расходы, ноутбук б/у». Если не знаете, как распределить — нажмите кнопку, "
+        "распределю сам (зарплата персонала, админ-расходы, транспорт и проживание участников, "
+        "оборудование по рыночной стоимости).",
+        reply_markup=budget_cofunding_keyboard(cf.get("min_pct")),
+    )
+
+
+async def _save_cofunding(message: Message, state: FSMContext, pct: float | None, text: str) -> None:
+    await state.update_data(cofunding_active=True, cofunding_pct=pct, cofunding_text=text)
+    await _ask_duration(message, state)
+
+
+@router.callback_query(StateFilter(S.ask_cofunding), F.data == "budget:cf_min")
+async def cofunding_minimum(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    cf = _cofunding_required(await state.get_data()) or {}
+    await _save_cofunding(callback.message, state, cf.get("min_pct"), "пользователь поручил распределить самому")
+
+
+@router.callback_query(StateFilter(S.ask_cofunding), F.data == "budget:cf_none")
+async def cofunding_none(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.update_data(cofunding_active=False)
+    await _ask_duration(callback.message, state)
+
+
+@router.message(StateFilter(S.ask_cofunding), TEXT)
+async def receive_cofunding(message: Message, state: FSMContext):
+    text = message.text.strip()
+    if text.lower().rstrip(".!") in SKIP_WORDS | {"не нужен", "не нужно"}:
+        await state.update_data(cofunding_active=False)
+        await _ask_duration(message, state)
+        return
+    m = _PCT_RE.search(text)
+    pct = float(m.group(1).replace(",", ".")) if m else _parse_number(text) if text.replace(".", "").replace(",", "").isdigit() else None
+    cf = _cofunding_required(await state.get_data()) or {}
+    if pct is not None and cf.get("min_pct") and pct < cf["min_pct"]:
+        await message.answer(
+            f"⚠️ По документам донора минимум {cf['min_pct']:g}%. Продолжаю с вашей цифрой — проверьте её перед подачей."
+        )
+    await _save_cofunding(message, state, pct, text)
+
+
 async def _ask_duration(message: Message, state: FSMContext) -> None:
     await state.set_state(S.ask_duration)
     await message.answer("Какой срок проекта? Например: «12 месяцев» или «с сентября по декабрь 2026».")
@@ -533,7 +653,7 @@ async def admin_share_confirmed(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     share = (data.get("donor_analysis") or {}).get("admin_share_pct")
     await state.update_data(donor_admin_share=share)
-    await _ask_duration(callback.message, state)
+    await _after_admin_share(callback.message, state)
 
 
 @router.message(StateFilter(S.confirm_admin_share), TEXT)
@@ -551,7 +671,7 @@ async def receive_admin_share(message: Message, state: FSMContext):
             await message.answer("Не понял. Напишите число от 0 до 100 (например 15) или «не знаю».")
             return
         await state.update_data(donor_admin_share=value)
-    await _ask_duration(message, state)
+    await _after_admin_share(message, state)
 
 
 @router.message(StateFilter(S.ask_duration), TEXT)
@@ -712,7 +832,7 @@ async def _ask_section(message: Message, state: FSMContext, idx: int) -> None:
         prompt += "\n\nПо документам донора такая статья допускается."
     await message.answer(
         prompt + f"\n\n(шаг {idx + 1} из {len(SECTIONS)})",
-        reply_markup=budget_skip_keyboard(),
+        reply_markup=budget_skip_keyboard(with_hint=key in HINT_KEYS),
     )
 
 
@@ -732,6 +852,22 @@ async def receive_section(message: Message, state: FSMContext):
     await _store_and_advance(message, state, None if text.lower() in SKIP_WORDS else text)
 
 
+@router.callback_query(StateFilter(*SECTION_STATES), F.data == "budget:hint")
+async def show_section_hint(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    current = await state.get_state()
+    key = next(k for st, k in SECTIONS if st.state == current)
+    hint = _section_hint(key, await state.get_data())
+    if hint:
+        await callback.message.answer(hint, reply_markup=budget_accept_rates_keyboard())
+
+
+@router.callback_query(StateFilter(*SECTION_STATES), F.data == "budget:accept_rates")
+async def accept_section_rates(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _store_and_advance(callback.message, state, "по ориентирам (пользователь не знает свои цифры)")
+
+
 @router.callback_query(StateFilter(*SECTION_STATES), F.data == "budget:skip")
 async def skip_section(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -741,6 +877,57 @@ async def skip_section(callback: CallbackQuery, state: FSMContext):
 # ============================================================================
 # 4. Генерация и согласование
 # ============================================================================
+
+_COFUND_HOW = (
+    "Если пользователь не расписал, чем вносит со-вклад, распредели его так: часть зарплаты персонала "
+    "(10-50% строки), админ-расходы (10-100%), транспортные расходы участников (с их согласия или за их "
+    "счёт), проживание участников мероприятий (включи в мероприятия статью проживания: местная гостиница "
+    "{acc} USD за ночь с завтраком), оборудование (укажи его рыночную стоимость как б/у). Донорскими деньгами "
+    "такие позиции не покрывай."
+)
+
+
+def _cofunding_brief(d: dict, size: float, cur: str) -> str:
+    acc = BUDGET_DEFAULTS["activities"]["accommodation"]
+    acc_txt = f"{acc['capital']} (столица) / {acc['region']} (регион)"
+    how = _COFUND_HOW.format(acc=acc_txt)
+    table_rule = (
+        "Для КАЖДОЙ строки бюджета дай три суммы: «Всего», «Сумма от донора» и «Со-вклад заявителя» "
+        "(всего = от донора + со-вклад); сумма столбца «от донора» не должна превышать сумму гранта."
+    )
+    if not d.get("cofunding_active"):
+        return (
+            "СО-ВКЛАД: донор его не требует и пользователь не просил — НЕ считай со-вклад и не добавляй "
+            "столбцы со-вклада. Только если пользователь сам попросит посчитать со-вклад (в своих ответах "
+            "выше или в правках) — тогда добавь столбцы «Сумма от донора» и «Со-вклад заявителя». "
+            + how
+        )
+    cf = (d.get("donor_analysis") or {}).get("cofunding") or {}
+    pct = d.get("cofunding_pct")
+    basis = cf.get("basis")
+    parts = ["СО-ВКЛАД ЗАЯВИТЕЛЯ (требование донора)."]
+    if cf.get("min_pct"):
+        parts.append(f"Требование: не менее {cf['min_pct']:g}% {_cofunding_basis_ru(cf)}.")
+    if cf.get("types"):
+        parts.append("Допустимые виды: " + ", ".join(COFUND_TYPE_RU[t] for t in cf["types"]) + ".")
+    if cf.get("notes"):
+        parts.append(f"Условия донора: {cf['notes']}")
+    parts.append(f"Готовность пользователя: {f'{pct:g}%' if pct else 'доля не названа'} — «{d.get('cofunding_text') or ''}».")
+    if pct and size:
+        cof = size * pct / 100 if basis == "grant" else size * pct / (100 - pct) if pct < 100 else None
+        if cof:
+            parts.append(
+                f"Сумма гранта (запрашиваемая у донора) = {size:g} {cur}; ориентир по со-вкладу ≈ {cof:g} {cur}, "
+                f"общая стоимость проекта ≈ {size + cof:g} {cur}."
+            )
+    parts.append(table_rule)
+    parts.append("Зачитывай только допустимые виды со-вклада.")
+    parts.append(how)
+    parts.append(
+        "В конце покажи итоги: сумма от донора, со-вклад, общая стоимость, фактические доли и сравнение с требованием донора."
+    )
+    return " ".join(parts)
+
 
 def _build_brief(d: dict) -> str:
     loc = d.get("location", "capital")
@@ -831,6 +1018,9 @@ def _build_brief(d: dict) -> str:
         f"Банковские расходы: заложи 0,1-0,3% от общей суммы бюджета.\n"
         f"Справочные расценки для незаполненных пользователем позиций ({where}, USD): {rates}"
         f"{donor_block}\n\n"
+        f"{_cofunding_brief(d, size, cur)}\n\n"
+        "Ответы пользователя выше могут содержать данные не по своей теме — разнеси их по нужным "
+        "статьям бюджета.\n"
         "Требования к результату: каждая статья построчно (расчёт «кол-во × ставка × период = итог»), "
         "итоговая сумма должна сойтись с суммой гранта и не превышать её, админ-доля не выше лимита; "
         "явно помечай цифры, которые взяты из ориентиров, а не от пользователя; покажи итоги по "

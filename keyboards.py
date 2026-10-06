@@ -192,10 +192,29 @@ def budget_location_keyboard() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def budget_skip_keyboard() -> InlineKeyboardMarkup:
-    """Пропустить текущий раздел бюджета (опционально)."""
+def budget_skip_keyboard(with_hint: bool = False) -> InlineKeyboardMarkup:
+    """Раздел интервью: пропустить; для разделов с ориентирами — ещё «подскажи»."""
     kb = InlineKeyboardBuilder()
+    if with_hint:
+        kb.button(text="💡 Не знаю — подскажи ориентиры", callback_data="budget:hint")
     kb.button(text="✅ Продолжить (нет таких расходов)", callback_data="budget:skip")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def budget_accept_rates_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👍 Беру ориентиры", callback_data="budget:accept_rates")
+    kb.button(text="✅ Продолжить (нет таких расходов)", callback_data="budget:skip")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def budget_cofunding_keyboard(min_pct: float | None) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    if min_pct:
+        kb.button(text=f"Минимум {min_pct:g}% — распредели сам", callback_data="budget:cf_min")
+    kb.button(text="Со-вклад не нужен", callback_data="budget:cf_none")
     kb.adjust(1)
     return kb.as_markup()
 

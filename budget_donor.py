@@ -39,6 +39,16 @@ async def analyze_donor_for_budget(context: str) -> dict:
         'этапы); перечисли ВСЕ явно названные варианты со своими суммами, не выбирай за '
         'пользователя; если вариант один — пустой список [],'
         ' "currency": "код валюты гранта" или null,'
+        ' "cofunding": {"required": true | false | null (null — в тексте про со-вклад / '
+        'софинансирование / cost share / matching ничего нет), "min_pct": число или null, '
+        '"max_pct": число или null (доля со-вклада заявителя в процентах), "basis": '
+        '"total" (от общей стоимости проекта) | "grant" (от суммы гранта) | "unknown", '
+        '"types": подмножество ["cash", "material", "intangible"] — какие виды со-вклада донор '
+        'явно допускает (cash — денежный, material — материальный: оборудование, помещение, '
+        'транспорт; intangible — нематериальный: труд, время, экспертиза, волонтёры) — пустой '
+        'список, если не указано, "notes": "кратко: что донор пишет про со-вклад (что засчитывает, '
+        'суммы, условия)", "quote": "короткая дословная цитата-основание"}'
+        ' (если со-вклад нужен, но доля не названа — required: true, min_pct: null),'
         ' "contingency": "allowed" | "forbidden" | "unknown" (непредвиденные '
         'расходы / резерв),'
         ' "ineligible_costs": "кратко: какие расходы донор не финансирует" или "",'
@@ -72,7 +82,20 @@ async def analyze_donor_for_budget(context: str) -> dict:
                 "max_grant": _num(o.get("max_grant")),
                 "admin_share_pct": pct if pct is not None and pct <= 100 else None,
             })
+    cf = data.get("cofunding") if isinstance(data.get("cofunding"), dict) else {}
+    cf_min, cf_max = _num(cf.get("min_pct")), _num(cf.get("max_pct"))
+    cofunding = {
+        "required": cf.get("required") if isinstance(cf.get("required"), bool) else None,
+        "min_pct": cf_min if cf_min is not None and cf_min <= 100 else None,
+        "max_pct": cf_max if cf_max is not None and cf_max <= 100 else None,
+        "basis": cf.get("basis") if cf.get("basis") in ("total", "grant") else "unknown",
+        "types": [t for t in (cf.get("types") or []) if t in ("cash", "material", "intangible")]
+        if isinstance(cf.get("types"), list) else [],
+        "notes": str(cf.get("notes") or "")[:500],
+        "quote": str(cf.get("quote") or "")[:300],
+    }
     return {
+        "cofunding": cofunding,
         "grant_options": options[:6],
         "admin_share_pct": share,
         "admin_share_quote": str(data.get("admin_share_quote") or "")[:300],

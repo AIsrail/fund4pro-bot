@@ -37,7 +37,14 @@ MAX_ROWS_IN_PROMPT = 90
 _ROLE_PATTERNS = [
     ("num", re.compile(r"^\s*(№|n°|no\.?|#|п/п|№\s*п/п)\s*$", re.I)),
     ("comment", re.compile(r"комментар|примечан|note|comment|remark|источник|source", re.I)),
-    ("unit_cost", re.compile(r"цена|ставка|стоимость за|за единиц|unit cost|unit price|\brate\b|\bprice\b", re.I)),
+    ("cofunding", re.compile(
+        r"со-?вклад|софинанс|cost[- ]?shar|co-?fund|\bmatch|own contribution|вклад заявител|"
+        r"собственн\w+ (вклад|средства)", re.I)),
+    ("donor_amount", re.compile(
+        r"запрашива|от донора|средства донора|сумма донора|донор\b|requested|grant (amount|request)|"
+        r"funder|from donor", re.I)),
+    ("unit_cost", re.compile(
+        r"цена|ставка|стоимость за|стоимость\s+ед\b|за единиц|за ед\b|unit cost|unit price|\brate\b|\bprice\b", re.I)),
     ("qty_unit", re.compile(r"единиц|количеств|кол-во|измерен|период|\bunit|quantity|\bqty\b|месяц", re.I)),
     ("name", re.compile(
         r"мероприят|статья|статьи|наименован|название|описание|вид расход|категори|activity|\bitem\b|"
@@ -101,7 +108,8 @@ def table_roles(table):
                 if rx.search(t):
                     roles[c] = role
                     break
-        if "name" in roles.values() and "amount" in roles.values():
+        vals = set(roles.values())
+        if "name" in vals and ("amount" in vals or "donor_amount" in vals):
             amounts = [c for c, r in roles.items() if r == "amount"]
             for c in amounts[:-1]:
                 roles[c] = "skip"
@@ -198,6 +206,9 @@ async def extract_budget_struct(budget_text: str) -> dict | None:
         "числом или null; qty — короткая запись количества/расчёта («3 дня × 25 чел.»); "
         "category — укрупнённая категория (Зарплаты, Админ-расходы, Мероприятия, Гонорары, "
         "Публикации, Оборудование, Банковские расходы и т.п.). Названия — на языке бюджета. "
+        "Если в бюджете есть разбивка на «сумму от донора» и «со-вклад заявителя» — добавь в каждую "
+        'строку числа "donor_amount" и "cofund" (amount = donor_amount + cofund); если такой разбивки '
+        "нет — эти поля не добавляй. "
         "Ничего не придумывай и не пересчитывай: только то, что есть в бюджете."
     )
     try:
@@ -215,17 +226,35 @@ async def extract_budget_struct(budget_text: str) -> dict | None:
         if amount is None or not name:
             continue
         unit_cost = _num(str(it.get("unit_cost"))) if it.get("unit_cost") is not None else None
+        donor = _num(str(it.get("donor_amount"))) if it.get("donor_amount") is not None else None
+        cofund = _num(str(it.get("cofund"))) if it.get("cofund") is not None else None
+        if donor is not None and cofund is not None:
+            amount = donor + cofund
+        elif cofund is not None:
+            donor = max(amount - cofund, 0.0)
+        elif donor is not None:
+            cofund = max(amount - donor, 0.0)
         items.append({
             "category": str(it.get("category") or "").strip(),
             "name": name,
             "qty": str(it.get("qty") or "").strip(),
             "unit_cost": unit_cost,
             "amount": amount,
+            "donor": donor,
+            "cofund": cofund,
         })
     if not items:
         return None
-    return {"currency": str(data.get("currency") or "").strip(), "items": items,
-            "total": sum(i["amount"] for i in items)}
+    has_cof = any(i["cofund"] for i in items)
+    for i in items:
+        if not has_cof:
+            i["donor"] = i["cofund"] = None
+    struct = {"currency": str(data.get("currency") or "").strip(), "items": items,
+              "total": sum(i["amount"] for i in items), "has_cofunding": has_cof}
+    if has_cof:
+        struct["total_donor"] = sum(i["donor"] or 0 for i in items)
+        struct["total_cofund"] = sum(i["cofund"] or 0 for i in items)
+    return struct
 
 
 def _entries(struct: dict) -> list[dict]:
@@ -336,14 +365,30 @@ def fill_line_item_table(table, header_row: int, roles: dict, struct: dict) -> d
             if entry.get("unit_cost") is not None:
                 put("unit_cost", fmt_amount(entry["unit_cost"]))
             put("amount", fmt_amount(entry["amount"]))
+            if struct.get("has_cofunding"):
+                put("donor_amount", fmt_amount(entry["donor"] or 0))
+                put("cofunding", fmt_amount(entry["cofund"] or 0))
             written += 1
     if total_r is not None:
         total_row = _grid(table)[total_r + added]
-        c = col_of["amount"]
-        cell, anchor = total_row[c]
-        if anchor and _writable(cell):
-            _write(cell, fmt_amount(struct["total"]), bold=True)
-    return {"items": written, "rows_added": added, "total": struct["total"]}
+        totals = {"amount": struct["total"]}
+        if struct.get("has_cofunding"):
+            totals["donor_amount"] = struct["total_donor"]
+            totals["cofunding"] = struct["total_cofund"]
+        for role, value in totals.items():
+            c = col_of.get(role)
+            if c is None:
+                continue
+            cell, anchor = total_row[c]
+            if anchor and _writable(cell):
+                _write(cell, fmt_amount(value), bold=True)
+    report = {"items": written, "rows_added": added, "total": struct["total"]}
+    if struct.get("has_cofunding"):
+        report["cofunding"] = {
+            "donor": struct["total_donor"], "cofund": struct["total_cofund"],
+            "in_table": "cofunding" in col_of and "donor_amount" in col_of,
+        }
+    return report
 
 
 # ------------------------------------------------- запасной путь: сетка (LLM)
@@ -360,7 +405,9 @@ async def map_budget_to_tables(grid_text: str, budget_text: str) -> dict:
         "Найди таблицу бюджета и распиши бюджет по её строкам: определи по шапке "
         "смысл столбцов (статья, количество, ставка, период, сумма, комментарий), "
         "впиши по одной статье бюджета на строку подряд. Итоговые суммы строк и "
-        "блоков («Итого») тоже впиши — рассчитай аккуратно. Не придумывай статьи "
+        "блоков («Итого») тоже впиши — рассчитай аккуратно. Если в бюджете есть разбивка на "
+        "сумму от донора и со-вклад заявителя, а в таблице есть такие столбцы — впиши обе суммы. "
+        "Не придумывай статьи "
         "и суммы: только то, что есть в согласованном бюджете; строки таблицы, "
         "которым нет соответствия, оставь пустыми. Если пустых строк меньше, чем "
         "статей, объедини мелкие статьи, не выходя за таблицу. Числа — без "
@@ -492,9 +539,14 @@ def build_budget_docx(struct: dict | None, budget_text: str, title: str, notes: 
         document.add_paragraph(n)
     if struct:
         cur = struct.get("currency") or ""
-        table = document.add_table(rows=1, cols=4)
+        cof = bool(struct.get("has_cofunding"))
+        suffix = f", {cur}" if cur else ""
+        heads = ["№", "Статья расходов", "Расчёт (кол-во, ставка)", f"Всего{suffix}"]
+        if cof:
+            heads += [f"Сумма от донора{suffix}", f"Со-вклад заявителя{suffix}"]
+        table = document.add_table(rows=1, cols=len(heads))
         table.style = "Table Grid"
-        for c, h in enumerate(["№", "Статья расходов", "Расчёт (кол-во, ставка)", f"Сумма{', ' + cur if cur else ''}"]):
+        for c, h in enumerate(heads):
             table.rows[0].cells[c].text = h
             for r in table.rows[0].cells[c].paragraphs[0].runs:
                 r.bold = True
@@ -509,11 +561,22 @@ def build_budget_docx(struct: dict | None, budget_text: str, title: str, notes: 
                 if e.get("unit_cost") is not None:
                     qty = (qty + " × " if qty else "") + fmt_amount(e["unit_cost"])
                 row[0].text, row[1].text, row[2].text, row[3].text = e["num"], e["name"], qty, fmt_amount(e["amount"])
+                if cof:
+                    row[4].text, row[5].text = fmt_amount(e["donor"] or 0), fmt_amount(e["cofund"] or 0)
         row = table.add_row().cells
         row[1].text, row[3].text = "ИТОГО", fmt_amount(struct["total"])
-        for c in (1, 3):
+        if cof:
+            row[4].text, row[5].text = fmt_amount(struct["total_donor"]), fmt_amount(struct["total_cofund"])
+        for c in range(1, len(heads)):
             for r in row[c].paragraphs[0].runs:
                 r.bold = True
+        if cof and struct["total"]:
+            document.add_paragraph(
+                f"Со-вклад заявителя: {fmt_amount(struct['total_cofund'])} {cur} "
+                f"({struct['total_cofund'] / struct['total'] * 100:.1f}% от общей стоимости проекта; "
+                f"{struct['total_cofund'] / struct['total_donor'] * 100:.1f}% от суммы гранта)." if struct["total_donor"]
+                else f"Со-вклад заявителя: {fmt_amount(struct['total_cofund'])} {cur}."
+            )
     else:
         for line in budget_text.split("\n"):
             document.add_paragraph(re.sub(r"[*#`]", "", line).rstrip())
