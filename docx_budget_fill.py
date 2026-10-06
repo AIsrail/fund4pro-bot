@@ -258,7 +258,14 @@ def _write(cell, text: str, bold: bool = False) -> None:
         ppr = first._p.find(qn("w:pPr"))
         mark = ppr.find(qn("w:rPr")) if ppr is not None else None
         if mark is not None:
-            run._r.insert(0, copy.deepcopy(mark))
+            clean = copy.deepcopy(mark)
+            # В шаблонах донора в знаке пустого абзаца бывают случайные «следы»
+            # форматирования (например зачёркивание у GGF) — размер/язык берём,
+            # а такие признаки отбрасываем, иначе вписанный текст выглядит испорченным.
+            for tag in ("w:strike", "w:dstrike", "w:vanish", "w:specVanish", "w:highlight"):
+                for el in clean.findall(qn(tag)):
+                    clean.remove(el)
+            run._r.insert(0, clean)
     if bold:
         run.bold = True
     for p in paragraphs[1:]:
