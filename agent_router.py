@@ -857,10 +857,13 @@ async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: st
     # оттуда. Старый _send_docx остаётся резервным путём на случай, если
     # список почему-то пуст, а document_ready всё равно True (не должно
     # случаться в норме, но лучше отправить хоть что-то, чем ничего).
+    delivered_application = bool(pending_text_documents)
     if getattr(result, "generated_documents", None):
+        delivered_application = True
         for doc in result.generated_documents:
             await _send_generated_document(message, doc)
     elif result.document_ready and result.document_text.strip():
+        delivered_application = True
         await _send_docx(message, result.document_text, session)
 
     if result.reply.strip():
@@ -872,6 +875,11 @@ async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: st
             await send_long(message, result.reply, reply_markup=quick_reply_keyboard(result.quick_replies))
         else:
             await send_long(message, result.reply)
+
+    # Опрос обратной связи после выдачи заявки (feedback_handlers) — раз на проект.
+    if delivered_application:
+        from handlers.feedback_handlers import offer_feedback
+        await offer_feedback(message, state)
 
 
 RESULT_DISCLAIMER = (

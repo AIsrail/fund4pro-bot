@@ -10,7 +10,7 @@ from aiogram.types import ErrorEvent
 import config
 import agent_router
 from chat_serialization import ChatSerializationMiddleware
-from handlers import payments_handlers
+from handlers import feedback_handlers, payments_handlers
 from update_dedup import DedupMiddleware
 
 logger = logging.getLogger("fund4pro.bot")
@@ -145,6 +145,8 @@ async def main():
     # до payments_handlers.successful_payment просто не доходил — оплата
     # проходила по деньгам, но бот не увидел бы, что платить она перестала.
     dp.include_router(payments_handlers.router)
+    # Опрос обратной связи — тоже ДО agent_router (его catch-all иначе съест fb:* и текст).
+    dp.include_router(feedback_handlers.router)
     dp.include_router(agent_router.router)
 
     # РЕАЛЬНЫЙ ИНЦИДЕНТ: необработанное исключение в любом хендлере роняло
