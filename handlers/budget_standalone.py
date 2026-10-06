@@ -897,7 +897,24 @@ async def budget_hint_comment(callback: CallbackQuery, state: FSMContext):
 
 async def _show_export_menu(message: Message, state: FSMContext, text: str) -> None:
     data = await state.get_data()
-    await message.answer(text, reply_markup=budget_export_keyboard(data.get("donor_templates") or []))
+    old = data.get("export_menu_msg")
+    if old:
+        # Прежнее меню убираем, иначе нужная кнопка тонет среди дублей.
+        try:
+            await message.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=old, reply_markup=None)
+        except Exception:
+            pass
+    sent = await message.answer(text, reply_markup=budget_export_keyboard(data.get("donor_templates") or []))
+    await state.update_data(export_menu_msg=sent.message_id)
+
+
+def _budget_meta(d: dict, tpl: dict) -> dict:
+    meta = {"currency": d.get("currency", ""), "donor_name": tpl["name"] if tpl.get("kind") != "standalone" else ""}
+    if d.get("fx_rate") and d.get("fx_currency"):
+        meta["fx"] = f"Курс: 1 USD = {d['fx_rate']:g} {d['fx_currency']} ({d.get('fx_source')})."
+    if d.get("admin_share") is not None:
+        meta["admin"] = f"Админ-расходы: не более {d['admin_share']:g}% бюджета."
+    return meta
 
 
 @router.callback_query(StateFilter(S.review_budget), F.data == "budget:done")
@@ -954,7 +971,12 @@ async def receive_template_file(message: Message, state: FSMContext):
     note = _register_template(templates, name, content, kind, lenient=True)
     idx = next((i for i, t in enumerate(templates) if t["name"] == name), None)
     if idx is None:
-        await message.answer(f"⚠️ {note or 'Файл не подошёл'}. Пришлите другой файл или напишите «отмена».")
+        await state.set_state(S.final_budget)
+        await _show_export_menu(
+            message, state,
+            f"⚠️ {note or 'Файл не подошёл'}. Могу собрать бюджет отдельным Word-документом "
+            "(кнопка ниже) — таблицу вы перенесёте в заявку сами, либо пришлите другой файл.",
+        )
         return
     await state.update_data(donor_templates=templates)
     await state.set_state(S.final_budget)
@@ -967,13 +989,19 @@ async def cancel_template_upload(message: Message, state: FSMContext):
     await _show_export_menu(message, state, "Хорошо. Что дальше?")
 
 
+@router.callback_query(StateFilter(S.final_budget), F.data == "budget_export:doc")
+async def export_standalone_doc(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await deliver_budget_template(callback.message, state, -1)
+
+
 @router.callback_query(StateFilter(S.final_budget), F.data.startswith("budget_export:fill:"))
 async def export_into_template(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await deliver_budget_template(callback.message, state, int(callback.data.rsplit(":", 1)[-1]))
 
 
-async def _fill_xlsx(content: bytes, budget_text: str) -> dict | None:
+async def _fill_xlsx(content: bytes, budget_text: str, meta: dict | None = None) -> dict | None:
     from excel_fill import fill_xlsx_template_report, generate_budget_cell_mapping
     from xlsx_patch import extract_xlsx_grid
 
@@ -995,7 +1023,25 @@ async def _fill_xlsx(content: bytes, budget_text: str) -> dict | None:
     return {"bytes": filled, "caption": caption}
 
 
-async def _fill_docx(content: bytes, budget_text: str) -> dict | None:
+async def _fill_docx(content: bytes, budget_text: str, meta: dict | None = None) -> dict | None:
+    # 1) таблица статей расходов (в том числе вложенная в ячейку-вопрос): статьи
+    #    пишутся построчно, недостающие строки добавляются перед «ИТОГО»
+    struct = None
+    if docx_budget_fill.find_line_item_tables(content):
+        struct = await docx_budget_fill.extract_budget_struct(budget_text)
+        if struct:
+            res = docx_budget_fill.fill_budget_into_docx(content, struct)
+            if res:
+                filled, rep = res
+                cur = struct.get("currency") or (meta or {}).get("currency", "")
+                caption = (
+                    f"вписано статей — {rep['items']}, добавлено строк — {rep['rows_added']}, "
+                    f"итог посчитан: {docx_budget_fill.fmt_amount(rep['total'])} {cur}. "
+                    "Остальной текст и таблицы заявки не менялись (другие разделы заявки в этом режиме "
+                    "не заполняются)."
+                )
+                return {"bytes": filled, "caption": caption.replace("  ", " ")}
+    # 2) произвольная сетка: модель сопоставляет цифры с адресами ячеек
     indices = docx_budget_fill.find_budget_tables(content) or docx_budget_fill.find_budget_tables(content, lenient=True)
     if not indices:
         return None
@@ -1016,7 +1062,23 @@ async def _fill_docx(content: bytes, budget_text: str) -> dict | None:
     return {"bytes": filled, "caption": caption}
 
 
-async def _fill_pdf(content: bytes, budget_text: str) -> dict | None:
+async def _fill_standalone(budget_text: str, meta: dict) -> dict:
+    """Отдельный Word-документ с бюджетом — когда вписать в форму донора некуда
+    (или пользователь сам попросил): таблицу переносят в заявку вручную."""
+    struct = await docx_budget_fill.extract_budget_struct(budget_text)
+    notes = []
+    if meta.get("donor_name"):
+        notes.append(f"Бюджет подготовлен для заявки: {meta['donor_name']}.")
+    if meta.get("fx"):
+        notes.append(meta["fx"])
+    if meta.get("admin"):
+        notes.append(meta["admin"])
+    notes.append("Цифры ориентировочные — проверьте перед подачей.")
+    data = docx_budget_fill.build_budget_docx(struct, budget_text, "Бюджет проекта", notes)
+    return {"bytes": data, "caption": "перенесите таблицу в форму донора."}
+
+
+async def _fill_pdf(content: bytes, budget_text: str, meta: dict | None = None) -> dict | None:
     fields = pdf_budget_fill.extract_pdf_form_schema(content)
     if not fields:
         return None
@@ -1050,10 +1112,10 @@ async def deliver_budget_template(message: Message, state: FSMContext, idx: int 
         idx = (data.get("_pending_budget_export") or {}).get("idx", 0)
     templates = data.get("donor_templates") or []
     budget_text = data.get("budget_text", "")
-    if idx >= len(templates) or not budget_text.strip():
+    if not budget_text.strip() or idx >= len(templates):
         await _show_export_menu(message, state, "Нет шаблона или готового бюджета — нечего заполнять.")
         return
-    tpl = templates[idx]
+    tpl = templates[idx] if idx >= 0 else {"name": "Бюджет проекта.docx", "kind": "standalone", "b64": ""}
 
     allowed = True
     try:
@@ -1071,23 +1133,39 @@ async def deliver_budget_template(message: Message, state: FSMContext, idx: int 
         )
         return
 
+    meta = _budget_meta(data, tpl)
     result = None
+    fell_back = False
     try:
-        async with show_working(message, _PROGRESS[tpl["kind"]]):
-            result = await _FILLERS[tpl["kind"]](base64.b64decode(tpl["b64"]), budget_text)
+        if tpl["kind"] != "standalone":
+            async with show_working(message, _PROGRESS[tpl["kind"]]):
+                result = await _FILLERS[tpl["kind"]](base64.b64decode(tpl["b64"]), budget_text, meta)
+        if not result:
+            fell_back = tpl["kind"] != "standalone"
+            async with show_working(message, "📄 Собираю бюджет отдельным Word-документом..."):
+                result = await _fill_standalone(budget_text, meta)
     except Exception:
         logger.exception("deliver_budget_template failed (%s)", tpl["kind"])
     if not result:
         await _show_export_menu(
             message, state,
-            "⚠️ Не смог уверенно определить, куда в этом файле вписывать цифры (структура нестандартная). "
-            "Деньги не списаны. Перенесите цифры вручную из бюджета выше.",
+            "⚠️ Не получилось собрать файл. Деньги не списаны. Бюджет текстом — по кнопке ниже.",
         )
         return
 
-    name = tpl["name"]
-    out_name = name if name.lower().startswith("filled_") else f"filled_{name}"
-    caption = f"{KIND_LABEL[tpl['kind']]} {name}: {result['caption']}\nПроверьте цифры перед отправкой донору."
+    if fell_back:
+        name, out_name = "Бюджет проекта", "Бюджет проекта.docx"
+        caption = (
+            f"📄 {tpl['name']}: не нашёл в этой форме место, куда можно вписать бюджет, поэтому "
+            f"подготовил его отдельным документом — {result['caption']}"
+        )
+    elif tpl["kind"] == "standalone":
+        name, out_name = "Бюджет проекта", "Бюджет проекта.docx"
+        caption = f"📄 Бюджет отдельным Word-документом: {result['caption']}"
+    else:
+        name = tpl["name"]
+        out_name = name if name.lower().startswith("filled_") else f"filled_{name}"
+        caption = f"{KIND_LABEL[tpl['kind']]} {name}: {result['caption']}\nПроверьте цифры перед отправкой донору."
     await message.answer_document(BufferedInputFile(result["bytes"], filename=out_name), caption=caption[:1020])
     try:
         await billing.consume(chat_id, "file_export")

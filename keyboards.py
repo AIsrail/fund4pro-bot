@@ -208,6 +208,7 @@ def budget_export_keyboard(templates: list | None = None) -> InlineKeyboardMarku
     for i, t in enumerate((templates or [])[:3]):
         name = t["name"] if len(t["name"]) <= 26 else t["name"][:23] + "..."
         kb.button(text=f"{icons.get(t['kind'], '📎')} Вписать в «{name}»", callback_data=f"budget_export:fill:{i}")
+    kb.button(text="📄 Бюджет отдельным Word-документом", callback_data="budget_export:doc")
     kb.button(text="📎 Прислать форму донора (Word/Excel/PDF)", callback_data="budget_export:upload")
     kb.button(text="✏️ Внести правки", callback_data="budget_export:revise")
     kb.adjust(1)
