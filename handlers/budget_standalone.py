@@ -937,6 +937,8 @@ async def export_text(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     data = await state.get_data()
     await send_long(callback.message, data.get("budget_text", ""))
+    from handlers.feedback_handlers import offer_feedback
+    await offer_feedback(callback.message, state)
 
 
 @router.callback_query(StateFilter(S.final_budget), F.data == "budget_export:revise")
@@ -1171,4 +1173,6 @@ async def deliver_budget_template(message: Message, state: FSMContext, idx: int 
         await billing.consume(chat_id, "file_export")
     except Exception:
         logger.warning("billing.consume(file_export) failed", exc_info=True)
+    from handlers.feedback_handlers import offer_feedback
+    await offer_feedback(message, state)
     await _show_export_menu(message, state, "Что дальше?")

@@ -452,6 +452,8 @@ async def resume_after_file_export_payment(message: Message, state: FSMContext) 
                 "⚠️ Не смог заполнить именно оригинальный файл формы донора (он не найден в текущей "
                 "сессии) — выше документ с тем же содержанием, но собранный в свободном формате."
             )
+        from handlers.feedback_handlers import offer_feedback
+        await offer_feedback(message, state)
     except Exception:
         logger.exception("resume_after_file_export_payment: failed to build/export document")
         await message.answer("⚠️ Оплата прошла, но собрать файл не удалось — напиши 'собери документ' ещё раз, я попробую снова.")
