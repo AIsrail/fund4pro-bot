@@ -118,12 +118,33 @@ async def send_file_export_invoice(bot: Bot, chat_id: int) -> None:
     )
 
 
+PAID_BUDGET_EXPORT_PAYLOAD = "paid_budget_export"
+
+
+async def send_budget_export_invoice(bot: Bot, chat_id: int) -> None:
+    """Инвойс на ещё один бюджет в файле (первый бесплатно). Тестовый режим:
+    цена названа в сомах для понятности, списывается в Stars."""
+    prices = [LabeledPrice(label="Ещё один бюджет в файле", amount=config.PAID_BUDGET_EXPORT_PRICE_XTR)]
+    await bot.send_invoice(
+        chat_id=chat_id,
+        title="Ещё один бюджет в файле",
+        description=(
+            f"Первый бюджет в файле бесплатно, дальше ~{config.BUDGET_EXPORT_PRICE_KGS} сом "
+            "(тестовый режим — цена может измениться). Текст бюджета в чате всегда бесплатно."
+        ),
+        payload=PAID_BUDGET_EXPORT_PAYLOAD,
+        provider_token=config.PROVIDER_TOKEN,
+        currency="XTR" if not config.PROVIDER_TOKEN else "USD",
+        prices=prices,
+    )
+
+
 async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
     """Подтверждает оплату перед списанием средств. Telegram требует ответ
     в течение 10 секунд, иначе платёж отклоняется автоматически."""
     known_payloads = (
         PAID_REVISION_PAYLOAD, PAID_PROJECT_PAYLOAD,
-        PAID_TEMPLATE_DOWNLOAD_PAYLOAD, PAID_FILE_EXPORT_PAYLOAD,
+        PAID_TEMPLATE_DOWNLOAD_PAYLOAD, PAID_FILE_EXPORT_PAYLOAD, PAID_BUDGET_EXPORT_PAYLOAD,
     )
     if pre_checkout_query.invoice_payload not in known_payloads:
         await pre_checkout_query.answer(ok=False, error_message="Неизвестный платёж")

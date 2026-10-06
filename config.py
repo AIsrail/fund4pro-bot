@@ -110,3 +110,15 @@ REDIS_URL = os.environ.get("REDIS_URL", "")
 # тем, как всё равно показать документ пользователю (чтобы не зациклиться
 # и не сжигать бюджет на LLM-вызовы бесконечно).
 RED_FLAG_AUTOFIX_ATTEMPTS = int(os.environ.get("RED_FLAG_AUTOFIX_ATTEMPTS", "1"))
+
+# --- Бюджет в файле (кнопка «Составить бюджет», 06.10.2026) ----------------
+# Владелец: ПЕРВЫЙ бюджет в файле (Excel/Word/PDF донора или отдельный Word)
+# бесплатно, со второго — за доплату ~90 сом (ТЕСТОВЫЙ РЕЖИМ, цена может
+# измениться). Текст бюджета в чате всегда бесплатно. 90 сом ≈ $1.03 при ~87.5
+# сом/$; по тому же ориентиру, что и остальные цены (~115 Stars за 200 сом) ≈ 52
+# Stars. Свериться перед стартом продаж. Платёж реально берётся только при
+# PAYMENT_ENABLED=true — иначе второй файл заблокировать нечем (см. billing).
+FREE_BUDGET_EXPORTS = int(os.environ.get("FREE_BUDGET_EXPORTS", "1"))
+ENFORCE_BUDGET_EXPORT_PAYMENT = os.environ.get("ENFORCE_BUDGET_EXPORT_PAYMENT", "true").lower() == "true"
+PAID_BUDGET_EXPORT_PRICE_XTR = int(os.environ.get("PAID_BUDGET_EXPORT_PRICE_XTR", "52"))
+BUDGET_EXPORT_PRICE_KGS = int(os.environ.get("BUDGET_EXPORT_PRICE_KGS", "90"))

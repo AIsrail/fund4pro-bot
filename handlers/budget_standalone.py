@@ -23,6 +23,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 import billing
+import config
 import docx_budget_fill
 import pdf_budget_fill
 from budget_donor import analyze_donor_for_budget, extract_urls
@@ -1338,20 +1339,26 @@ async def deliver_budget_template(message: Message, state: FSMContext, idx: int 
         return
     tpl = templates[idx] if idx >= 0 else {"name": "Бюджет проекта.docx", "kind": "standalone", "b64": ""}
 
+    # Один бюджет = одно прохождение сценария: первый файл бесплатно, после него
+    # любые форматы того же бюджета (Excel/Word/PDF) уже оплачены/бесплатны.
+    already = bool(data.get("budget_export_counted"))
     allowed = True
-    try:
-        allowed = await billing.can_use(chat_id, "file_export")
-    except Exception:
-        logger.warning("billing.can_use(file_export) failed, defaulting to allow", exc_info=True)
+    if not already:
+        try:
+            allowed = await billing.can_use(chat_id, "budget_export")
+        except Exception:
+            logger.warning("billing.can_use(budget_export) failed, defaulting to allow", exc_info=True)
     if not allowed:
         import payments
 
         await state.update_data(_pending_budget_export={"idx": idx})
-        await payments.send_file_export_invoice(message.bot, chat_id)
         await message.answer(
-            "Заполненный файл донора — платная услуга (текст бюджета остаётся бесплатным). "
+            "Первый бюджет в файле вы уже получили бесплатно. Следующие — "
+            f"{config.BUDGET_EXPORT_PRICE_KGS} сом (≈{config.PAID_BUDGET_EXPORT_PRICE_XTR} ⭐), "
+            "сейчас тестовый режим, цена может измениться. Текст бюджета в чате — всегда бесплатно. "
             "После оплаты пришлю файл сразу."
         )
+        await payments.send_budget_export_invoice(message.bot, chat_id)
         return
 
     meta = _budget_meta(data, tpl)
@@ -1388,13 +1395,23 @@ async def deliver_budget_template(message: Message, state: FSMContext, idx: int 
         out_name = name if name.lower().startswith("filled_") else f"filled_{name}"
         caption = f"{KIND_LABEL[tpl['kind']]} {name}: {result['caption']}\nПроверьте цифры перед отправкой донору."
     await message.answer_document(BufferedInputFile(result["bytes"], filename=out_name), caption=caption[:1020])
-    try:
-        await billing.consume(chat_id, "file_export")
-    except Exception:
-        logger.warning("billing.consume(file_export) failed", exc_info=True)
+    first_free = False
+    if not already:
+        try:
+            first_free = not await _has_paid_credit(chat_id)
+            await billing.consume(chat_id, "budget_export")
+        except Exception:
+            logger.warning("billing.consume(budget_export) failed", exc_info=True)
+        await state.update_data(budget_export_counted=True)
+    note = ""
+    if first_free and config.ENFORCE_BUDGET_EXPORT_PAYMENT and config.PAYMENT_ENABLED:
+        note = (
+            f"\n\nЭто ваш бесплатный бюджет в файле. Следующие — {config.BUDGET_EXPORT_PRICE_KGS} сом "
+            "(тестовый режим, цена может измениться). Другие форматы этого же бюджета — без доплаты."
+        )
     from handlers.feedback_handlers import offer_feedback
     await offer_feedback(message, state)
-    await _show_export_menu(message, state, "Что дальше?", compact=True)
+    await _show_export_menu(message, state, "Что дальше?" + note, compact=True)
 
 
 # ============================================================================
@@ -1452,3 +1469,21 @@ async def go_fill_application(callback: CallbackQuery, state: FSMContext):
     import agent_router
 
     await agent_router.start_application_from_budget(callback.message, state, _build_handoff(data))
+
+
+async def _has_paid_credit(chat_id: int) -> bool:
+    """Есть ли у пользователя купленный (платный) кредит на бюджет в файле —
+    чтобы не называть бесплатным то, за что только что заплатили."""
+    try:
+        record = await billing._read(chat_id)
+        return record["budget_export"].get("paid_credits", 0) > 0
+    except Exception:
+        return False
+
+
+async def resume_after_budget_payment(message: Message, state: FSMContext) -> None:
+    """Вызывается из handlers/payments_handlers.py после оплаты ещё одного бюджета
+    в файле: отдаёт файл, ради которого пользователь упёрся в лимит."""
+    pending = (await state.get_data()).get("_pending_budget_export") or {}
+    await state.update_data(_pending_budget_export=None)
+    await deliver_budget_template(message, state, pending.get("idx", 0))

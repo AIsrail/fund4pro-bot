@@ -13,6 +13,8 @@
                            формы донора (не считается, если скачать не
                            удалось — см. agent_engine._execute_tool,
                            списание происходит только после успеха).
+  - "budget_export"      — бюджет в файле (режим «Составить бюджет»):
+                           1 бесплатно, дальше платно (config.FREE_BUDGET_EXPORTS).
   - "file_export"        — сборка итогового документа В ОФИЦИАЛЬНЫЙ ФАЙЛ
                            шаблона (не текст в чате) — по умолчанию 0
                            бесплатных, платно с первого раза.
@@ -66,6 +68,10 @@ def _resource_limits(resource: str) -> tuple[bool, int]:
         return config.ENFORCE_TEMPLATE_DOWNLOAD_LIMIT, config.FREE_TEMPLATE_DOWNLOADS
     if resource == "file_export":
         return config.ENFORCE_FILE_EXPORT_PAYMENT, config.FREE_FILE_EXPORTS
+    if resource == "budget_export":
+        # Без включённой оплаты второй файл заблокировать нечем (счёт не отправить) —
+        # поэтому ограничение действует только при PAYMENT_ENABLED=true.
+        return config.ENFORCE_BUDGET_EXPORT_PAYMENT and config.PAYMENT_ENABLED, config.FREE_BUDGET_EXPORTS
     raise ValueError(f"billing: unknown resource {resource!r}")
 
 
@@ -111,7 +117,7 @@ async def _read(chat_id: int) -> dict:
             "paid_credits": record.get("paid_credits", 0),
         }}
 
-    for res in ("project", "template_download", "file_export"):
+    for res in ("project", "template_download", "file_export", "budget_export"):
         record.setdefault(res, dict(_EMPTY_RESOURCE))
     return record
 

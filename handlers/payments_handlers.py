@@ -16,6 +16,7 @@ from aiogram import Router
 from aiogram.types import Message, PreCheckoutQuery
 
 from payments import (
+    PAID_BUDGET_EXPORT_PAYLOAD,
     PAID_FILE_EXPORT_PAYLOAD,
     PAID_PROJECT_PAYLOAD,
     PAID_REVISION_PAYLOAD,
@@ -65,6 +66,15 @@ async def successful_payment(message: Message, state):
         await billing.add_paid_credit(message.chat.id, "template_download")
         await message.answer("✅ Оплата прошла — вот шаблон:")
         await agent_router.resume_after_template_payment(message, state)
+        return
+
+    if payload == PAID_BUDGET_EXPORT_PAYLOAD:
+        # Оплата ещё одного бюджета в файле (режим «Составить бюджет»).
+        from handlers import budget_standalone
+
+        await billing.add_paid_credit(message.chat.id, "budget_export")
+        await message.answer("✅ Оплата прошла — собираю файл:")
+        await budget_standalone.resume_after_budget_payment(message, state)
         return
 
     if payload == PAID_FILE_EXPORT_PAYLOAD:
