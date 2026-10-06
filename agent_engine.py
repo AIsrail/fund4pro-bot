@@ -217,6 +217,7 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
                     pending_att.append({
                         "path": path,
                         "caption": f"📎 Форма донора: {f['filename']}",
+                        "filename": f["filename"],
                     })
                 else:
                     withheld_files.append({"filename": f["filename"], "content_b64": f_entry["content_b64"]})

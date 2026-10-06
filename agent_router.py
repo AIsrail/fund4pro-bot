@@ -922,7 +922,7 @@ async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: st
             if p and os.path.exists(p):
                 try:
                     await message.answer_document(
-                        FSInputFile(p),
+                        FSInputFile(p, filename=att.get("filename") or None),
                         caption=att.get("caption", ""),
                     )
                 except Exception as e:

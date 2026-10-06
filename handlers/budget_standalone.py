@@ -39,6 +39,7 @@ from keyboards import (
     budget_fx_keyboard,
     budget_grant_options_keyboard,
     budget_location_keyboard,
+    budget_overlimit_keyboard,
     budget_ready_keyboard,
     budget_skip_keyboard,
 )
@@ -409,7 +410,8 @@ async def _ingest_donor_text(message: Message, state: FSMContext, text: str) -> 
                 note = _register_template(templates, f["name"], f["content"], f["kind"])
                 if note:
                     notes.append(note)
-        await state.update_data(donor_context=context[:MAX_DONOR_CONTEXT], donor_templates=templates)
+        known_urls = list(dict.fromkeys(list(data.get("donor_urls") or []) + urls[:2]))
+        await state.update_data(donor_context=context[:MAX_DONOR_CONTEXT], donor_templates=templates, donor_urls=known_urls)
         await _refresh_analysis(state)
 
     data = await state.get_data()
@@ -1085,7 +1087,7 @@ async def budget_hint_comment(callback: CallbackQuery, state: FSMContext):
     )
 
 
-async def _show_export_menu(message: Message, state: FSMContext, text: str) -> None:
+async def _show_export_menu(message: Message, state: FSMContext, text: str, compact: bool = False) -> None:
     data = await state.get_data()
     old = data.get("export_menu_msg")
     if old:
@@ -1094,7 +1096,7 @@ async def _show_export_menu(message: Message, state: FSMContext, text: str) -> N
             await message.bot.edit_message_reply_markup(chat_id=message.chat.id, message_id=old, reply_markup=None)
         except Exception:
             pass
-    sent = await message.answer(text, reply_markup=budget_export_keyboard(data.get("donor_templates") or []))
+    sent = await message.answer(text, reply_markup=budget_export_keyboard(data.get("donor_templates") or [], compact=compact))
     await state.update_data(export_menu_msg=sent.message_id)
 
 
@@ -1110,9 +1112,36 @@ def _budget_meta(d: dict, tpl: dict) -> dict:
 @router.callback_query(StateFilter(S.review_budget), F.data == "budget:done")
 async def budget_done(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    data = await state.get_data()
+    size = data.get("budget_size") or 0
+    # Итог бюджета не должен превышать запрошенный грант — проверяем кодом по таблице статей.
+    if size and (data.get("budget_text") or "").strip():
+        async with show_working(callback.message, "🔎 Проверяю итоги бюджета..."):
+            struct = await docx_budget_fill.extract_budget_struct(data["budget_text"])
+        if struct:
+            donor_total = struct["total_donor"] if struct.get("has_cofunding") else struct["total"]
+            if donor_total > size * 1.01:
+                cur = data.get("currency", "")
+                await callback.message.answer(
+                    f"⚠️ Итог бюджета {docx_budget_fill.fmt_amount(donor_total)} {cur} превышает запрошенный грант "
+                    f"{docx_budget_fill.fmt_amount(size)} {cur} на {docx_budget_fill.fmt_amount(donor_total - size)}. "
+                    "Скорректируем бюджет или оставить как есть?",
+                    reply_markup=budget_overlimit_keyboard(),
+                )
+                return
+    await _finish_budget(callback.message, state)
+
+
+@router.callback_query(StateFilter(S.review_budget), F.data == "budget:done_force")
+async def budget_done_force(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _finish_budget(callback.message, state)
+
+
+async def _finish_budget(message: Message, state: FSMContext) -> None:
     await state.set_state(S.final_budget)
     await _show_export_menu(
-        callback.message, state,
+        message, state,
         "✅ Бюджет согласован. Проверьте итоговую сумму и лимит админ-расходов "
         "по условиям донора перед подачей.",
     )
@@ -1365,4 +1394,61 @@ async def deliver_budget_template(message: Message, state: FSMContext, idx: int 
         logger.warning("billing.consume(file_export) failed", exc_info=True)
     from handlers.feedback_handlers import offer_feedback
     await offer_feedback(message, state)
-    await _show_export_menu(message, state, "Что дальше?")
+    await _show_export_menu(message, state, "Что дальше?", compact=True)
+
+
+# ============================================================================
+# 6. Переход к заявке (основной сценарий)
+# ============================================================================
+
+def _build_handoff(d: dict) -> dict:
+    """Всё, что основной сценарий (agent_router) должен знать из бюджета:
+    согласованный бюджет, донор и его условия."""
+    a = d.get("donor_analysis") or {}
+    facts = []
+    if d.get("chosen_grant_option"):
+        facts.append(f"Вариант гранта: {d['chosen_grant_option']}" + (f" (до {a['max_grant']:g})" if a.get("max_grant") else ""))
+    elif a.get("max_grant"):
+        facts.append(f"Грант до {a['max_grant']:g}")
+    if d.get("admin_share") is not None:
+        facts.append(f"Админ-расходы: не более {d['admin_share']:g}%")
+    if d.get("budget_size"):
+        facts.append(f"Запрошенная сумма: {d['budget_size']:g} {d.get('currency', '')}")
+    if d.get("project_duration"):
+        facts.append(f"Срок проекта: {d['project_duration']}")
+    cf = a.get("cofunding") or {}
+    if d.get("cofunding_active"):
+        facts.append(f"Со-вклад заявителя: {d.get('cofunding_pct') or 'доля не названа'}% ({d.get('cofunding_text') or ''})")
+    elif cf.get("required") is True:
+        facts.append("Со-вклад донором требуется")
+    if a.get("ineligible_costs"):
+        facts.append(f"Не финансируется: {a['ineligible_costs']}")
+    if a.get("budget_notes"):
+        facts.append(f"Прочие бюджетные требования: {a['budget_notes']}")
+    urls = d.get("donor_urls") or []
+    return {
+        "budget_text": d.get("budget_text", ""),
+        "donor_urls": urls,
+        "donor_facts": facts,
+        "donor_context": (d.get("donor_context") or "")[:3000],
+        "currency": d.get("currency", ""),
+    }
+
+
+@router.callback_query(StateFilter(S.final_budget), F.data == "budget_export:application")
+async def go_fill_application(callback: CallbackQuery, state: FSMContext):
+    """Пользователь хочет заполнить заявку: передаём бюджет и донора в основной
+    сценарий (организация -> донор -> ... ) без повторных вопросов о них."""
+    await callback.answer()
+    data = await state.get_data()
+    if not (data.get("budget_text") or "").strip():
+        await _show_export_menu(callback.message, state, "Сначала нужен согласованный бюджет.")
+        return
+    # Убираем кнопки у меню, с которого ушли, чтобы не возвращаться в него случайно.
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    import agent_router
+
+    await agent_router.start_application_from_budget(callback.message, state, _build_handoff(data))

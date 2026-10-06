@@ -73,19 +73,48 @@ def _filename(resp: httpx.Response, kind: str) -> str:
     return name[:120]
 
 
-async def _fetch(client: httpx.AsyncClient, url: str) -> dict | None:
+class _Resp:
+    """Минимальный общий вид ответа (httpx / curl_cffi): content, headers, url."""
+
+    def __init__(self, content: bytes, headers, url: str):
+        self.content, self.headers, self.url = content, headers, url
+
+
+async def fetch_bytes(url: str, client: httpx.AsyncClient | None = None, referer: str | None = None) -> _Resp | None:
+    """Скачивает файл. Сначала обычный httpx; при 403/ошибке — curl_cffi с
+    отпечатком Chrome: часть сайтов (NED за Cloudflare) отдаёт 403 любому
+    Python-клиенту по TLS-отпечатку, хотя браузер и curl получают файл."""
     try:
-        resp = await client.get(url)
-        resp.raise_for_status()
+        if client is not None:
+            resp = await client.get(url)
+        else:
+            async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=HEADERS) as c:
+                resp = await c.get(url)
+        if resp.status_code == 200 and resp.content:
+            return _Resp(resp.content, resp.headers, str(resp.url))
     except Exception:
+        pass
+    try:
+        from curl_cffi.requests import AsyncSession
+
+        headers = {"Referer": referer} if referer else {}
+        async with AsyncSession() as session:
+            r = await session.get(url, impersonate="chrome", headers=headers, timeout=30, allow_redirects=True)
+        if r.status_code == 200 and r.content:
+            return _Resp(r.content, r.headers, str(r.url))
+    except Exception:
+        logger.info("fetch_bytes: curl_cffi fallback failed for %s", url, exc_info=True)
+    return None
+
+
+async def _fetch(client: httpx.AsyncClient, url: str, referer: str | None = None) -> dict | None:
+    resp = await fetch_bytes(url, client, referer)
+    if resp is None or len(resp.content) > MAX_BYTES:
         return None
-    content = resp.content
-    if not content or len(content) > MAX_BYTES:
-        return None
-    kind = sniff_kind(content)
+    kind = sniff_kind(resp.content)
     if not kind:
         return None
-    return {"name": _filename(resp, kind), "content": content, "kind": kind, "url": str(resp.url)}
+    return {"name": _filename(resp, kind), "content": resp.content, "kind": kind, "url": resp.url}
 
 
 async def download_direct(url: str) -> dict | None:
@@ -150,7 +179,7 @@ async def discover_page_files(url: str, limit: int = 5) -> list[dict]:
     files: list[dict] = []
     async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=HEADERS) as client:
         for _, link in scored[:limit * 2]:
-            got = await _fetch(client, google_export_url(link) or link)
+            got = await _fetch(client, google_export_url(link) or link, referer=url)
             if got:
                 files.append(got)
             if len(files) >= limit:

@@ -162,7 +162,14 @@ async def _fetch_and_extract(client: httpx.AsyncClient, file_url: str) -> tuple[
         resp.raise_for_status()
         content = resp.content
     except Exception:
-        return "", b""
+        # Часть сайтов (за Cloudflare) отдаёт 403 любому Python-клиенту по TLS-
+        # отпечатку — пробуем скачать с отпечатком Chrome (см. donor_files.fetch_bytes).
+        from donor_files import fetch_bytes
+
+        got = await fetch_bytes(file_url)
+        if got is None:
+            return "", b""
+        content = got.content
 
     lower = file_url.lower()
     try:

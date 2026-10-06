@@ -219,16 +219,19 @@ def budget_cofunding_keyboard(min_pct: float | None) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def budget_export_keyboard(templates: list | None = None) -> InlineKeyboardMarkup:
-    """Экспорт готового бюджета: текст, вписать в найденные файлы донора, прислать свой."""
+def budget_export_keyboard(templates: list | None = None, compact: bool = False) -> InlineKeyboardMarkup:
+    """Экспорт готового бюджета. compact=True — меню ПОСЛЕ выдачи файла: только
+    «Заполнить заявку» и «Внести правки» (остальное уже не нужно)."""
     icons = {"xlsx": "📊", "docx": "📝", "pdf": "📄"}
     kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Показать бюджет текстом", callback_data="budget_export:text")
-    for i, t in enumerate((templates or [])[:3]):
-        name = t["name"] if len(t["name"]) <= 26 else t["name"][:23] + "..."
-        kb.button(text=f"{icons.get(t['kind'], '📎')} Вписать в «{name}»", callback_data=f"budget_export:fill:{i}")
-    kb.button(text="📄 Бюджет отдельным Word-документом", callback_data="budget_export:doc")
-    kb.button(text="📎 Прислать форму донора (Word/Excel/PDF)", callback_data="budget_export:upload")
+    if not compact:
+        kb.button(text="📋 Показать бюджет текстом", callback_data="budget_export:text")
+        for i, t in enumerate((templates or [])[:3]):
+            name = t["name"] if len(t["name"]) <= 26 else t["name"][:23] + "..."
+            kb.button(text=f"{icons.get(t['kind'], '📎')} Вписать в «{name}»", callback_data=f"budget_export:fill:{i}")
+        kb.button(text="📄 Бюджет отдельным Word-документом", callback_data="budget_export:doc")
+        kb.button(text="📎 Прислать форму донора (Word/Excel/PDF)", callback_data="budget_export:upload")
+    kb.button(text="📝 Заполнить заявку", callback_data="budget_export:application")
     kb.button(text="✏️ Внести правки", callback_data="budget_export:revise")
     kb.adjust(1)
     return kb.as_markup()
@@ -248,6 +251,14 @@ def budget_grant_options_keyboard(options: list) -> InlineKeyboardMarkup:
         label = o["label"] if len(o["label"]) <= 38 else o["label"][:35] + "..."
         kb.button(text=f"{label}{amount}", callback_data=f"budget_grant:{i}")
     kb.button(text="Другой вариант / пока не знаю", callback_data="budget_grant:other")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def budget_overlimit_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Скорректировать бюджет", callback_data="budget:hint_comment")
+    kb.button(text="✅ Оставить как есть", callback_data="budget:done_force")
     kb.adjust(1)
     return kb.as_markup()
 
