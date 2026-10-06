@@ -22,3 +22,26 @@ class ProjectFlow(StatesGroup):
     waiting_concept_revision = State()     # Шаг 6, ветка "нужны правки"
     final_version = State()                # Шаг 7
     waiting_final_revision = State()       # Шаг 7, ветка "версия #2"
+
+
+class BudgetStandaloneFlow(StatesGroup):
+    """Standalone бюджет (отдельно от основного flow проекта)"""
+    waiting_donor_info = State()           # Информация о доноре (ссылка/файл/текст)
+    confirm_admin_share = State()          # Подтверждение доли админ-расходов
+    ask_duration = State()                 # Срок проекта
+    ask_currency = State()                 # Валюта
+    ask_local_currency = State()           # Местная валюта, если бюджет в USD
+    ask_fx_rate = State()                  # Курс обмена (вручную или поиском)
+    waiting_xlsx_template = State()        # Пользователь присылает Excel-шаблон донора в конце
+    ask_budget_size = State()              # Размер гранта
+    choose_location = State()              # Столица или регион (для рекомендаций)
+    ask_admin_team = State()               # Состав команды админ-уровня
+    ask_admin_salaries = State()           # Зарплаты админ-персонала
+    ask_admin_overhead = State()           # Админ-расходы (офис, транспорт, комм)
+    ask_consultant_fees = State()          # Гонорары консультантов
+    ask_activities = State()               # Мероприятия
+    ask_publications = State()             # Публикации
+    ask_equipment = State()                # Оборудование
+    ask_contingency = State()              # Непредвиденные расходы
+    review_budget = State()                # Согласование финального бюджета
+    final_budget = State()                 # Готов к экспорту

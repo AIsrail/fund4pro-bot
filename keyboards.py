@@ -183,6 +183,59 @@ def budget_ready_keyboard() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def budget_location_keyboard() -> InlineKeyboardMarkup:
+    """Выбор локации (столица/регион) для рекомендаций по расходам."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📍 Столица (Бишкек/Алматы)", callback_data="budget_loc:capital")
+    kb.button(text="📍 Регион", callback_data="budget_loc:region")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def budget_skip_keyboard() -> InlineKeyboardMarkup:
+    """Пропустить текущий раздел бюджета (опционально)."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Продолжить (нет таких расходов)", callback_data="budget:skip")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def budget_export_keyboard(has_xlsx: bool = False) -> InlineKeyboardMarkup:
+    """Экспорт готового бюджета."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Показать бюджет текстом", callback_data="budget_export:text")
+    if has_xlsx:
+        kb.button(text="📊 Вписать в Excel-шаблон донора", callback_data="budget_export:xlsx")
+    else:
+        kb.button(text="📎 Прислать Excel-шаблон донора", callback_data="budget_export:upload")
+    kb.button(text="✏️ Внести правки", callback_data="budget_export:revise")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def _single_button(text: str, data: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=text, callback_data=data)
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def budget_donor_next_keyboard() -> InlineKeyboardMarkup:
+    return _single_button("➡️ Дальше", "budget:donor_next")
+
+
+def budget_admin_confirm_keyboard() -> InlineKeyboardMarkup:
+    return _single_button("✅ Верно", "budget:admin_ok")
+
+
+def budget_all_usd_keyboard() -> InlineKeyboardMarkup:
+    return _single_button("💵 Всё в долларах", "budget:fx_none")
+
+
+def budget_fx_keyboard() -> InlineKeyboardMarkup:
+    return _single_button("🔎 Найти курс самому", "budget:fx_search")
+
+
 def final_version_keyboard(full_version_count: int, limit_reached: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Финально, всё устраивает", callback_data="final:done")

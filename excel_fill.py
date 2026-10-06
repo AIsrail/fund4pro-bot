@@ -45,29 +45,21 @@ def extract_xlsx_structure(content: bytes) -> str:
     return "\n".join(lines)
 
 
+def fill_xlsx_template_report(content: bytes, cell_values: dict):
+    """Заполняет ТОЛЬКО указанные ячейки, правя XML листа внутри zip (см.
+    xlsx_patch.py) — остальной шаблон донора остаётся байт-в-байт. Возвращает
+    (файл, записанные, пропущенные[(ячейка, причина)], заменённые_примеры)."""
+    from xlsx_patch import fill_cells_preserving
+    return fill_cells_preserving(content, cell_values)
+
+
 def fill_xlsx_template(content: bytes, cell_values: dict) -> bytes:
-    """cell_values: {"Лист1": {"C7": "12000", ...}, ...}. Пишет значения
-    ТОЛЬКО в указанные ячейки поверх копии оригинального файла — формулы,
-    форматирование, остальные листы/ячейки не трогаются."""
-    wb = load_workbook(io.BytesIO(content), data_only=False)
-    for sheet_name, cells in cell_values.items():
-        if sheet_name not in wb.sheetnames:
-            # LLM могла ошибиться с именем листа — пробуем единственный лист
-            if len(wb.sheetnames) == 1:
-                sheet_name_actual = wb.sheetnames[0]
-            else:
-                continue
-        else:
-            sheet_name_actual = sheet_name
-        ws = wb[sheet_name_actual]
-        for coord, value in cells.items():
-            try:
-                ws[coord] = value
-            except Exception as exc:
-                logger.warning("failed to set cell %s!%s: %s", sheet_name_actual, coord, exc)
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+    """cell_values: {"Лист1": {"C7": "12000", ...}, ...}. Формулы, заголовки
+    донора, форматирование и остальные листы не трогаются."""
+    new, applied, skipped, _ = fill_xlsx_template_report(content, cell_values)
+    for cell, reason in skipped:
+        logger.info("fill_xlsx_template: skipped %s (%s)", cell, reason)
+    return new
 
 
 async def fill_donor_xlsx_template_v1(template_path: str, output_path: str, session: dict) -> tuple[bool, str]:
@@ -92,7 +84,8 @@ async def fill_donor_xlsx_template_v1(template_path: str, output_path: str, sess
         logger.info("fill_donor_xlsx_template_v1: no activities_and_budget yet, nothing to map")
         return False, ""
 
-    structure = extract_xlsx_structure(content)
+    from xlsx_patch import extract_xlsx_grid
+    structure = extract_xlsx_grid(content)
     if not structure.strip():
         logger.info("fill_donor_xlsx_template_v1: empty xlsx structure (no labelled cells) in %s", template_path)
         return False, ""
@@ -125,25 +118,35 @@ async def generate_budget_cell_mapping(structure_text: str, budget_text: str) ->
     from llm import call_claude
 
     system_prompt = (
-        "Перед тобой структура Excel-шаблона бюджета донора (координаты "
-        "непустых ячеек и их текст — это подписи полей/шапка таблицы) и "
-        "согласованный с пользователем бюджет проекта. Определи, в какие "
-        "именно ячейки нужно вписать суммы/цифры (обычно это пустые ячейки "
-        "рядом/под текстовыми подписями статей расходов), и верни СТРОГО "
-        "JSON без каких-либо пояснений в формате:\n"
-        '{"Название листа": {"C7": "12000", "C8": "5000"}}\n\n'
-        "Пиши в ячейки только числа/суммы (без валютных символов, если в "
-        "шаблоне уже есть колонка с валютой) — ориентируйся на формат "
-        "соседних заполненных ячеек, если такие есть. Если не уверен, в "
-        "какую именно ячейку что-то писать — не пиши, лучше пропустить "
-        "поле, чем испортить не ту ячейку. Не трогай ячейки, которые уже "
-        "содержат текст/формулы (Excel-формулы начинаются с '=')."
+        "Перед тобой сетка Excel-шаблона бюджета донора (по строкам, у каждой "
+        "ячейки адрес) и согласованный с пользователем бюджет. Условные знаки: "
+        "∅ — пустая ячейка (сюда можно писать), ▒ — внутри объединённой "
+        "ячейки (не трогать), '=...' — формула (не трогать, она посчитается "
+        "сама), текст в кавычках — заголовки/подписи донора (не менять). "
+        "Задача: распиши бюджет ПО СТРОКАМ шаблона. Найди таблицу статей "
+        "расходов, определи по шапке смысл колонок (название статьи, "
+        "количество, ставка, период, итог и т.п.) и впиши данные в пустые "
+        "ячейки подряд, по одной статье бюджета на строку. Если в строке-"
+        "образце уже стоят примерные числа или подсказки вроде «укажите…» — "
+        "их МОЖНО заменить своими значениями. Итоги, которые считает формула, "
+        "не пиши — пиши только исходные данные (ставки, количества, периоды). "
+        "Если строк в шаблоне меньше, чем статей бюджета — объедини "
+        "мелкие статьи, но не выходи за пределы таблицы и не дублируй "
+        "формулы. Числа — без валютных символов и пробелов, десятичная точка. "
+        "Не придумывай статьи и суммы: пиши только то, что есть в согласованном "
+        "бюджете; строки и разделы шаблона, которым нет соответствия в бюджете "
+        "(например «льготы и налоги», если их там нет), оставь пустыми. Подбирай "
+        "значения так, чтобы формула строки из шаблона (она видна в соседней "
+        "ячейке) давала именно сумму статьи из бюджета. "
+        "Не уверен в ячейке — пропусти её, лучше недозаполнить, чем испортить. "
+        "Верни СТРОГО JSON без пояснений: "
+        '{"Название листа": {"C8": "Руководитель проекта", "E8": 30000}}'
     )
     try:
         raw = await call_claude(
             system_prompt,
             f"Структура шаблона:\n{structure_text}\n\nСогласованный бюджет:\n{budget_text}",
-            max_tokens=2000,
+            max_tokens=4000,
         )
     except Exception as exc:
         logger.warning("generate_budget_cell_mapping failed: %s: %s", type(exc).__name__, exc)

@@ -110,6 +110,7 @@ def start_keyboard():
         kb.button(text="📋 Разработать проект", callback_data="agentflow:grant")
     if config.BIZPLAN_FLOW_ENABLED:
         kb.button(text="💼 Разработать бизнес-план", callback_data="agentflow:bizplan")
+    kb.button(text="📊 Составить бюджет отдельно", callback_data="agentflow:budget_standalone")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -424,6 +425,12 @@ async def resume_after_file_export_payment(message: Message, state: FSMContext) 
     from agent_docgen import build_final_document, export_docx
 
     data = await state.get_data()
+    if data.get("_pending_budget_export"):
+        from handlers.budget_standalone import deliver_budget_xlsx
+
+        await state.update_data(_pending_budget_export=False)
+        await deliver_budget_xlsx(message, state)
+        return
     pending = data.get("_pending_file_export")
     await state.update_data(_pending_file_export=None)
     if not pending:
