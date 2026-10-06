@@ -425,11 +425,12 @@ async def resume_after_file_export_payment(message: Message, state: FSMContext) 
     from agent_docgen import build_final_document, export_docx
 
     data = await state.get_data()
-    if data.get("_pending_budget_export"):
-        from handlers.budget_standalone import deliver_budget_xlsx
+    pending_budget = data.get("_pending_budget_export")
+    if pending_budget:
+        from handlers.budget_standalone import deliver_budget_template
 
-        await state.update_data(_pending_budget_export=False)
-        await deliver_budget_xlsx(message, state)
+        await state.update_data(_pending_budget_export=None)
+        await deliver_budget_template(message, state, pending_budget.get("idx", 0))
         return
     pending = data.get("_pending_file_export")
     await state.update_data(_pending_file_export=None)

@@ -200,14 +200,15 @@ def budget_skip_keyboard() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def budget_export_keyboard(has_xlsx: bool = False) -> InlineKeyboardMarkup:
-    """Экспорт готового бюджета."""
+def budget_export_keyboard(templates: list | None = None) -> InlineKeyboardMarkup:
+    """Экспорт готового бюджета: текст, вписать в найденные файлы донора, прислать свой."""
+    icons = {"xlsx": "📊", "docx": "📝", "pdf": "📄"}
     kb = InlineKeyboardBuilder()
     kb.button(text="📋 Показать бюджет текстом", callback_data="budget_export:text")
-    if has_xlsx:
-        kb.button(text="📊 Вписать в Excel-шаблон донора", callback_data="budget_export:xlsx")
-    else:
-        kb.button(text="📎 Прислать Excel-шаблон донора", callback_data="budget_export:upload")
+    for i, t in enumerate((templates or [])[:3]):
+        name = t["name"] if len(t["name"]) <= 26 else t["name"][:23] + "..."
+        kb.button(text=f"{icons.get(t['kind'], '📎')} Вписать в «{name}»", callback_data=f"budget_export:fill:{i}")
+    kb.button(text="📎 Прислать форму донора (Word/Excel/PDF)", callback_data="budget_export:upload")
     kb.button(text="✏️ Внести правки", callback_data="budget_export:revise")
     kb.adjust(1)
     return kb.as_markup()
@@ -216,6 +217,17 @@ def budget_export_keyboard(has_xlsx: bool = False) -> InlineKeyboardMarkup:
 def _single_button(text: str, data: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=text, callback_data=data)
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def budget_grant_options_keyboard(options: list) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for i, o in enumerate(options[:6]):
+        amount = f" — до {o['max_grant']:g}" if o.get("max_grant") else ""
+        label = o["label"] if len(o["label"]) <= 38 else o["label"][:35] + "..."
+        kb.button(text=f"{label}{amount}", callback_data=f"budget_grant:{i}")
+    kb.button(text="Другой вариант / пока не знаю", callback_data="budget_grant:other")
     kb.adjust(1)
     return kb.as_markup()
 

@@ -3,7 +3,6 @@
 таблица внутри Word-заявки). Источники — страница донора, найденные на ней
 файлы и всё, что прислал пользователь."""
 
-import io
 import json
 import logging
 import re
@@ -13,52 +12,8 @@ logger = logging.getLogger("fund4pro.budget_donor")
 URL_RE = re.compile(r"https?://[^\s<>\"')]+", re.IGNORECASE)
 MAX_CONTEXT_CHARS = 16000
 
-_BUDGET_WORDS = re.compile(
-    r"бюджет|budget|смет|расход|затрат|стоимост|cost|expens|amount|сумм", re.IGNORECASE)
-
-
 def extract_urls(text: str) -> list[str]:
     return [u.rstrip(".,;") for u in URL_RE.findall(text or "")]
-
-
-def find_budget_docx_tables(content: bytes, max_chars: int = 3000) -> str:
-    """Текст таблиц Word-заявки, похожих на бюджетные (по ключевым словам в
-    шапке/ячейках и наличию чисел). У небольших доноров бюджет обычно
-    внутри заявки — это структура статей, которую нужно повторить."""
-    import docx
-
-    try:
-        document = docx.Document(io.BytesIO(content))
-    except Exception:
-        return ""
-    chunks = []
-    for table in document.tables:
-        rows = []
-        for row in table.rows:
-            seen, cells = set(), []
-            for cell in row.cells:
-                if id(cell._tc) in seen:
-                    continue
-                seen.add(id(cell._tc))
-                cells.append(cell.text.strip().replace("\n", " ")[:60])
-            rows.append(" | ".join(cells))
-        text = "\n".join(rows)
-        header = " ".join(rows[:2])
-        if _BUDGET_WORDS.search(header) or (_BUDGET_WORDS.search(text) and re.search(r"\d{3,}", text)):
-            chunks.append(text)
-    return "\n\n".join(chunks)[:max_chars]
-
-
-def pick_budget_xlsx(forms: list[dict]) -> dict | None:
-    """Из найденных на странице файлов — Excel-шаблон бюджета (предпочитаем
-    тот, где в имени/тексте есть слово «бюджет/budget»)."""
-    xlsx = [f for f in forms if (f.get("filename") or "").lower().endswith(".xlsx") and f.get("content")]
-    if not xlsx:
-        return None
-    for f in xlsx:
-        if _BUDGET_WORDS.search(f["filename"] + " " + (f.get("text") or "")[:500]):
-            return f
-    return xlsx[0]
 
 
 async def analyze_donor_for_budget(context: str) -> dict:
@@ -75,7 +30,15 @@ async def analyze_donor_for_budget(context: str) -> dict:
         '{"admin_share_pct": число или null (максимальная допустимая доля '
         'административных / накладных / косвенных расходов в процентах),'
         ' "admin_share_quote": "короткая дословная цитата-основание" или "",'
-        ' "max_grant": число или null, "currency": "код валюты гранта" или null,'
+        ' "max_grant": число или null (если вариант гранта ОДИН),'
+        ' "grant_options": [{"label": "название варианта своими словами, как у донора '
+        '(например «проекты в одной стране»)", "max_grant": число или null, '
+        '"admin_share_pct": число или null (только если для этого варианта указана своя доля)}] — '
+        'заполняй ТОЛЬКО если донор явно предлагает несколько вариантов/категорий с разными '
+        'суммами или условиями (по одной стране и межстрановые, малые и крупные гранты, '
+        'этапы); перечисли ВСЕ явно названные варианты со своими суммами, не выбирай за '
+        'пользователя; если вариант один — пустой список [],'
+        ' "currency": "код валюты гранта" или null,'
         ' "contingency": "allowed" | "forbidden" | "unknown" (непредвиденные '
         'расходы / резерв),'
         ' "ineligible_costs": "кратко: какие расходы донор не финансирует" или "",'
@@ -83,7 +46,7 @@ async def analyze_donor_for_budget(context: str) -> dict:
         'софинансирование, налоги, сроки трат)" или ""}'
     )
     try:
-        raw = await call_claude(system_prompt, context[:MAX_CONTEXT_CHARS], max_tokens=900)
+        raw = await call_claude(system_prompt, context[:MAX_CONTEXT_CHARS], max_tokens=1200)
         start, end = raw.find("{"), raw.rfind("}")
         data = json.loads(raw[start:end + 1])
     except Exception as exc:
@@ -100,7 +63,17 @@ async def analyze_donor_for_budget(context: str) -> dict:
     share = _num(data.get("admin_share_pct"))
     if share is not None and share > 100:
         share = None
+    options = []
+    for o in (data.get("grant_options") or []) if isinstance(data.get("grant_options"), list) else []:
+        if isinstance(o, dict) and str(o.get("label") or "").strip():
+            pct = _num(o.get("admin_share_pct"))
+            options.append({
+                "label": str(o["label"]).strip()[:90],
+                "max_grant": _num(o.get("max_grant")),
+                "admin_share_pct": pct if pct is not None and pct <= 100 else None,
+            })
     return {
+        "grant_options": options[:6],
         "admin_share_pct": share,
         "admin_share_quote": str(data.get("admin_share_quote") or "")[:300],
         "max_grant": _num(data.get("max_grant")),

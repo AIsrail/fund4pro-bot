@@ -27,6 +27,7 @@ class ProjectFlow(StatesGroup):
 class BudgetStandaloneFlow(StatesGroup):
     """Standalone бюджет (отдельно от основного flow проекта)"""
     waiting_donor_info = State()           # Информация о доноре (ссылка/файл/текст)
+    choose_grant_option = State()          # Донор предлагает несколько вариантов гранта — какой выбрать
     confirm_admin_share = State()          # Подтверждение доли админ-расходов
     ask_duration = State()                 # Срок проекта
     ask_currency = State()                 # Валюта

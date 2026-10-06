@@ -23,13 +23,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 import billing
-from budget_donor import (
-    analyze_donor_for_budget,
-    extract_urls,
-    find_budget_docx_tables,
-    pick_budget_xlsx,
-)
+import docx_budget_fill
+import pdf_budget_fill
+from budget_donor import analyze_donor_for_budget, extract_urls
 from budget_guidelines import BUDGET_DEFAULTS, get_admin_share_recommendation
+from donor_files import discover_page_files, download_direct, sniff_kind
 from fx import get_usd_rate, normalize_currency
 from keyboards import (
     budget_admin_confirm_keyboard,
@@ -37,6 +35,7 @@ from keyboards import (
     budget_donor_next_keyboard,
     budget_export_keyboard,
     budget_fx_keyboard,
+    budget_grant_options_keyboard,
     budget_location_keyboard,
     budget_ready_keyboard,
     budget_skip_keyboard,
@@ -208,27 +207,81 @@ async def start_budget_standalone(callback: CallbackQuery, state: FSMContext):
     )
 
 
-def _summary_of_donor(d: dict, urls_total: int, page_ok: bool, names: list[str]) -> str:
+KIND_LABEL = {"xlsx": "📊 Excel", "docx": "📝 Word", "pdf": "📄 PDF"}
+MAX_TEMPLATES = 4
+_KIND_PRIORITY = {"xlsx": 1, "docx": 2, "pdf": 3}
+
+
+def _register_template(templates: list[dict], name: str, content: bytes, kind: str, lenient: bool = False) -> str | None:
+    """Добавляет файл в список шаблонов, если в него можно вписать бюджет.
+    Возвращает пояснение, почему файл не подошёл (или None)."""
+    if kind == "legacy":
+        return f"{name}: старый формат .doc/.xls я не читаю — пересохраните в .docx / .xlsx и пришлите снова"
+    entry = {"name": name, "kind": kind, "b64": base64.b64encode(content).decode("ascii"), "prio": _KIND_PRIORITY.get(kind, 9)}
+    if kind == "xlsx":
+        if re.search(r"бюджет|budget", name, re.IGNORECASE):
+            entry["prio"] = 0
+    elif kind == "docx":
+        if not docx_budget_fill.find_budget_tables(content, lenient=lenient):
+            return f"{name}: таблицу бюджета в этом Word-файле не нашёл"
+    elif kind == "pdf":
+        if not pdf_budget_fill.extract_pdf_form_schema(content):
+            return f"{name}: PDF без заполняемых полей (скан или плоский) — вписать в него автоматически не смогу"
+    else:
+        return None
+    templates[:] = [t for t in templates if t["name"] != name] + [entry]
+    templates.sort(key=lambda t: t["prio"])
+    del templates[MAX_TEMPLATES:]
+    return None
+
+
+def _file_text(kind: str, content: bytes, ready_text: str = "") -> str:
+    if ready_text:
+        return ready_text
+    import document_reader as dr
+
+    try:
+        if kind == "docx":
+            return dr._extract_docx(content)
+        if kind == "xlsx":
+            return dr._extract_xlsx(content)
+        if kind == "pdf":
+            return dr._extract_pdf(content)
+    except Exception:
+        logger.warning("text extraction failed for %s file", kind, exc_info=True)
+    return ""
+
+
+def _summary_of_donor(d: dict, urls_total: int, page_ok: bool, names: list[str], notes: list[str]) -> str:
     a = d.get("donor_analysis") or {}
+    templates = d.get("donor_templates") or []
     lines = ["✅ Принял."]
     if urls_total:
         lines.append(
             "Страницу донора прочитал." if page_ok else
-            "⚠️ Страницу открыть не получилось (защита от ботов или пустой ответ) — "
-            "вставьте сюда нужный текст или пришлите файл."
+            "⚠️ Страницу открыть не получилось (защита от ботов или пустой ответ)."
         )
     if names:
-        lines.append("Нашёл файлы: " + ", ".join(names[:6]))
-    if d.get("donor_xlsx_b64"):
+        lines.append("Скачал файлы: " + ", ".join(names[:8]))
+    elif urls_total:
         lines.append(
-            f"📊 Excel-шаблон бюджета: {d.get('donor_xlsx_name')} — в конце впишу бюджет "
-            "именно в него: шаблон не меняю, заполняю только пустые ячейки."
+            "⚠️ Файлов формы на странице найти не удалось. Пришлите форму сюда сообщением "
+            "(Word, Excel или PDF), либо прямую ссылку на файл или на Google Docs."
         )
-    elif d.get("donor_budget_table"):
+    for t in templates:
+        what = {
+            "xlsx": "Excel-шаблон бюджета",
+            "docx": "Word-заявка, нашёл в ней таблицу бюджета",
+            "pdf": "PDF-форма с заполняемыми полями",
+        }[t["kind"]]
+        lines.append(f"{KIND_LABEL[t['kind']]}: {t['name']} — {what}.")
+    if templates:
         lines.append(
-            "Нашёл таблицу бюджета внутри заявки (Word) — повторю её статьи. Сам Word-файл "
-            "я пока не заполняю: бюджет пришлю текстом по структуре этой таблицы."
+            "В конце впишу бюджет прямо в файл донора: заполняю только пустые ячейки/поля, "
+            "заголовки и остальной текст не меняю."
         )
+    for n in notes:
+        lines.append(f"⚠️ {n}.")
     if a.get("admin_share_pct") is not None:
         lines.append(f"Админ-расходы по донору: не более {a['admin_share_pct']:g}%.")
     if a.get("contingency") == "forbidden":
@@ -237,9 +290,12 @@ def _summary_of_donor(d: dict, urls_total: int, page_ok: bool, names: list[str])
         lines.append("Непредвиденные расходы донор допускает.")
     if a.get("ineligible_costs"):
         lines.append(f"Не финансируется: {a['ineligible_costs']}")
-    if a.get("currency") or a.get("max_grant"):
+    if len(a.get("grant_options") or []) >= 2:
+        lines.append("Варианты гранта: " + "; ".join(
+            o["label"] + (f" — до {o['max_grant']:g}" if o.get("max_grant") else "") for o in a["grant_options"]) + ".")
+    if a.get("currency") or (a.get("max_grant") and len(a.get("grant_options") or []) < 2):
         bits = []
-        if a.get("max_grant"):
+        if a.get("max_grant") and len(a.get("grant_options") or []) < 2:
             bits.append(f"грант до {a['max_grant']:g}")
         if a.get("currency"):
             bits.append(f"валюта {a['currency']}")
@@ -258,45 +314,67 @@ async def _refresh_analysis(state: FSMContext) -> None:
     await state.update_data(donor_analysis=found)
 
 
-async def _ingest_donor_text(message: Message, state: FSMContext, text: str) -> None:
+async def _collect_files(url: str) -> tuple[str, list[dict]]:
+    """(текст страницы, [{name, content, kind, text}]) — прямая ссылка на файл,
+    Google Docs/Drive, форма на странице (в том числе без расширения в ссылке)."""
     from donor_scrape import try_scrape_donor_forms
 
+    direct = await download_direct(url)
+    if direct:
+        return "", [direct]
+    try:
+        forms, page_text = await try_scrape_donor_forms(url)
+    except Exception:
+        logger.warning("try_scrape_donor_forms failed for %s", url, exc_info=True)
+        forms, page_text = [], ""
+    files = []
+    for f in forms:
+        content = f.get("content") or b""
+        kind = sniff_kind(content) if content else None
+        if kind:
+            files.append({"name": f.get("filename") or "donor_form", "content": content, "kind": kind, "text": f.get("text", "")})
+    if not any(f["kind"] in ("docx", "xlsx", "pdf") for f in files):
+        try:
+            files += await discover_page_files(url)
+        except Exception:
+            logger.warning("discover_page_files failed for %s", url, exc_info=True)
+    return page_text, files
+
+
+async def _ingest_donor_text(message: Message, state: FSMContext, text: str) -> None:
     data = await state.get_data()
     context = data.get("donor_context", "") + f"\n\n[Сообщение пользователя]\n{text}"
-    updates: dict = {}
+    templates: list[dict] = list(data.get("donor_templates") or [])
     urls = extract_urls(text)
     names: list[str] = []
+    notes: list[str] = []
     page_ok = False
 
-    async with show_working(message, "🔎 Читаю материалы донора и ищу бюджетные требования..."):
+    async with show_working(message, "🔎 Открываю ссылку, скачиваю формы и ищу бюджетные требования..."):
         for url in urls[:2]:
-            try:
-                forms, page_text = await try_scrape_donor_forms(url)
-            except Exception:
-                logger.warning("try_scrape_donor_forms failed for %s", url, exc_info=True)
-                forms, page_text = [], ""
+            page_text, files = await _collect_files(url)
             if page_text:
                 page_ok = True
                 context += f"\n\n[Страница {url}]\n{page_text[:7000]}"
-            for f in forms:
-                names.append(f.get("filename", "?"))
-                if f.get("text"):
-                    context += f"\n\n[Файл донора: {f.get('filename')}]\n{f['text'][:4000]}"
-                fn = (f.get("filename") or "").lower()
-                if fn.endswith(".docx") and f.get("content") and not data.get("donor_budget_table"):
-                    table = find_budget_docx_tables(f["content"])
-                    if table:
-                        updates["donor_budget_table"] = table
-            xlsx = pick_budget_xlsx(forms)
-            if xlsx:
-                updates["donor_xlsx_b64"] = base64.b64encode(xlsx["content"]).decode("ascii")
-                updates["donor_xlsx_name"] = xlsx["filename"]
-        await state.update_data(donor_context=context[:MAX_DONOR_CONTEXT], **updates)
+            seen_hashes = set()
+            for f in files:
+                key = hash(f["content"])
+                if key in seen_hashes:
+                    continue
+                seen_hashes.add(key)
+                names.append(f["name"])
+                body = _file_text(f["kind"], f["content"], f.get("text", ""))
+                if body:
+                    context += f"\n\n[Файл донора: {f['name']}]\n{body[:4000]}"
+                note = _register_template(templates, f["name"], f["content"], f["kind"])
+                if note:
+                    notes.append(note)
+        await state.update_data(donor_context=context[:MAX_DONOR_CONTEXT], donor_templates=templates)
         await _refresh_analysis(state)
 
     data = await state.get_data()
     await message.answer(
-        _summary_of_donor(data, len(urls), page_ok, names),
+        _summary_of_donor(data, len(urls), page_ok, names, notes),
         reply_markup=budget_donor_next_keyboard(),
     )
 
@@ -321,50 +399,34 @@ async def _download_document(message: Message, document) -> bytes | None:
 
 @router.message(StateFilter(S.waiting_donor_info), F.document)
 async def donor_info_file(message: Message, state: FSMContext):
-    import document_reader as dr
-
     name = message.document.file_name or "file"
-    lower = name.lower()
-    if lower.endswith((".doc", ".xls", ".ppt")):
-        await message.answer("Старый формат Office я не читаю. Пересохраните в .docx / .xlsx / .pdf и пришлите снова.")
-        return
-    if not lower.endswith((".xlsx", ".docx", ".pdf")):
-        await message.answer("Принимаю .xlsx, .docx и .pdf. Или вставьте текст сообщением.")
-        return
     content = await _download_document(message, message.document)
     if content is None:
         return
-
-    updates: dict = {}
-    text = ""
-    try:
-        if lower.endswith(".xlsx"):
-            text = dr._extract_xlsx(content)
-            updates["donor_xlsx_b64"] = base64.b64encode(content).decode("ascii")
-            updates["donor_xlsx_name"] = name
-        elif lower.endswith(".docx"):
-            text = dr._extract_docx(content)
-            table = find_budget_docx_tables(content)
-            if table:
-                updates["donor_budget_table"] = table
-        else:
-            text = dr._extract_pdf(content)
-    except Exception:
-        logger.warning("donor file extraction failed for %s", name, exc_info=True)
-    if not text.strip() and "donor_xlsx_b64" not in updates:
-        await message.answer(
-            "Не получилось прочитать текст из файла (возможно, это скан). "
-            "Вставьте нужный текст сообщением."
-        )
+    kind = sniff_kind(content)
+    if kind not in ("docx", "xlsx", "pdf", "legacy"):
+        await message.answer("Принимаю Word (.docx), Excel (.xlsx) и PDF. Или вставьте текст сообщением.")
         return
 
+    templates: list[dict] = list((await state.get_data()).get("donor_templates") or [])
+    note = _register_template(templates, name, content, kind)
+    text = _file_text(kind, content) if kind != "legacy" else ""
+    if not text.strip() and not (kind == "xlsx" or any(t["name"] == name for t in templates)):
+        await message.answer(
+            (note + ". " if note else "") +
+            "Текст из файла прочитать не получилось (возможно, это скан). Вставьте нужный текст сообщением."
+        )
+        return
     data = await state.get_data()
-    context = data.get("donor_context", "") + f"\n\n[Файл пользователя: {name}]\n{text[:6000]}"
-    await state.update_data(donor_context=context[:MAX_DONOR_CONTEXT], **updates)
+    context = data.get("donor_context", "") + (f"\n\n[Файл пользователя: {name}]\n{text[:6000]}" if text else "")
+    await state.update_data(donor_context=context[:MAX_DONOR_CONTEXT], donor_templates=templates)
     async with show_working(message, "🔎 Читаю файл и ищу бюджетные требования..."):
         await _refresh_analysis(state)
     data = await state.get_data()
-    await message.answer(_summary_of_donor(data, 0, False, [name]), reply_markup=budget_donor_next_keyboard())
+    await message.answer(
+        _summary_of_donor(data, 0, False, [name], [note] if note else []),
+        reply_markup=budget_donor_next_keyboard(),
+    )
 
 
 @router.message(StateFilter(S.waiting_donor_info), TEXT)
@@ -388,6 +450,58 @@ async def donor_next(callback: CallbackQuery, state: FSMContext):
 # ============================================================================
 
 async def _go_admin_share(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    options = (data.get("donor_analysis") or {}).get("grant_options") or []
+    if len(options) >= 2 and not data.get("grant_option_done"):
+        await _ask_grant_option(message, state, options)
+        return
+    await _ask_admin_share(message, state)
+
+
+async def _ask_grant_option(message: Message, state: FSMContext, options: list[dict]) -> None:
+    await state.set_state(S.choose_grant_option)
+    lines = []
+    for o in options:
+        amount = f" — до {o['max_grant']:g}" if o.get("max_grant") else ""
+        lines.append(f"• {o['label']}{amount}")
+    await message.answer(
+        "Донор предлагает несколько вариантов гранта:\n" + "\n".join(lines) +
+        "\n\nНа какой вариант готовим бюджет? Нажмите кнопку (или напишите свой вариант).",
+        reply_markup=budget_grant_options_keyboard(options),
+    )
+
+
+async def _apply_grant_option(message: Message, state: FSMContext, chosen: dict | None, custom: str = "") -> None:
+    data = await state.get_data()
+    analysis = dict(data.get("donor_analysis") or {})
+    if chosen:
+        if chosen.get("max_grant"):
+            analysis["max_grant"] = chosen["max_grant"]
+        if chosen.get("admin_share_pct") is not None:
+            analysis["admin_share_pct"] = chosen["admin_share_pct"]
+        label = chosen["label"]
+    else:
+        analysis["max_grant"] = None
+        label = custom or "вариант не выбран"
+    await state.update_data(donor_analysis=analysis, chosen_grant_option=label, grant_option_done=True)
+    await _ask_admin_share(message, state)
+
+
+@router.callback_query(StateFilter(S.choose_grant_option), F.data.startswith("budget_grant:"))
+async def grant_option_chosen(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    key = callback.data.split(":", 1)[1]
+    options = ((await state.get_data()).get("donor_analysis") or {}).get("grant_options") or []
+    chosen = options[int(key)] if key.isdigit() and int(key) < len(options) else None
+    await _apply_grant_option(callback.message, state, chosen)
+
+
+@router.message(StateFilter(S.choose_grant_option), TEXT)
+async def grant_option_typed(message: Message, state: FSMContext):
+    await _apply_grant_option(message, state, None, custom=message.text.strip()[:120])
+
+
+async def _ask_admin_share(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     analysis = data.get("donor_analysis") or {}
     share = analysis.get("admin_share_pct")
@@ -547,6 +661,12 @@ async def receive_budget_size(message: Message, state: FSMContext):
         return
     await state.update_data(budget_size=size)
     data = await state.get_data()
+    max_grant = (data.get("donor_analysis") or {}).get("max_grant")
+    if max_grant and data.get("currency") == (data.get("donor_analysis") or {}).get("currency", data.get("currency")) and size > max_grant:
+        await message.answer(
+            f"⚠️ По документам донора для выбранного варианта максимум {max_grant:g}. "
+            "Продолжаю с вашей суммой — проверьте её перед подачей."
+        )
     admin_share = data.get("donor_admin_share")
     if admin_share is None:
         # Пороги заданы в долларах — пересчитываем сумму в USD, если курс известен.
@@ -669,20 +789,26 @@ def _build_brief(d: dict) -> str:
         donor_bits.append(f"Расходы, которые донор НЕ финансирует: {analysis['ineligible_costs']}")
     if analysis.get("budget_notes"):
         donor_bits.append(f"Прочие бюджетные требования донора: {analysis['budget_notes']}")
-    if d.get("donor_budget_table"):
-        donor_bits.append(
-            "Таблица бюджета из заявки донора — повтори её структуру и названия статей:\n" + d["donor_budget_table"]
-        )
-    if d.get("donor_xlsx_b64"):
+    templates = d.get("donor_templates") or []
+    if templates:
+        t = templates[0]
         try:
-            from xlsx_patch import extract_xlsx_grid
-            grid = extract_xlsx_grid(base64.b64decode(d["donor_xlsx_b64"]), max_chars=5000)
+            raw = base64.b64decode(t["b64"])
+            if t["kind"] == "xlsx":
+                from xlsx_patch import extract_xlsx_grid
+                structure = extract_xlsx_grid(raw, max_chars=5000)
+            elif t["kind"] == "docx":
+                idx = docx_budget_fill.find_budget_tables(raw, lenient=True)
+                structure = docx_budget_fill.render_tables(raw, idx)[:5000]
+            else:
+                structure = pdf_budget_fill.describe_fields(pdf_budget_fill.extract_pdf_form_schema(raw))[:4000]
             donor_bits.append(
-                "Бюджет будет вписан в Excel-шаблон донора — строй статьи так, чтобы они ложились в его "
-                "колонки (название, количество, ставка, период…). Структура шаблона:\n" + grid
+                f"Бюджет будет вписан в файл донора «{t['name']}» ({t['kind']}) — строй статьи так, чтобы они "
+                "ложились в его строки/колонки (название, количество, ставка, период, сумма…) и повторяли "
+                "названия статей донора. Структура файла:\n" + structure
             )
         except Exception:
-            logger.warning("could not render donor xlsx grid for brief", exc_info=True)
+            logger.warning("could not render donor template structure for brief", exc_info=True)
     donor_block = ("\n\n" + "\n\n".join(donor_bits)) if donor_bits else ""
 
     return (
@@ -691,6 +817,7 @@ def _build_brief(d: dict) -> str:
         f"Срок проекта: {d.get('project_duration', na)}\n"
         f"{money}\n"
         f"Сумма гранта: {size:g} {cur}\n"
+        f"Вариант гранта, на который подаёмся: {d.get('chosen_grant_option') or 'единственный / не уточнялся'}\n"
         f"Максимальная доля админ-расходов: {admin_share}% ({share_src}) — не превышай её.\n"
         f"Локация: {where}\n\n"
         f"Команда: {d.get('admin_team') or na}\n"
@@ -770,7 +897,7 @@ async def budget_hint_comment(callback: CallbackQuery, state: FSMContext):
 
 async def _show_export_menu(message: Message, state: FSMContext, text: str) -> None:
     data = await state.get_data()
-    await message.answer(text, reply_markup=budget_export_keyboard(has_xlsx=bool(data.get("donor_xlsx_b64"))))
+    await message.answer(text, reply_markup=budget_export_keyboard(data.get("donor_templates") or []))
 
 
 @router.callback_query(StateFilter(S.review_budget), F.data == "budget:done")
@@ -803,55 +930,130 @@ async def revise_final_budget(callback: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(StateFilter(S.final_budget), F.data == "budget_export:upload")
-async def ask_xlsx_template(callback: CallbackQuery, state: FSMContext):
+async def ask_template_upload(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(S.waiting_xlsx_template)
     await callback.message.answer(
-        "Пришлите Excel-шаблон бюджета донора (.xlsx). Я впишу бюджет только в пустые "
-        "ячейки, остальное в шаблоне не трону. Передумали — напишите «отмена»."
+        "Пришлите форму донора с бюджетом: Excel (.xlsx), Word (.docx) или PDF с заполняемыми полями. "
+        "Я впишу бюджет только в пустые ячейки/поля, остальное не трону. "
+        "Передумали — напишите «отмена»."
     )
 
 
-@router.message(StateFilter(S.waiting_xlsx_template), F.document)
-async def receive_xlsx_template(message: Message, state: FSMContext):
-    name = message.document.file_name or "template.xlsx"
-    if not name.lower().endswith(".xlsx"):
-        await message.answer("Нужен файл .xlsx. Если у вас .xls — пересохраните в .xlsx и пришлите снова.")
-        return
+@router.message(StateFilter(S.waiting_xlsx_template, S.final_budget), F.document)
+async def receive_template_file(message: Message, state: FSMContext):
+    name = message.document.file_name or "template"
     content = await _download_document(message, message.document)
     if content is None:
         return
-    await state.update_data(donor_xlsx_b64=base64.b64encode(content).decode("ascii"), donor_xlsx_name=name)
+    kind = sniff_kind(content)
+    if kind not in ("docx", "xlsx", "pdf", "legacy"):
+        await message.answer("Нужен Word (.docx), Excel (.xlsx) или PDF. Пришлите другой файл или напишите «отмена».")
+        return
+    templates: list[dict] = list((await state.get_data()).get("donor_templates") or [])
+    note = _register_template(templates, name, content, kind, lenient=True)
+    idx = next((i for i, t in enumerate(templates) if t["name"] == name), None)
+    if idx is None:
+        await message.answer(f"⚠️ {note or 'Файл не подошёл'}. Пришлите другой файл или напишите «отмена».")
+        return
+    await state.update_data(donor_templates=templates)
     await state.set_state(S.final_budget)
-    await deliver_budget_xlsx(message, state)
+    await deliver_budget_template(message, state, idx)
 
 
 @router.message(StateFilter(S.waiting_xlsx_template), TEXT)
-async def cancel_xlsx_upload(message: Message, state: FSMContext):
+async def cancel_template_upload(message: Message, state: FSMContext):
     await state.set_state(S.final_budget)
     await _show_export_menu(message, state, "Хорошо. Что дальше?")
 
 
-@router.callback_query(StateFilter(S.final_budget), F.data == "budget_export:xlsx")
-async def export_xlsx(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(StateFilter(S.final_budget), F.data.startswith("budget_export:fill:"))
+async def export_into_template(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await deliver_budget_xlsx(callback.message, state)
+    await deliver_budget_template(callback.message, state, int(callback.data.rsplit(":", 1)[-1]))
 
 
-async def deliver_budget_xlsx(message: Message, state: FSMContext) -> None:
-    """Вписывает согласованный бюджет в Excel-шаблон донора и отправляет файл.
-    Платный ресурс file_export; вызывается и после оплаты (agent_router.
-    resume_after_file_export_payment)."""
+async def _fill_xlsx(content: bytes, budget_text: str) -> dict | None:
     from excel_fill import fill_xlsx_template_report, generate_budget_cell_mapping
     from xlsx_patch import extract_xlsx_grid
 
+    mapping = await generate_budget_cell_mapping(extract_xlsx_grid(content), budget_text)
+    if not mapping:
+        return None
+    filled, applied, skipped, replaced = fill_xlsx_template_report(content, mapping)
+    if not applied:
+        return None
+    refused = [c.split("!")[-1] for c, why in skipped if "формул" in why or "донора" in why or "объединён" in why]
+    caption = (
+        f"вписано ячеек — {len(applied)}. Шаблон не менялся: заполнены только пустые ячейки, формулы и "
+        "заголовки на месте, итоги пересчитаются при открытии в Excel."
+    )
+    if replaced:
+        caption += f"\nЗаменены примеры/подсказки шаблона: {', '.join(c.split('!')[-1] for c in replaced[:12])}."
+    if refused:
+        caption += f"\nНе трогал (формулы/заголовки/объединённые ячейки): {', '.join(refused[:8])}."
+    return {"bytes": filled, "caption": caption}
+
+
+async def _fill_docx(content: bytes, budget_text: str) -> dict | None:
+    indices = docx_budget_fill.find_budget_tables(content) or docx_budget_fill.find_budget_tables(content, lenient=True)
+    if not indices:
+        return None
+    mapping = await docx_budget_fill.map_budget_to_tables(docx_budget_fill.render_tables(content, indices), budget_text)
+    if not mapping:
+        return None
+    filled, applied, skipped, replaced, fixed = docx_budget_fill.fill_docx_budget(content, mapping)
+    if not applied:
+        return None
+    caption = (
+        f"вписано ячеек таблицы бюджета — {len(applied)}. Заголовки таблицы и весь остальной текст заявки "
+        "не менялись (другие разделы заявки в этом режиме не заполняются)."
+    )
+    if replaced:
+        caption += f"\nЗаменены подсказки шаблона: {', '.join(c.split('!')[-1] for c in replaced[:10])}."
+    if fixed:
+        caption += f"\nИтоги пересчитал по столбцам: {'; '.join(fixed[:4])}."
+    return {"bytes": filled, "caption": caption}
+
+
+async def _fill_pdf(content: bytes, budget_text: str) -> dict | None:
+    fields = pdf_budget_fill.extract_pdf_form_schema(content)
+    if not fields:
+        return None
+    answers = await pdf_budget_fill.map_budget_to_pdf_fields(fields, budget_text)
+    if not answers:
+        return None
+    filled, count, non_latin = pdf_budget_fill.fill_pdf_budget(content, fields, answers)
+    if not count:
+        return None
+    caption = f"заполнено полей формы — {count}. Остальные поля и страницы не менялись; итоги проверьте вручную."
+    if non_latin:
+        caption += "\n⚠️ В части полей кириллица — шрифт PDF-формы может её не отобразить."
+    return {"bytes": filled, "caption": caption}
+
+
+_FILLERS = {"xlsx": _fill_xlsx, "docx": _fill_docx, "pdf": _fill_pdf}
+_PROGRESS = {
+    "xlsx": "📊 Вписываю бюджет в Excel-шаблон донора...",
+    "docx": "📝 Вписываю бюджет в таблицу Word-заявки донора...",
+    "pdf": "📄 Заполняю бюджетные поля PDF-формы донора...",
+}
+
+
+async def deliver_budget_template(message: Message, state: FSMContext, idx: int | None = None) -> None:
+    """Вписывает согласованный бюджет в файл донора (Excel/Word/PDF) и отправляет
+    его. Платный ресурс file_export; вызывается и после оплаты (agent_router.
+    resume_after_file_export_payment; индекс тогда лежит в _pending_budget_export)."""
     chat_id = message.chat.id
     data = await state.get_data()
-    b64, name = data.get("donor_xlsx_b64"), data.get("donor_xlsx_name") or "budget.xlsx"
+    if idx is None:
+        idx = (data.get("_pending_budget_export") or {}).get("idx", 0)
+    templates = data.get("donor_templates") or []
     budget_text = data.get("budget_text", "")
-    if not b64 or not budget_text.strip():
+    if idx >= len(templates) or not budget_text.strip():
         await _show_export_menu(message, state, "Нет шаблона или готового бюджета — нечего заполнять.")
         return
+    tpl = templates[idx]
 
     allowed = True
     try:
@@ -861,45 +1063,32 @@ async def deliver_budget_xlsx(message: Message, state: FSMContext) -> None:
     if not allowed:
         import payments
 
-        await state.update_data(_pending_budget_export=True)
+        await state.update_data(_pending_budget_export={"idx": idx})
         await payments.send_file_export_invoice(message.bot, chat_id)
         await message.answer(
-            "Заполненный Excel — платная услуга (текст бюджета остаётся бесплатным). "
+            "Заполненный файл донора — платная услуга (текст бюджета остаётся бесплатным). "
             "После оплаты пришлю файл сразу."
         )
         return
 
-    content = base64.b64decode(b64)
+    result = None
     try:
-        async with show_working(message, "📊 Вписываю бюджет в Excel-шаблон донора..."):
-            structure = extract_xlsx_grid(content)
-            mapping = await generate_budget_cell_mapping(structure, budget_text)
-            filled, applied, skipped, replaced = (
-                fill_xlsx_template_report(content, mapping) if mapping else (content, [], [], [])
-            )
+        async with show_working(message, _PROGRESS[tpl["kind"]]):
+            result = await _FILLERS[tpl["kind"]](base64.b64decode(tpl["b64"]), budget_text)
     except Exception:
-        logger.exception("deliver_budget_xlsx failed")
-        applied, skipped, replaced, filled = [], [], [], content
-    if not applied:
+        logger.exception("deliver_budget_template failed (%s)", tpl["kind"])
+    if not result:
         await _show_export_menu(
             message, state,
-            "⚠️ Не смог уверенно определить, в какие ячейки вписывать цифры (структура шаблона "
-            "нестандартная). Деньги не списаны. Перенесите цифры вручную из бюджета выше.",
+            "⚠️ Не смог уверенно определить, куда в этом файле вписывать цифры (структура нестандартная). "
+            "Деньги не списаны. Перенесите цифры вручную из бюджета выше.",
         )
         return
 
+    name = tpl["name"]
     out_name = name if name.lower().startswith("filled_") else f"filled_{name}"
-    caption = (
-        f"📊 {name}: вписано ячеек — {len(applied)}. Шаблон донора не менялся: заполнены только "
-        "пустые ячейки, формулы и заголовки на месте, итоги пересчитаются при открытии в Excel. "
-        "Проверьте цифры перед отправкой донору."
-    )
-    if replaced:
-        caption += f"\nЗаменены примеры/подсказки шаблона: {', '.join(c.split('!')[-1] for c in replaced[:12])}."
-    refused = [c.split("!")[-1] for c, why in skipped if "формул" in why or "донора" in why or "объединён" in why]
-    if refused:
-        caption += f"\nНе трогал (формулы/заголовки/объединённые ячейки): {', '.join(refused[:8])}."
-    await message.answer_document(BufferedInputFile(filled, filename=out_name), caption=caption[:1020])
+    caption = f"{KIND_LABEL[tpl['kind']]} {name}: {result['caption']}\nПроверьте цифры перед отправкой донору."
+    await message.answer_document(BufferedInputFile(result["bytes"], filename=out_name), caption=caption[:1020])
     try:
         await billing.consume(chat_id, "file_export")
     except Exception:
