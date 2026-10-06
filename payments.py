@@ -129,7 +129,7 @@ async def send_budget_export_invoice(bot: Bot, chat_id: int) -> None:
         chat_id=chat_id,
         title="Ещё один бюджет в файле",
         description=(
-            f"Первый бюджет в файле бесплатно, дальше ~{config.BUDGET_EXPORT_PRICE_KGS} сом "
+            f"{config.FREE_BUDGET_EXPORTS} бюджета в файле бесплатно, дальше ~{config.BUDGET_EXPORT_PRICE_KGS} сом "
             "(тестовый режим — цена может измениться). Текст бюджета в чате всегда бесплатно."
         ),
         payload=PAID_BUDGET_EXPORT_PAYLOAD,
@@ -150,3 +150,13 @@ async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
         await pre_checkout_query.answer(ok=False, error_message="Неизвестный платёж")
         return
     await pre_checkout_query.answer(ok=True)
+
+
+# Режим оплаты по чеку (config.PAYMENT_MODE=receipt, см. receipt_payments.py):
+# те же имена send_*_invoice, но вместо Telegram-счёта запускают приём чека.
+import receipt_payments as _rp  # noqa: E402
+
+send_project_invoice = _rp.wrap_invoice_function(PAID_PROJECT_PAYLOAD, send_project_invoice)
+send_template_download_invoice = _rp.wrap_invoice_function(PAID_TEMPLATE_DOWNLOAD_PAYLOAD, send_template_download_invoice)
+send_file_export_invoice = _rp.wrap_invoice_function(PAID_FILE_EXPORT_PAYLOAD, send_file_export_invoice)
+send_budget_export_invoice = _rp.wrap_invoice_function(PAID_BUDGET_EXPORT_PAYLOAD, send_budget_export_invoice)

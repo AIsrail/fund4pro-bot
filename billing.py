@@ -67,7 +67,7 @@ def _resource_limits(resource: str) -> tuple[bool, int]:
     if resource == "template_download":
         return config.ENFORCE_TEMPLATE_DOWNLOAD_LIMIT, config.FREE_TEMPLATE_DOWNLOADS
     if resource == "file_export":
-        return config.ENFORCE_FILE_EXPORT_PAYMENT, config.FREE_FILE_EXPORTS
+        return config.ENFORCE_FILE_EXPORT_PAYMENT and config.PAYMENT_ENABLED, config.FREE_FILE_EXPORTS
     if resource == "budget_export":
         # Без включённой оплаты второй файл заблокировать нечем (счёт не отправить) —
         # поэтому ограничение действует только при PAYMENT_ENABLED=true.

@@ -10,7 +10,7 @@ from aiogram.types import ErrorEvent
 import config
 import agent_router
 from chat_serialization import ChatSerializationMiddleware
-from handlers import feedback_handlers, payments_handlers, budget_standalone
+from handlers import feedback_handlers, payments_handlers, receipt_handlers, budget_standalone
 from update_dedup import DedupMiddleware
 
 logger = logging.getLogger("fund4pro.bot")
@@ -147,6 +147,7 @@ async def main():
     dp.include_router(payments_handlers.router)
     # Опрос обратной связи — тоже ДО agent_router (его catch-all иначе съест fb:* и текст).
     dp.include_router(feedback_handlers.router)
+    dp.include_router(receipt_handlers.router)
     # Standalone бюджет-flow — до agent_router.
     dp.include_router(budget_standalone.router)
     dp.include_router(agent_router.router)

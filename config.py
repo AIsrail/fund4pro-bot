@@ -90,8 +90,13 @@ ENFORCE_TEMPLATE_DOWNLOAD_LIMIT = os.environ.get("ENFORCE_TEMPLATE_DOWNLOAD_LIMI
 # сомах владельцем — стартовое значение, свериться перед стартом продаж.
 PAID_TEMPLATE_DOWNLOAD_PRICE_XTR = int(os.environ.get("PAID_TEMPLATE_DOWNLOAD_PRICE_XTR", "50"))
 
-FREE_FILE_EXPORTS = int(os.environ.get("FREE_FILE_EXPORTS", "0"))
-ENFORCE_FILE_EXPORT_PAYMENT = os.environ.get("ENFORCE_FILE_EXPORT_PAYMENT", "false").lower() == "true"
+# 06.10.2026 (владелец): в квоту «2 проекта и 3 бюджета бесплатно» входит и файл
+# Word/Excel; сверх квоты — платно (проект 200 сом, бюджет 90 сом), текст в
+# чате всегда бесплатно. Ограничение действует только при PAYMENT_ENABLED=true
+# (иначе заплатить нечем — см. billing._resource_limits).
+FREE_FILE_EXPORTS = int(os.environ.get("FREE_FILE_EXPORTS", "2"))
+ENFORCE_FILE_EXPORT_PAYMENT = os.environ.get("ENFORCE_FILE_EXPORT_PAYMENT", "true").lower() == "true"
+PROJECT_FILE_PRICE_KGS = int(os.environ.get("PROJECT_FILE_PRICE_KGS", "200"))
 # Озвучено владельцем как "200 сом за проект". Курс сом/Stars не зафиксирован
 # нигде в проекте — переведено по тому же ориентиру, что и PAID_VERSION_PRICE_XTR
 # (~$0.02/Star): 200 сом ≈ $2.3 при ~87 сом/$ (ОРИЕНТИРОВОЧНО, свериться перед
@@ -118,7 +123,18 @@ RED_FLAG_AUTOFIX_ATTEMPTS = int(os.environ.get("RED_FLAG_AUTOFIX_ATTEMPTS", "1")
 # сом/$; по тому же ориентиру, что и остальные цены (~115 Stars за 200 сом) ≈ 52
 # Stars. Свериться перед стартом продаж. Платёж реально берётся только при
 # PAYMENT_ENABLED=true — иначе второй файл заблокировать нечем (см. billing).
-FREE_BUDGET_EXPORTS = int(os.environ.get("FREE_BUDGET_EXPORTS", "1"))
+FREE_BUDGET_EXPORTS = int(os.environ.get("FREE_BUDGET_EXPORTS", "3"))
 ENFORCE_BUDGET_EXPORT_PAYMENT = os.environ.get("ENFORCE_BUDGET_EXPORT_PAYMENT", "true").lower() == "true"
 PAID_BUDGET_EXPORT_PRICE_XTR = int(os.environ.get("PAID_BUDGET_EXPORT_PRICE_XTR", "52"))
 BUDGET_EXPORT_PRICE_KGS = int(os.environ.get("BUDGET_EXPORT_PRICE_KGS", "90"))
+
+# --- Способ оплаты (06.10.2026) -------------------------------------------
+# "receipt" — как в c4faq_bot: пользователь переводит сомы по реквизитам и
+# присылает скрин чека, бот пересылает его владельцу (OWNER_CHAT_ID), владелец
+# подтверждает кнопкой — и кредит начисляется. "stars" — старый путь через
+# Telegram Stars. В обоих режимах нужно PAYMENT_ENABLED=true.
+PAYMENT_MODE = os.environ.get("PAYMENT_MODE", "receipt").strip().lower()
+# Текст с реквизитами (номер карты/кошелька) — задаётся в Render Environment,
+# в коде не хранится. Переносы строк в значении переменной — как \n.
+PAYMENT_REQUISITES = os.environ.get("PAYMENT_REQUISITES", "").replace("\\n", "\n").strip()
+PAID_TEMPLATE_DOWNLOAD_PRICE_KGS = int(os.environ.get("PAID_TEMPLATE_DOWNLOAD_PRICE_KGS", "40"))

@@ -1353,7 +1353,7 @@ async def deliver_budget_template(message: Message, state: FSMContext, idx: int 
 
         await state.update_data(_pending_budget_export={"idx": idx})
         await message.answer(
-            "Первый бюджет в файле вы уже получили бесплатно. Следующие — "
+            f"Бесплатные бюджеты в файле закончились ({config.FREE_BUDGET_EXPORTS} шт.). Следующий — "
             f"{config.BUDGET_EXPORT_PRICE_KGS} сом (≈{config.PAID_BUDGET_EXPORT_PRICE_XTR} ⭐), "
             "сейчас тестовый режим, цена может измениться. Текст бюджета в чате — всегда бесплатно. "
             "После оплаты пришлю файл сразу."
@@ -1406,7 +1406,7 @@ async def deliver_budget_template(message: Message, state: FSMContext, idx: int 
     note = ""
     if first_free and config.ENFORCE_BUDGET_EXPORT_PAYMENT and config.PAYMENT_ENABLED:
         note = (
-            f"\n\nЭто ваш бесплатный бюджет в файле. Следующие — {config.BUDGET_EXPORT_PRICE_KGS} сом "
+            f"\n\nБесплатных бюджетов в файле — {config.FREE_BUDGET_EXPORTS} шт., дальше {config.BUDGET_EXPORT_PRICE_KGS} сом за бюджет "
             "(тестовый режим, цена может измениться). Другие форматы этого же бюджета — без доплаты."
         )
     from handlers.feedback_handlers import offer_feedback
