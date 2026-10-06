@@ -149,6 +149,8 @@ async def request_receipt(bot, chat_id: int, payload: str) -> None:
     except Exception:
         pass
     note = "" if config.PAYMENT_REQUISITES else "\n⚠️ PAYMENT_REQUISITES не задан в Render Environment — пользователю реквизиты не показаны."
+    import telemetry
+    await telemetry.log_event(chat_id, "payment_requested", what=what, price=price)
     await notify_owner(bot, f"💳 {who} запросил оплату: {what}, {price} сом. Жду чек.{note}")
 
 

@@ -471,6 +471,8 @@ async def _start_fresh_flow(message: Message, state: FSMContext, flow: str) -> N
         "project_data": {},
         "history_openai": [],
     })
+    import telemetry
+    await telemetry.log_event(message.chat.id, "project_started", flow=flow)
 
     # Показываем дорожную карту разработки
     roadmap = (
@@ -560,6 +562,8 @@ async def _do_start_from_budget(message: Message, state: FSMContext, handoff: di
 
 @router.callback_query(F.data == "agent:restart")
 async def restart(callback: CallbackQuery, state: FSMContext):
+    import telemetry
+    await telemetry.log_event(callback.message.chat.id, "restart", stage=telemetry.stage_of((await state.get_data()).get("project_data")))
     await state.clear()
     await callback.message.answer(_welcome_text(), reply_markup=start_keyboard())
     await callback.answer()
@@ -596,6 +600,11 @@ async def handle_quick_reply(callback: CallbackQuery, state: FSMContext):
         except (ValueError, IndexError):
             await callback.message.answer("Эта кнопка устарела — напиши ответ текстом 👇")
             return
+    import telemetry
+    await telemetry.log_event(
+        callback.message.chat.id, "quick_reply", text=chosen,
+        question=(callback.message.text or "")[:200], stage=telemetry.stage_of(data.get("project_data")),
+    )
     # Убираем стрелки/пальцы вниз и призывы нажать кнопку, фиксируем выбор в сообщении
     try:
         old_text = callback.message.text or callback.message.caption or ""
@@ -785,6 +794,12 @@ async def receive_any_message(message: Message, state: FSMContext):
     # Проект уже есть или был — активируем и обрабатываем сообщение
     await _ensure_active(state)
 
+    import telemetry
+    await telemetry.log_event(
+        message.chat.id, "user_msg",
+        stage=telemetry.stage_of(session_data.get("project_data")), text=raw_text[:200],
+    )
+
     # Если пользователь прислал цифру ("1", "2", ...), сопоставляем с активными кнопками
     active_opts = session_data.get("_active_quick_replies") or []
     if raw_text.isdigit() and active_opts:
@@ -951,6 +966,8 @@ async def _run_turn_and_reply(message: Message, state: FSMContext, user_text: st
 
     # Опрос обратной связи после выдачи заявки (feedback_handlers) — раз на проект.
     if delivered_application:
+        import telemetry
+        await telemetry.log_event(message.chat.id, "doc_delivered", flow=session.get("flow", "grant"))
         from handlers.feedback_handlers import offer_feedback
         await offer_feedback(message, state)
 

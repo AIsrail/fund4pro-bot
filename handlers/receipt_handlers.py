@@ -77,6 +77,9 @@ async def owner_decision(callback: CallbackQuery, dispatcher):
     bot = callback.bot
     _payload, resource, _attr, what = rp.OFFERS[code]
 
+    import telemetry
+    await telemetry.log_event(chat_id, "payment_rejected" if verdict == "no" else "payment_confirmed", what=what)
+
     if verdict == "no":
         await rp.clear_waiting(chat_id)
         await callback.message.edit_text(f"{callback.message.text}\n\n❌ Отклонено.", reply_markup=None)

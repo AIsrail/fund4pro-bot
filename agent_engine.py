@@ -142,6 +142,10 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
                 else:
                     project_data[field] = value.strip()
                 updated.append(field)
+        if updated and session.get("_chat_id") is not None:
+            import telemetry
+            for field in updated:
+                await telemetry.log_event(session["_chat_id"], "field_saved", field=field, text=args.get(field) or "")
         return f"Сохранено: {', '.join(updated) if updated else 'нечего сохранять (пустые поля)'}"
 
     if name == "fetch_donor_page":

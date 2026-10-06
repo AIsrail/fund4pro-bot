@@ -196,3 +196,25 @@ async def feedback_stats(message: Message):
     if records:
         raw = "\n".join(json.dumps(r, ensure_ascii=False) for r in records).encode("utf-8")
         await message.answer_document(BufferedInputFile(raw, filename="feedback.jsonl"))
+
+
+@router.message(Command("insights"))
+async def insights(message: Message):
+    """Только владелец: воронка по шагам, частые выборы, оплаты + выгрузка
+    events.jsonl (телеметрия, см. telemetry.py) и feedback.jsonl — для
+    еженедельного анализа и улучшений бота."""
+    if not _is_owner(message.chat.id):
+        return
+    import json
+    import telemetry
+    events = await telemetry.load_all()
+    from telegram_text import send_long
+    await send_long(message, telemetry.summarize(events))
+    if events:
+        raw = "\n".join(json.dumps(e, ensure_ascii=False) for e in events).encode("utf-8")
+        await message.answer_document(BufferedInputFile(raw, filename="events.jsonl"))
+    records = await feedback.load_all()
+    if records:
+        await message.answer(feedback.summarize(records))
+        raw = "\n".join(json.dumps(r, ensure_ascii=False) for r in records).encode("utf-8")
+        await message.answer_document(BufferedInputFile(raw, filename="feedback.jsonl"))
