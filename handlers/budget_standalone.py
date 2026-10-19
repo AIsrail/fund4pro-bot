@@ -558,10 +558,10 @@ async def _ask_admin_share(message: Message, state: FSMContext) -> None:
         )
     else:
         await message.answer(
-            "В материалах донора долю админ-расходов не нашёл. Какую максимальную "
-            "долю допускает донор, в %? Обычно от 0 до 20%, реже до 30% (для "
-            "очень крупных проектов).\n\nЕсли не знаете — напишите «не знаю», "
-            "подскажу ориентир по размеру проекта."
+            "В материалах донора долю админ-расходов не нашёл. Найдите её, пожалуйста, "
+            "в условиях конкурса (разделы Budget / Eligible costs / Guidelines, слова "
+            "administrative, indirect costs, overhead) и напишите максимальную долю в %.\n\n"
+            "Это важно: у каждого донора свой лимит, подставлять число наугад нельзя."
         )
 
 
@@ -667,6 +667,16 @@ async def receive_admin_share(message: Message, state: FSMContext):
     if text in YES_WORDS and found is not None:
         await state.update_data(donor_admin_share=found)
     elif text in UNKNOWN_WORDS or text in SKIP_WORDS:
+        if not data.get("_admin_unknown_asked"):
+            await state.update_data(_admin_unknown_asked=True)
+            await message.answer(
+                "Пожалуйста, попробуйте найти лимит админ-расходов в условиях конкурса "
+                "(Budget / Eligible costs / Guidelines; administrative, indirect costs, "
+                "overhead) — от него зависит весь бюджет. Если лимита там действительно "
+                "нет, напишите «не знаю» ещё раз: тогда админ-строку сделаю ориентировочной "
+                "и помечу как неподтверждённую."
+            )
+            return
         await state.update_data(donor_admin_share=None)
     else:
         value = _parse_number(text)
@@ -798,9 +808,9 @@ async def receive_budget_size(message: Message, state: FSMContext):
         admin_share = get_admin_share_recommendation(size_usd)
         await state.update_data(admin_share_is_recommended=True)
         await message.answer(
-            f"Доля админ-расходов не указана, беру ориентир {admin_share}% "
-            "(10% для проектов до 20 тыс. долларов, до 15% — до 100 тыс.). "
-            "Если у донора другой лимит — скажите на этапе правок."
+            f"Лимит админ-расходов донора не подтверждён — беру временный ориентир {admin_share}% "
+            "(он НЕ из условий конкурса, админ-строку считайте неподтверждённой). "
+            "Найдёте лимит в условиях — напишите его на этапе правок, и я пересчитаю."
         )
     await state.update_data(admin_share=admin_share)
     await state.set_state(S.choose_location)
