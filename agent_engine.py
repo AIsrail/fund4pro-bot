@@ -1127,8 +1127,24 @@ async def _deliver_generated_document(
         "official_template": official_template,
         "non_latin_warning": session.pop("_pdf_non_latin_warning", False),
         "donor_review": donor_review,
+        "other_forms": _other_donor_forms(session, chosen_fn),
     })
     return True
+
+
+def _other_donor_forms(session: dict, chosen_fn: str) -> list[str]:
+    """Имена ДРУГИХ форм донора, найденных в этой сессии (например, основная
+    форма и форма на поездку у GGF) — чтобы пользователь видел, какая именно
+    заполнена, и мог попросить другую. РЕАЛЬНАЯ ЖАЛОБА (20.10.2026): бот
+    заполнил форму на поездку вместо основной, и пользователь решил, что
+    «убрали таблицу мероприятий» (в форме на поездку её просто нет)."""
+    names: list[str] = []
+    for key in ("donor_form_candidates", "saved_donor_files"):
+        for f in session.get(key) or []:
+            fn = f.get("filename")
+            if fn and fn != chosen_fn and fn.lower().endswith((".docx", ".pdf", ".xlsx")) and fn not in names:
+                names.append(fn)
+    return names
 
 
 async def run_agent_turn(session: dict, user_text: str) -> AgentTurnResult:

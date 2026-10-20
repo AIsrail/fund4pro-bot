@@ -45,8 +45,19 @@ def test_plain_text_without_comment_unchanged():
     assert not any(r.font.highlight_color for r in p.runs)
 
 
+def test_other_donor_forms_lists_alternatives():
+    from agent_engine import _other_donor_forms
+    session = {
+        "donor_form_candidates": [{"filename": "main.docx"}, {"filename": "travel.docx"}],
+        "saved_donor_files": [{"filename": "travel.docx"}, {"filename": "rules.txt"}, {"filename": "x.pdf"}],
+    }
+    assert _other_donor_forms(session, "travel.docx") == ["main.docx", "x.pdf"]
+    assert _other_donor_forms({}, "a.docx") == []
+
+
 if __name__ == "__main__":
     test_admin_rule_not_fixed_percent_and_in_prompts()
     test_applicant_comment_yellow_and_xyz_red()
     test_plain_text_without_comment_unchanged()
+    test_other_donor_forms_lists_alternatives()
     print("All quality-rules tests passed.")

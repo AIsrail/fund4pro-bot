@@ -1011,6 +1011,15 @@ async def _send_generated_document(message: Message, doc: dict) -> None:
         # см. agent_engine.py) — код-driven, не зависит от того, вспомнит ли
         # модель это упомянуть. Пустая строка = либо документ без содержательного
         # текста (чистая kv-форма), либо сам обзор не нашёл серьёзных пробелов.
+        other_forms = doc.get("other_forms") or []
+        if other_forms and doc.get("filename"):
+            await message.answer(
+                f"ℹ️ Заполнена форма донора «{doc['filename']}». У донора есть и другие формы: "
+                + ", ".join(f"«{n}»" for n in other_forms[:4])
+                + ". Формы отличаются разделами и таблицами (например, в основной форме есть таблица "
+                "плана мероприятий, а в форме на поездку её нет). Если нужна другая — напишите, "
+                "какую, и я соберу заявку в ней."
+            )
         donor_review = (doc.get("donor_review") or "").strip()
         if donor_review:
             from telegram_text import send_long
