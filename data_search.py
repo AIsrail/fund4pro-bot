@@ -40,6 +40,9 @@ SEARXNG_INSTANCES = [
 ]
 
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
+# Wikimedia API отвечает 403 на безликий "Mozilla/5.0" (проверено 20.10.2026) —
+# их политика требует описательный User-Agent с адресом проекта.
+_WIKI_HEADERS = {"User-Agent": "fund4pro-bot/1.0 (https://github.com/AIsrail/fund4pro-bot)"}
 
 
 async def try_search_statistics(query: str, max_results: int = 5) -> list[dict]:
@@ -138,7 +141,7 @@ async def _search_wikipedia(query: str, max_results: int) -> list[dict]:
     веб-поиск заблокирован — не заменяет актуальную статистику доноров, но
     даёт хоть какую-то опору (демография, география, общие цифры по
     стране/региону), лучше чем полностью пустой результат."""
-    async with httpx.AsyncClient(timeout=10, headers=_HEADERS) as client:
+    async with httpx.AsyncClient(timeout=10, headers=_WIKI_HEADERS) as client:
         resp = await client.get(WIKIPEDIA_SEARCH_URL, params={
             "action": "query",
             "list": "search",
@@ -165,7 +168,7 @@ async def _search_wikidata(query: str, max_results: int) -> list[dict]:
     (население, площадь, официальные показатели стран/регионов/организаций)
     — резерв на случай, когда и обычный веб-поиск, и русская Wikipedia не
     дали ничего по запросу."""
-    async with httpx.AsyncClient(timeout=10, headers=_HEADERS) as client:
+    async with httpx.AsyncClient(timeout=10, headers=_WIKI_HEADERS) as client:
         resp = await client.get(WIKIDATA_SEARCH_URL, params={
             "action": "wbsearchentities",
             "search": query,
