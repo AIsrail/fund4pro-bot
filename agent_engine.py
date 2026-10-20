@@ -490,13 +490,16 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
         # ответ с источниками, а не сырые ссылки. Пробуется первым; при
         # недоступности (нет ключа/сбой) молча падает на старую цепочку —
         # ничего не ломается для случая, когда Anthropic сам недоступен.
-        from llm import web_search_and_summarize
+        # 20.10.2026: цепочка Gemini -> ChatGPT -> DeepSeek (web_research.py);
+        # Claude из неё убран по цене токенов. Раньше при недоступности
+        # Anthropic поиск молча деградировал до слабого скрейпинга.
+        from web_research import web_research
         try:
             org_info = (project_data.get("org_info") or "")[:300]
-            summary, sources = await web_search_and_summarize(query, context=org_info)
+            summary, sources, search_provider = await web_research(query, context=org_info)
         except Exception as exc:
-            logger.warning("web_search_and_summarize failed, falling back to scraping chain: %s: %s", type(exc).__name__, exc)
-            summary, sources = "", []
+            logger.warning("web_research failed, falling back to scraping chain: %s: %s", type(exc).__name__, exc)
+            summary, sources, search_provider = "", [], ""
 
         if summary:
             session.setdefault("_found_data_notes", []).append(
@@ -504,7 +507,7 @@ async def _execute_tool(name: str, args: dict, session: dict) -> str:
             )
             src_lines = "\n".join(f"- {s['title']}: {s['url']}" for s in sources[:5])
             return (
-                f"Найдено по запросу '{query}' (живой веб-поиск через Claude):\n{summary}\n\n"
+                f"Найдено по запросу '{query}' (живой веб-поиск, {search_provider}):\n{summary}\n\n"
                 f"Источники:\n{src_lines}\n\n"
                 f"ОБЯЗАТЕЛЬНО вызови update_project В ЭТОМ ЖЕ ХОДУ и сохрани "
                 f"конкретные найденные цифры/факты (с источником) в подходящее поле "
