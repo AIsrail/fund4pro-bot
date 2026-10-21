@@ -210,6 +210,67 @@ async def cmd_start(message: Message, state: FSMContext, command: CommandObject)
     await message.answer(_welcome_text(), reply_markup=start_keyboard())
 
 
+@router.message(Command("code"))
+async def cmd_code(message: Message, state: FSMContext, command: CommandObject):
+    """Активация доступа по коду тарифа от fundan.cc.
+
+    Использование: /code 751F3C29B0DE8ED1 (16 символов hex, выданный @c4faq_bot)
+    """
+    code = (command.args or "").strip().upper()
+    if not code:
+        await message.answer("❌ Используйте: `/code <ваш_16-значный_код>`")
+        return
+
+    if len(code) != 16:
+        await message.answer("❌ Код должен быть 16 символов (пример: `751F3C29B0DE8ED1`)")
+        return
+
+    import code_access
+    result = await code_access.redeem_code(code)
+
+    if result is None:
+        await message.answer(
+            "❌ Код не найден или уже использован.\n\n"
+            "Проверьте правильность кода и попробуйте снова. "
+            "Если проблема сохраняется, напишите владельцу бота."
+        )
+        return
+
+    plan = result.get("plan")
+    remaining = result.get("remaining")
+
+    if plan != "pro":
+        await message.answer(
+            f"❌ Этот тариф не поддерживается (ожидается 'pro', получено '{plan}')."
+        )
+        return
+
+    if not isinstance(remaining, int) or remaining <= 0:
+        await message.answer(
+            "❌ Проектов в этом месяце нет или счётчик некорректен. "
+            "Напишите владельцу бота."
+        )
+        return
+
+    import billing
+    import telemetry
+    try:
+        await billing.add_paid_credit(message.chat.id, "project", remaining)
+        await telemetry.log_event(message.chat.id, "code_redeemed", plan=plan, remaining=remaining)
+        await message.answer(
+            f"✅ Доступ активирован!\n\n"
+            f"Ваш тариф: Pro\n"
+            f"Проектов в этом месяце: {remaining}\n\n"
+            f"Готовы разрабатывать проекты? 📋 Нажмите кнопку ниже.",
+            reply_markup=start_keyboard()
+        )
+    except Exception:
+        logger.exception(f"cmd_code: failed to add credit for chat {message.chat.id}")
+        await message.answer(
+            "⚠️ Ошибка при активации доступа. Напишите владельцу бота."
+        )
+
+
 @router.callback_query(F.data.startswith("agentflow:"))
 async def choose_flow(callback: CallbackQuery, state: FSMContext):
     flow = callback.data.split(":")[1]
