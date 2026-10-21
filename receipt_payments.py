@@ -26,11 +26,22 @@ _DONE_PREFIX = "fund4pro:rcpt_done:"
 
 # код -> (payload счёта, ресурс billing, имя настройки цены в сомах, описание)
 OFFERS = {
-    "pf": ("paid_file_export", "file_export", "PROJECT_FILE_PRICE_KGS", "проект в файле (заявка + бюджет)"),
-    "bf": ("paid_budget_export", "budget_export", "BUDGET_EXPORT_PRICE_KGS", "бюджет в файле"),
-    "pr": ("paid_new_project", "project", "PROJECT_FILE_PRICE_KGS", "ещё один проект"),
+    "pf": ("paid_file_export", "file_export", "PROJECT_FILE_PRICE_KGS", "перенос проекта в шаблон донора (Word/Excel)"),
+    "bf": ("paid_budget_export", "budget_export", "BUDGET_EXPORT_PRICE_KGS", "перенос бюджета в шаблон донора (Word/Excel)"),
+    "pr": ("paid_new_project", "project", "PROJECT_DEV_PRICE_KGS", "разработка ещё одного проекта"),
+    "bd": ("paid_budget_dev", "budget_dev", "BUDGET_DEV_PRICE_KGS", "разработка ещё одного бюджета"),
     "td": ("paid_template_download", "template_download", "PAID_TEMPLATE_DOWNLOAD_PRICE_KGS", "шаблон донора"),
 }
+# Для каких услуг показываем и цену в долларах (стандарт: 200 сом или $2 для
+# других стран ЦА); скачивание шаблона — только в сомах.
+USD_CODES = {"pf", "bf", "pr", "bd"}
+
+
+def price_text(code: str) -> str:
+    kgs = f"{price_kgs(code)} сом"
+    if code in USD_CODES:
+        return f"{kgs} (Кыргызстан) или ${config.PRICE_USD} (другие страны Центральной Азии)"
+    return kgs
 
 _memory_wait: dict[int, tuple[str, float]] = {}
 
@@ -136,7 +147,7 @@ async def request_receipt(bot, chat_id: int, payload: str) -> None:
     )
     await bot.send_message(
         chat_id,
-        f"💳 Оплата: {what} — {price} сом (тестовый режим, цена может измениться).\n\n"
+        f"💳 {what[:1].upper()}{what[1:]} — {price_text(code)} (тестовый режим, цена может измениться).\n\n"
         f"{requisites}\n\n"
         "После перевода пришлите сюда скрин чека (фото или файл) — владелец "
         "проверит, и я сразу продолжу с того же места. Чек можно прислать в течение 24 часов.",

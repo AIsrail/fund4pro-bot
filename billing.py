@@ -68,6 +68,8 @@ def _resource_limits(resource: str) -> tuple[bool, int]:
         return config.ENFORCE_TEMPLATE_DOWNLOAD_LIMIT, config.FREE_TEMPLATE_DOWNLOADS
     if resource == "file_export":
         return config.ENFORCE_FILE_EXPORT_PAYMENT and config.PAYMENT_ENABLED, config.FREE_FILE_EXPORTS
+    if resource == "budget_dev":
+        return config.ENFORCE_BUDGET_DEV_LIMIT and config.PAYMENT_ENABLED, config.FREE_BUDGET_DEVS
     if resource == "budget_export":
         # Без включённой оплаты второй файл заблокировать нечем (счёт не отправить) —
         # поэтому ограничение действует только при PAYMENT_ENABLED=true.
@@ -117,7 +119,7 @@ async def _read(chat_id: int) -> dict:
             "paid_credits": record.get("paid_credits", 0),
         }}
 
-    for res in ("project", "template_download", "file_export", "budget_export"):
+    for res in ("project", "template_download", "file_export", "budget_export", "budget_dev"):
         record.setdefault(res, dict(_EMPTY_RESOURCE))
     return record
 

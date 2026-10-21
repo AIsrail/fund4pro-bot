@@ -40,7 +40,9 @@ def test_payload_codes_and_prices():
     assert rp.code_for_payload(payments.PAID_FILE_EXPORT_PAYLOAD) == "pf"
     assert rp.code_for_payload(payments.PAID_BUDGET_EXPORT_PAYLOAD) == "bf"
     assert rp.code_for_payload("nope") is None
-    assert rp.price_kgs("pf") == 200 and rp.price_kgs("bf") == 90
+    assert rp.price_kgs("pf") == 200 and rp.price_kgs("bf") == 200
+    assert rp.price_kgs("pr") == 200 and rp.price_kgs("bd") == 200
+    assert "$2" in rp.price_text("bd") and "$" not in rp.price_text("td")
 
 
 def test_invoice_in_receipt_mode_asks_for_receipt_and_notifies_owner():
@@ -48,7 +50,7 @@ def test_invoice_in_receipt_mode_asks_for_receipt_and_notifies_owner():
     bot = FakeBot()
     asyncio.run(payments.send_budget_export_invoice(bot, 42))
     to_user = [t for c, t in bot.sent if c == 42][0]
-    assert "90 сом" in to_user and "Карта 0000" in to_user and "чека" in to_user
+    assert "200 сом" in to_user and "$2" in to_user and "Карта 0000" in to_user and "чека" in to_user
     assert any(c == "999" and "запросил оплату" in t for c, t in bot.sent)
     assert asyncio.run(rp.get_waiting(42)) == "bf"
 

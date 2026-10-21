@@ -222,10 +222,46 @@ def _section_hint(key: str, d: dict) -> str:
 @router.callback_query(F.data == "agentflow:budget_standalone")
 async def start_budget_standalone(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    chat_id = callback.message.chat.id
+    allowed = True
+    try:
+        allowed = await billing.can_use(chat_id, "budget_dev")
+    except Exception:
+        logger.warning("billing.can_use(budget_dev) failed, defaulting to allow", exc_info=True)
+    if not allowed:
+        import payments
+
+        await state.update_data(_pending_budget_dev=True)
+        await callback.message.answer(
+            f"Бесплатные бюджеты закончились ({config.FREE_BUDGET_DEVS} шт.). "
+            "Разработка ещё одного бюджета — платная. Сейчас пришлю, как оплатить: "
+            "после подтверждения сразу начнём."
+        )
+        await payments.send_budget_dev_invoice(callback.message.bot, chat_id)
+        return
+    try:
+        await billing.consume(chat_id, "budget_dev")
+    except Exception:
+        logger.warning("billing.consume(budget_dev) failed", exc_info=True)
+    await _begin_budget_standalone(callback.message, state)
+
+
+async def resume_after_budget_dev_payment(message: Message, state: FSMContext) -> None:
+    """Вызывается после оплаты ещё одного бюджета (Stars или чек): списывает
+    только что купленный кредит и начинает сценарий."""
+    await state.update_data(_pending_budget_dev=None)
+    try:
+        await billing.consume(message.chat.id, "budget_dev")
+    except Exception:
+        logger.warning("billing.consume(budget_dev) after payment failed", exc_info=True)
+    await _begin_budget_standalone(message, state)
+
+
+async def _begin_budget_standalone(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.update_data(ui_language="ru", flow="budget_standalone")
     await state.set_state(S.waiting_donor_info)
-    await callback.message.answer(
+    await message.answer(
         "📊 Составим бюджет вместе.\n\n"
         "Для начала расскажите о доноре. Пришлите любое из:\n"
         "• ссылку на донора или на форму заявки/бюджета — я открою страницу, "
@@ -1363,10 +1399,9 @@ async def deliver_budget_template(message: Message, state: FSMContext, idx: int 
 
         await state.update_data(_pending_budget_export={"idx": idx})
         await message.answer(
-            f"Бесплатные бюджеты в файле закончились ({config.FREE_BUDGET_EXPORTS} шт.). Следующий — "
-            f"{config.BUDGET_EXPORT_PRICE_KGS} сом (≈{config.PAID_BUDGET_EXPORT_PRICE_XTR} ⭐), "
-            "сейчас тестовый режим, цена может измениться. Текст бюджета в чате — всегда бесплатно. "
-            "После оплаты пришлю файл сразу."
+            "Перенос бюджета в шаблон донора (Word/Excel) — платная функция; текст бюджета "
+            "в чате остаётся бесплатным. Сейчас пришлю, как оплатить: после подтверждения "
+            "сразу заполню шаблон."
         )
         await payments.send_budget_export_invoice(message.bot, chat_id)
         return
@@ -1414,11 +1449,8 @@ async def deliver_budget_template(message: Message, state: FSMContext, idx: int 
             logger.warning("billing.consume(budget_export) failed", exc_info=True)
         await state.update_data(budget_export_counted=True)
     note = ""
-    if first_free and config.ENFORCE_BUDGET_EXPORT_PAYMENT and config.PAYMENT_ENABLED:
-        note = (
-            f"\n\nБесплатных бюджетов в файле — {config.FREE_BUDGET_EXPORTS} шт., дальше {config.BUDGET_EXPORT_PRICE_KGS} сом за бюджет "
-            "(тестовый режим, цена может измениться). Другие форматы этого же бюджета — без доплаты."
-        )
+    if config.ENFORCE_BUDGET_EXPORT_PAYMENT and config.PAYMENT_ENABLED and not already:
+        note = "\n\nДругие форматы (Excel/Word/PDF) этого же бюджета — без доплаты."
     from handlers.feedback_handlers import offer_feedback
     await offer_feedback(message, state)
     await _show_export_menu(message, state, "Что дальше?" + note, compact=True)

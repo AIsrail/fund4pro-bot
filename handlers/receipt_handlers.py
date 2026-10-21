@@ -50,7 +50,7 @@ async def receive_receipt(message: Message):
         who = f"@{message.from_user.username}" if message.from_user and message.from_user.username else f"chat {chat_id}"
         await message.bot.send_message(
             owner,
-            f"🧾 Чек от {who}: {what}, {price} сом.\nПроверьте поступление и подтвердите.",
+            f"🧾 Чек от {who}: {what}, {rp.price_text(code)}.\nПроверьте поступление и подтвердите.",
             reply_markup=kb.as_markup(),
         )
     except Exception:
@@ -106,6 +106,9 @@ async def owner_decision(callback: CallbackQuery, dispatcher):
         elif code == "bf":
             from handlers import budget_standalone
             await budget_standalone.resume_after_budget_payment(user_msg, state)
+        elif code == "bd":
+            from handlers import budget_standalone
+            await budget_standalone.resume_after_budget_dev_payment(user_msg, state)
         elif code == "pr":
             import agent_router
             await agent_router.resume_after_payment(user_msg, state)

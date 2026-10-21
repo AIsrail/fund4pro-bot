@@ -36,8 +36,8 @@ BIZPLAN_FLOW_ENABLED = os.environ.get("BIZPLAN_FLOW_ENABLED", "false").lower() =
 # момент реального старта нового проекта (не при "Продолжить этот проект").
 # Пока ENFORCE_FULL_VERSION_LIMIT=false — лимит не блокирует никого (этап
 # свободного тестирования). Включить: ENFORCE_FULL_VERSION_LIMIT=true.
-FULL_VERSION_LIMIT = int(os.environ.get("FULL_VERSION_LIMIT", "3"))
-ENFORCE_FULL_VERSION_LIMIT = os.environ.get("ENFORCE_FULL_VERSION_LIMIT", "false").lower() == "true"
+FULL_VERSION_LIMIT = int(os.environ.get("FULL_VERSION_LIMIT", "2"))
+ENFORCE_FULL_VERSION_LIMIT = os.environ.get("ENFORCE_FULL_VERSION_LIMIT", "true").lower() == "true"
 
 # ID пользователей Telegram, для которых лимит бесплатных версий (выше) не
 # применяется даже когда ENFORCE_FULL_VERSION_LIMIT=true — например, владелец
@@ -94,7 +94,7 @@ PAID_TEMPLATE_DOWNLOAD_PRICE_XTR = int(os.environ.get("PAID_TEMPLATE_DOWNLOAD_PR
 # Word/Excel; сверх квоты — платно (проект 200 сом, бюджет 90 сом), текст в
 # чате всегда бесплатно. Ограничение действует только при PAYMENT_ENABLED=true
 # (иначе заплатить нечем — см. billing._resource_limits).
-FREE_FILE_EXPORTS = int(os.environ.get("FREE_FILE_EXPORTS", "2"))
+FREE_FILE_EXPORTS = int(os.environ.get("FREE_FILE_EXPORTS", "0"))
 ENFORCE_FILE_EXPORT_PAYMENT = os.environ.get("ENFORCE_FILE_EXPORT_PAYMENT", "true").lower() == "true"
 PROJECT_FILE_PRICE_KGS = int(os.environ.get("PROJECT_FILE_PRICE_KGS", "200"))
 # Озвучено владельцем как "200 сом за проект". Курс сом/Stars не зафиксирован
@@ -123,10 +123,10 @@ RED_FLAG_AUTOFIX_ATTEMPTS = int(os.environ.get("RED_FLAG_AUTOFIX_ATTEMPTS", "1")
 # сом/$; по тому же ориентиру, что и остальные цены (~115 Stars за 200 сом) ≈ 52
 # Stars. Свериться перед стартом продаж. Платёж реально берётся только при
 # PAYMENT_ENABLED=true — иначе второй файл заблокировать нечем (см. billing).
-FREE_BUDGET_EXPORTS = int(os.environ.get("FREE_BUDGET_EXPORTS", "3"))
+FREE_BUDGET_EXPORTS = int(os.environ.get("FREE_BUDGET_EXPORTS", "0"))
 ENFORCE_BUDGET_EXPORT_PAYMENT = os.environ.get("ENFORCE_BUDGET_EXPORT_PAYMENT", "true").lower() == "true"
 PAID_BUDGET_EXPORT_PRICE_XTR = int(os.environ.get("PAID_BUDGET_EXPORT_PRICE_XTR", "52"))
-BUDGET_EXPORT_PRICE_KGS = int(os.environ.get("BUDGET_EXPORT_PRICE_KGS", "90"))
+BUDGET_EXPORT_PRICE_KGS = int(os.environ.get("BUDGET_EXPORT_PRICE_KGS", "200"))
 
 # --- Способ оплаты (06.10.2026) -------------------------------------------
 # "receipt" — как в c4faq_bot: пользователь переводит сомы по реквизитам и
@@ -138,3 +138,21 @@ PAYMENT_MODE = os.environ.get("PAYMENT_MODE", "receipt").strip().lower()
 # в коде не хранится. Переносы строк в значении переменной — как \n.
 PAYMENT_REQUISITES = os.environ.get("PAYMENT_REQUISITES", "").replace("\\n", "\n").strip()
 PAID_TEMPLATE_DOWNLOAD_PRICE_KGS = int(os.environ.get("PAID_TEMPLATE_DOWNLOAD_PRICE_KGS", "40"))
+
+# --- Схема 21.10.2026 (решение владельца) -----------------------------------
+# Разработка: 2 проекта и 2 бюджета (кнопка «Составить бюджет» считается
+# отдельно) бесплатно текстом, дальше платно — 200 сом (Кыргызстан) или $2
+# (другие страны ЦА) за проект и за бюджет. ПЕРЕНОС в шаблон донора (Word/
+# Excel) — отдельная платная услуга по той же цене, предлагается в конце
+# каждой разработки (FREE_FILE_EXPORTS=0, FREE_BUDGET_EXPORTS=0). Покупателям
+# книги (приходят из @c4faq_bot по ссылке t.me/fund4_bot?start=book) первые
+# BOOK_FREE_TRANSFERS переносов проекта в шаблон донора бесплатны.
+# Все ограничения действуют только при PAYMENT_ENABLED=true (иначе платить нечем).
+ENFORCE_FULL_VERSION_LIMIT = ENFORCE_FULL_VERSION_LIMIT and PAYMENT_ENABLED
+FREE_BUDGET_DEVS = int(os.environ.get("FREE_BUDGET_DEVS", "2"))
+ENFORCE_BUDGET_DEV_LIMIT = os.environ.get("ENFORCE_BUDGET_DEV_LIMIT", "true").lower() == "true"
+PROJECT_DEV_PRICE_KGS = int(os.environ.get("PROJECT_DEV_PRICE_KGS", "200"))
+BUDGET_DEV_PRICE_KGS = int(os.environ.get("BUDGET_DEV_PRICE_KGS", "200"))
+PRICE_USD = int(os.environ.get("PRICE_USD", "2"))
+PAID_BUDGET_DEV_PRICE_XTR = int(os.environ.get("PAID_BUDGET_DEV_PRICE_XTR", "115"))
+BOOK_FREE_TRANSFERS = int(os.environ.get("BOOK_FREE_TRANSFERS", "2"))

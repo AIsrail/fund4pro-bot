@@ -17,7 +17,7 @@ import os
 import tempfile
 
 from aiogram import Router, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
@@ -192,8 +192,21 @@ async def handle_channel_post(message: Message):
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext, command: CommandObject):
     await state.clear()
+    # Покупатели книги приходят из @c4faq_bot по ссылке t.me/fund4_bot?start=book
+    # (см. book_bonus.py): им бесплатный перенос проектов в шаблон донора.
+    if (command.args or "").strip().lower() == "book":
+        import book_bonus
+        import telemetry
+        try:
+            granted = await book_bonus.grant_book_bonus(message.chat.id)
+        except Exception:
+            logger.warning("book_bonus grant failed", exc_info=True)
+            granted = False
+        await telemetry.log_event(message.chat.id, "book_start", granted=granted)
+        if granted:
+            await message.answer(book_bonus.BOOK_WELCOME.format(n=config.BOOK_FREE_TRANSFERS))
     await message.answer(_welcome_text(), reply_markup=start_keyboard())
 
 
@@ -351,11 +364,18 @@ async def _paywall_or_consume(message: Message, state: FSMContext, pending: dict
         return True
 
     await state.update_data(_pending_paid_start=pending)
-    await message.answer(
-        f"🔒 Бесплатные проекты закончились ({config.FULL_VERSION_LIMIT} шт. на аккаунт).\n\n"
-        f"Чтобы начать ещё один, оплати {config.PAID_VERSION_PRICE_XTR} ⭐ Telegram Stars "
-        "по счёту ниже — сразу после оплаты продолжим с того же места."
-    )
+    if config.PAYMENT_MODE == "receipt":
+        await message.answer(
+            f"🔒 Бесплатные проекты закончились ({config.FULL_VERSION_LIMIT} шт. на аккаунт).\n\n"
+            "Разработка ещё одного проекта — платная. Сейчас пришлю, как оплатить: "
+            "после подтверждения продолжим с того же места."
+        )
+    else:
+        await message.answer(
+            f"🔒 Бесплатные проекты закончились ({config.FULL_VERSION_LIMIT} шт. на аккаунт).\n\n"
+            f"Чтобы начать ещё один, оплати {config.PAID_VERSION_PRICE_XTR} ⭐ Telegram Stars "
+            "по счёту ниже — сразу после оплаты продолжим с того же места."
+        )
     if config.PAYMENT_ENABLED:
         await payments.send_project_invoice(message.bot, chat_id)
     else:

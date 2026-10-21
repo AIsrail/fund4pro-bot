@@ -139,12 +139,32 @@ async def send_budget_export_invoice(bot: Bot, chat_id: int) -> None:
     )
 
 
+PAID_BUDGET_DEV_PAYLOAD = "paid_budget_dev"
+
+
+async def send_budget_dev_invoice(bot: Bot, chat_id: int) -> None:
+    """Инвойс (Telegram Stars) на разработку ещё одного бюджета сверх
+    бесплатных (config.FREE_BUDGET_DEVS). В режиме оплаты по чеку не
+    используется — см. receipt_payments.wrap_invoice_function."""
+    prices = [LabeledPrice(label="Ещё один бюджет", amount=config.PAID_BUDGET_DEV_PRICE_XTR)]
+    await bot.send_invoice(
+        chat_id=chat_id,
+        title="Ещё один бюджет",
+        description=f"Разработка ещё одного бюджета сверх бесплатных ({config.FREE_BUDGET_DEVS}).",
+        payload=PAID_BUDGET_DEV_PAYLOAD,
+        provider_token=config.PROVIDER_TOKEN,
+        currency="XTR" if not config.PROVIDER_TOKEN else "USD",
+        prices=prices,
+    )
+
+
 async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
     """Подтверждает оплату перед списанием средств. Telegram требует ответ
     в течение 10 секунд, иначе платёж отклоняется автоматически."""
     known_payloads = (
         PAID_REVISION_PAYLOAD, PAID_PROJECT_PAYLOAD,
         PAID_TEMPLATE_DOWNLOAD_PAYLOAD, PAID_FILE_EXPORT_PAYLOAD, PAID_BUDGET_EXPORT_PAYLOAD,
+        PAID_BUDGET_DEV_PAYLOAD,
     )
     if pre_checkout_query.invoice_payload not in known_payloads:
         await pre_checkout_query.answer(ok=False, error_message="Неизвестный платёж")
@@ -160,3 +180,4 @@ send_project_invoice = _rp.wrap_invoice_function(PAID_PROJECT_PAYLOAD, send_proj
 send_template_download_invoice = _rp.wrap_invoice_function(PAID_TEMPLATE_DOWNLOAD_PAYLOAD, send_template_download_invoice)
 send_file_export_invoice = _rp.wrap_invoice_function(PAID_FILE_EXPORT_PAYLOAD, send_file_export_invoice)
 send_budget_export_invoice = _rp.wrap_invoice_function(PAID_BUDGET_EXPORT_PAYLOAD, send_budget_export_invoice)
+send_budget_dev_invoice = _rp.wrap_invoice_function(PAID_BUDGET_DEV_PAYLOAD, send_budget_dev_invoice)
