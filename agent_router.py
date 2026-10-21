@@ -226,11 +226,13 @@ async def cmd_code(message: Message, state: FSMContext, command: CommandObject):
         return
 
     import code_access
-    result = await code_access.redeem_code(code)
+    import telemetry
+
+    result = await code_access.get_status(code)
 
     if result is None:
         await message.answer(
-            "❌ Код не найден или уже использован.\n\n"
+            "❌ Код не найден или некорректен.\n\n"
             "Проверьте правильность кода и попробуйте снова. "
             "Если проблема сохраняется, напишите владельцу бота."
         )
@@ -245,29 +247,36 @@ async def cmd_code(message: Message, state: FSMContext, command: CommandObject):
         )
         return
 
-    if not isinstance(remaining, int) or remaining <= 0:
+    if not isinstance(remaining, int) or remaining < 0:
         await message.answer(
-            "❌ Проектов в этом месяце нет или счётчик некорректен. "
-            "Напишите владельцу бота."
+            "❌ Ошибка при получении статуса. Напишите владельцу бота."
         )
         return
 
-    import billing
-    import telemetry
     try:
-        await billing.add_paid_credit(message.chat.id, "project", remaining)
-        await telemetry.log_event(message.chat.id, "code_redeemed", plan=plan, remaining=remaining)
-        await message.answer(
-            f"✅ Доступ активирован!\n\n"
-            f"Ваш тариф: Pro\n"
-            f"Проектов в этом месяце: {remaining}\n\n"
-            f"Готовы разрабатывать проекты? 📋 Нажмите кнопку ниже.",
-            reply_markup=start_keyboard()
-        )
+        data = await state.get_data()
+        data["_code_access"] = {"code": code, "plan": plan, "remaining": remaining}
+        await state.update_data(**data)
+
+        await telemetry.log_event(message.chat.id, "code_verified", plan=plan, remaining=remaining)
+
+        if remaining > 0:
+            await message.answer(
+                f"✅ Код принят!\n\n"
+                f"Ваш тариф: Pro\n"
+                f"Доступно в этом месяце: {remaining} {'проект' if remaining == 1 else 'проектов'}\n\n"
+                f"Готовы разрабатывать проекты? 📋 Нажмите кнопку ниже.",
+                reply_markup=start_keyboard()
+            )
+        else:
+            await message.answer(
+                "⚠️ Код принят, но проектов в этом месяце нет (использованы все).\n"
+                "Доступ восстановится 1-го числа следующего месяца."
+            )
     except Exception:
-        logger.exception(f"cmd_code: failed to add credit for chat {message.chat.id}")
+        logger.exception(f"cmd_code: failed for chat {message.chat.id}")
         await message.answer(
-            "⚠️ Ошибка при активации доступа. Напишите владельцу бота."
+            "⚠️ Ошибка при проверке кода. Напишите владельцу бота."
         )
 
 
@@ -420,6 +429,24 @@ async def _paywall_or_consume(message: Message, state: FSMContext, pending: dict
     на Telegram Stars и возвращает False — вызывающий код должен прервать
     старт проекта (не трогать project_data/state)."""
     chat_id = message.chat.id
+
+    # Если у пользователя есть код доступа — списать проект со счётчика Fundan
+    data = await state.get_data()
+    code_info = data.get("_code_access")
+    if code_info:
+        code = code_info.get("code")
+        if code:
+            import code_access
+            result = await code_access.redeem_code(code)
+            if result is None:
+                await message.answer(
+                    "❌ Ошибка при списании проекта по коду доступа. "
+                    "Проверьте, не закончился ли лимит, или напишите владельцу бота."
+                )
+                return False
+            # Успешно списано — продолжаем, переступаем через billing гейт
+            return True
+
     if await billing.can_start_project(chat_id):
         await billing.consume_project_start(chat_id)
         return True

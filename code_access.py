@@ -21,9 +21,11 @@ TIMEOUT = 10  # секунд
 
 
 async def redeem_code(code: str) -> dict | None:
-    """Отправить код на redeem, вернуть {plan, remaining} или None при ошибке.
+    """POST /redeem: списать 1 проект из месячного лимита при старте проекта.
 
-    Код — это 16 символов hex (пример: 751F3C29B0DE8ED1), выданный @c4faq_bot.
+    ВАЖНО: не идемпотентен — вызывать ТОЛЬКО при реальном старте нового проекта,
+    а не при вводе команды /code. Возвращает {plan, remaining} или None при ошибке
+    (400/409 если код привязан к другому чату).
     """
     if not code or len(code) != 16:
         logger.warning("redeem_code: invalid code format (expected 16 hex chars)")
