@@ -204,6 +204,177 @@ def _force_recalc(data: bytes) -> bytes:
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
+_TOKEN = re.compile(
+    r"\s*(?:(?P<num>\d+(?:\.\d+)?)"
+    r"|(?P<ref>(?:(?:'[^']+'|[A-Za-z_][\w.]*)!)?\$?[A-Za-z]{1,3}\$?\d+(?::\$?[A-Za-z]{1,3}\$?\d+)?)"
+    r"|(?P<func>[A-Za-z]+)\("
+    r"|(?P<op>[-+*/(),]))")
+
+
+class _Unsupported(Exception):
+    pass
+
+
+def _eval_formula(text: str, sheet: str, lookup) -> float:
+    """Вычисляет формулу из + - * / скобок, ссылок, диапазонов и SUM. Всё остальное —
+    _Unsupported (такие ячейки не пересчитываются)."""
+    tokens, pos = [], 0
+    text = text.lstrip("=")
+    while pos < len(text):
+        m = _TOKEN.match(text, pos)
+        if not m or m.end() == pos:
+            if text[pos:].strip() == "":
+                break
+            raise _Unsupported(text)
+        pos = m.end()
+        kind = m.lastgroup
+        tokens.append((kind, m.group(kind)))
+    idx = 0
+
+    def peek():
+        return tokens[idx] if idx < len(tokens) else (None, None)
+
+    def take():
+        nonlocal idx
+        idx += 1
+        return tokens[idx - 1]
+
+    def ref_values(token: str):
+        sh, _, addr = token.rpartition("!")
+        sh = sh.strip("'") or sheet
+        a, _, b = addr.replace("$", "").partition(":")
+        ma, mb = _COORD.match(a), _COORD.match(b or a)
+        if not ma or not mb:
+            raise _Unsupported(token)
+        c1, r1 = column_index_from_string(ma.group(1).upper()), int(ma.group(2))
+        c2, r2 = column_index_from_string(mb.group(1).upper()), int(mb.group(2))
+        return [lookup(sh, f"{get_column_letter(c)}{r}")
+                for r in range(min(r1, r2), max(r1, r2) + 1)
+                for c in range(min(c1, c2), max(c1, c2) + 1)]
+
+    def atom():
+        kind, val = take()
+        if kind == "num":
+            return float(val)
+        if kind == "ref":
+            vals = ref_values(val)
+            if len(vals) != 1:
+                raise _Unsupported(val)
+            return vals[0]
+        if kind == "func":
+            if val.upper() != "SUM":
+                raise _Unsupported(val)
+            total = 0.0
+            while True:
+                k, v = peek()
+                if k == "op" and v == ")":
+                    take()
+                    return total
+                if k == "op" and v == ",":
+                    take()
+                    continue
+                if k == "ref" and ":" in v:
+                    total += sum(x for x in ref_values(take()[1]) if isinstance(x, (int, float)))
+                else:
+                    total += expr()
+        if kind == "op" and val == "(":
+            v = expr()
+            if take() != ("op", ")"):
+                raise _Unsupported(text)
+            return v
+        raise _Unsupported(text)
+
+    def factor():
+        k, v = peek()
+        if k == "op" and v in "+-":
+            take()
+            s = factor()
+            return -s if v == "-" else s
+        return atom()
+
+    def term():
+        v = factor()
+        while peek()[0] == "op" and peek()[1] in ("*", "/"):
+            op = take()[1]
+            r = factor()
+            v = v * r if op == "*" else v / r
+        return v
+
+    def expr():
+        v = term()
+        while peek()[0] == "op" and peek()[1] in ("+", "-"):
+            op = take()[1]
+            r = term()
+            v = v + r if op == "+" else v - r
+        return v
+
+    result = expr()
+    if idx != len(tokens):
+        raise _Unsupported(text)
+    return result
+
+
+def _recalc_cached_values(content: bytes, sheet_parts: dict[str, str]) -> dict[str, bytes]:
+    """Пересчитывает кэшированные <v> формул, чтобы превью и чтение без пересчёта
+    показывали актуальные итоги, а не 0. Возвращает {путь: xml} только для изменённых листов."""
+    wf = load_workbook(io.BytesIO(content), data_only=False)
+    wv = load_workbook(io.BytesIO(content), data_only=True)
+    memo: dict[tuple[str, str], object] = {}
+    failed: set[tuple[str, str]] = set()
+
+    def lookup(sheet: str, coord: str):
+        key = (sheet, coord)
+        if key in memo:
+            return memo[key]
+        if key in failed:
+            raise _Unsupported(coord)
+        if sheet not in wf.sheetnames:
+            raise _Unsupported(sheet)
+        raw = wf[sheet][coord].value
+        if isinstance(raw, str) and raw.startswith("="):
+            try:
+                memo[key] = _eval_formula(raw, sheet, lookup)
+            except (_Unsupported, ZeroDivisionError, TypeError):
+                failed.add(key)
+                raise _Unsupported(coord)
+        else:
+            val = wv[sheet][coord].value
+            memo[key] = 0.0 if val is None else val
+        return memo[key]
+
+    changed: dict[str, bytes] = {}
+    zin = zipfile.ZipFile(io.BytesIO(content))
+    for sheet, path in sheet_parts.items():
+        root = etree.fromstring(zin.read(path))
+        touched = False
+        for c in root.iter(_q("c")):
+            if c.find(_q("f")) is None:
+                continue
+            coord = c.get("r", "")
+            v_el = c.find(_q("v"))
+            try:
+                value = lookup(sheet, coord)
+            except (_Unsupported, ZeroDivisionError, TypeError):
+                value = None
+            if v_el is None:
+                v_el = etree.SubElement(c, _q("v"))
+            if value is None or isinstance(value, bool):
+                c.remove(v_el)
+                if "t" in c.attrib:
+                    del c.attrib["t"]
+            elif isinstance(value, str):
+                v_el.text = value
+                c.set("t", "str")
+            else:
+                v_el.text = repr(float(value))
+                if "t" in c.attrib:
+                    del c.attrib["t"]
+            touched = True
+        if touched:
+            changed[path] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    return changed
+
+
 def fill_cells_preserving(content: bytes, values: dict):
     """values: {"Лист": {"C7": 12000, "B7": "Зарплата"}}. Возвращает
     (новый_файл, записанные ["Лист!C7"], пропущенные [("Лист!C8", причина)],
@@ -248,16 +419,26 @@ def fill_cells_preserving(content: bytes, values: dict):
     if not applied:
         return content, applied, skipped, replaced_cells
 
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
-        for item in zin.infolist():
-            data = zin.read(item.filename)
-            if item.filename in new_parts:
-                data = new_parts[item.filename]
-            elif item.filename == "xl/workbook.xml":
-                data = _force_recalc(data)
-            zout.writestr(item, data)
-    return out.getvalue(), applied, skipped, replaced_cells
+    def _pack(parts_xml: dict[str, bytes]) -> bytes:
+        # свой ZipFile на каждый проход: writestr правит ZipInfo исходного архива
+        src = zipfile.ZipFile(io.BytesIO(content))
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in src.infolist():
+                data = src.read(item.filename)
+                if item.filename in parts_xml:
+                    data = parts_xml[item.filename]
+                elif item.filename == "xl/workbook.xml":
+                    data = _force_recalc(data)
+                zout.writestr(item, data)
+        return out.getvalue()
+
+    interim = _pack(new_parts)
+    try:
+        new_parts.update(_recalc_cached_values(interim, parts))
+    except Exception as exc:  # итоги без пересчёта — хуже, но заполнение важнее
+        logger.warning("xlsx cached recalc failed: %s: %s", type(exc).__name__, exc)
+    return _pack(new_parts), applied, skipped, replaced_cells
 
 
 def extract_xlsx_grid(content: bytes, max_chars: int = 14000) -> str:
