@@ -280,6 +280,55 @@ async def cmd_code(message: Message, state: FSMContext, command: CommandObject):
         )
 
 
+@router.message(Command("grant"))
+async def cmd_grant(message: Message, state: FSMContext, command: CommandObject):
+    """Ручная выдача проектов владельцем (временное решение).
+
+    Использование (только для владельца):
+      /grant <chat_id> <количество>
+      /grant 123456789 10
+    """
+    import grant
+
+    # Проверка прав доступа
+    if not await grant.is_owner(message.from_user.id):
+        await message.answer("❌ Эта команда доступна только владельцу бота.")
+        return
+
+    args = (command.args or "").strip().split()
+    if len(args) < 2:
+        await message.answer(
+            "❌ Использование: `/grant <chat_id> <количество>`\n\n"
+            "Пример: `/grant 123456789 10`"
+        )
+        return
+
+    try:
+        chat_id = int(args[0])
+        quantity = int(args[1])
+    except ValueError:
+        await message.answer(
+            "❌ chat_id и количество должны быть числами.\n\n"
+            "Пример: `/grant 123456789 10`"
+        )
+        return
+
+    success, msg = await grant.grant_projects(chat_id, quantity)
+    await message.answer(msg)
+
+    if success:
+        import telemetry
+        await telemetry.log_event(message.chat.id, "grant_awarded", target_chat=chat_id, quantity=quantity)
+        try:
+            await message.bot.send_message(
+                chat_id,
+                f"🎁 Вам выдано {quantity} проектов! Начните разработку 📋",
+                reply_markup=start_keyboard()
+            )
+        except Exception:
+            logger.warning(f"cmd_grant: не удалось отправить уведомление chat {chat_id}")
+
+
 @router.callback_query(F.data.startswith("agentflow:"))
 async def choose_flow(callback: CallbackQuery, state: FSMContext):
     flow = callback.data.split(":")[1]
@@ -444,8 +493,33 @@ async def _paywall_or_consume(message: Message, state: FSMContext, pending: dict
                     "Проверьте, не закончился ли лимит, или напишите владельцу бота."
                 )
                 return False
-            # Успешно списано — продолжаем, переступаем через billing гейт
-            return True
+
+            # Обработка различных статусов API
+            status = result.get("status")
+            error = result.get("error")
+
+            if status == 200:
+                # Успешно списано — продолжаем
+                return True
+            elif status == 403 and error == "quota_exhausted":
+                await message.answer(
+                    "🔒 Лимит проектов по вашему коду исчерпан на этот месяц.\n\n"
+                    "Доступ восстановится 1-го числа следующего месяца."
+                )
+                return False
+            elif status == 409 and error == "code_used":
+                await message.answer(
+                    "❌ Этот код уже используется другим пользователем.\n\n"
+                    "Каждый код можно привязать только к одному аккаунту. "
+                    "Если это ошибка, напишите владельцу бота."
+                )
+                return False
+            else:
+                await message.answer(
+                    "❌ Ошибка при списании проекта по коду доступа. "
+                    "Напишите владельцу бота."
+                )
+                return False
 
     if await billing.can_start_project(chat_id):
         await billing.consume_project_start(chat_id)
