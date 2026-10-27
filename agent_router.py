@@ -194,9 +194,11 @@ async def handle_channel_post(message: Message):
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext, command: CommandObject):
     await state.clear()
-    # Покупатели книги приходят из @c4faq_bot по ссылке t.me/fund4_bot?start=book
-    # (см. book_bonus.py): им бесплатный перенос проектов в шаблон донора.
-    if (command.args or "").strip().lower() == "book":
+
+    args = (command.args or "").strip().lower()
+
+    # Покупатели книги: t.me/fund4_bot?start=book
+    if args == "book":
         import book_bonus
         import telemetry
         try:
@@ -207,6 +209,39 @@ async def cmd_start(message: Message, state: FSMContext, command: CommandObject)
         await telemetry.log_event(message.chat.id, "book_start", granted=granted)
         if granted:
             await message.answer(book_bonus.BOOK_WELCOME.format(n=config.BOOK_FREE_TRANSFERS))
+        await message.answer(_welcome_text(), reply_markup=start_keyboard())
+        return
+
+    # Интеграция с Fundan: draft_<id> (проект) или budget_<id> (только бюджет)
+    import fundan_integration
+    import telemetry
+    parsed = fundan_integration.parse_start_params(command.args)
+    if parsed:
+        mode, hint_id = parsed
+        hint = await fundan_integration.get_app_hint(hint_id)
+
+        if hint and hint.get("text"):
+            context_text = hint["text"]
+            await telemetry.log_event(message.chat.id, f"fundan_start_{mode}", hint_id=hint_id)
+
+            # Сохраняем контекст в state для использования в flow
+            await state.update_data(_fundan_context=context_text)
+
+            if mode == "draft":
+                # Разработка проекта с контекстом из Fundan
+                await _start_fresh_flow(message, state, "grant")
+                return
+            elif mode == "budget":
+                # Только бюджет с контекстом из Fundan
+                from handlers import budget_standalone
+                await budget_standalone.start_budget_standalone(message, state)
+                return
+        else:
+            logger.warning(f"cmd_start: failed to get hint for {hint_id}")
+            # Fallback: обычный старт без контекста
+            await telemetry.log_event(message.chat.id, f"fundan_start_{mode}_fallback", hint_id=hint_id)
+
+    # Обычный старт (без параметров или неизвестные параметры)
     await message.answer(_welcome_text(), reply_markup=start_keyboard())
 
 
