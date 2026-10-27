@@ -723,6 +723,16 @@ async def _start_fresh_flow(message: Message, state: FSMContext, flow: str) -> N
     await state.update_data(_active_quick_replies=opts)
     await message.answer(msg, reply_markup=quick_reply_keyboard(opts), parse_mode="Markdown")
 
+    # Если пришли из deep-link Fundan с контекстом — автоматически запускаем первый шаг
+    data = await state.get_data()
+    if data.get("_fundan_context"):
+        context_text = data["_fundan_context"]
+        await state.update_data(_fundan_context=None)  # Очищаем, чтобы не использовать повторно
+        import telemetry
+        await telemetry.log_event(message.chat.id, "fundan_context_auto_start", flow=flow)
+        # Запускаем первый шаг с контекстом
+        await _run_turn_and_reply(message, state, context_text)
+
 
 async def start_application_from_budget(message: Message, state: FSMContext, handoff: dict) -> None:
     """Из режима «Составить бюджет» — к заполнению заявки: готовый бюджет и

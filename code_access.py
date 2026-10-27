@@ -37,26 +37,39 @@ async def redeem_code(code: str) -> dict | None:
                 f"{FUNDAN_API_BASE}/redeem",
                 json={"code": code}
             )
-            resp.raise_for_status()
-            data = resp.json()
-            plan = data.get("plan")
-            remaining = data.get("remaining")
-            if plan and remaining is not None:
-                logger.info(f"redeem_code: plan={plan}, remaining={remaining}")
-                return {"plan": plan, "remaining": remaining}
-            else:
-                logger.warning(f"redeem_code: invalid response {data}")
+            if resp.status_code == 200:
+                data = resp.json()
+                plan = data.get("plan")
+                remaining = data.get("remaining")
+                if plan and remaining is not None:
+                    logger.info(f"redeem_code: plan={plan}, remaining={remaining}")
+                    return {"plan": plan, "remaining": remaining, "status": 200}
+                else:
+                    logger.warning(f"redeem_code: invalid response {data}")
+                    return None
+            elif resp.status_code == 403:
+                logger.warning(f"redeem_code: quota exhausted (403)")
+                try:
+                    error_data = resp.json()
+                    return {"error": "quota_exhausted", "status": 403, "data": error_data}
+                except:
+                    return {"error": "quota_exhausted", "status": 403}
+            elif resp.status_code == 409:
+                logger.warning(f"redeem_code: code used by another chat (409)")
+                try:
+                    error_data = resp.json()
+                    return {"error": "code_used", "status": 409, "data": error_data}
+                except:
+                    return {"error": "code_used", "status": 409}
+            elif resp.status_code == 400:
+                logger.warning(f"redeem_code: invalid code (400)")
                 return None
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 400:
-            logger.warning(f"redeem_code: invalid code (400)")
-            return None
-        elif e.response.status_code == 401:
-            logger.warning(f"redeem_code: unauthorized (401) — API key missing?")
-            return None
-        else:
-            logger.error(f"redeem_code: HTTP {e.response.status_code}")
-            return None
+            elif resp.status_code == 401:
+                logger.warning(f"redeem_code: unauthorized (401)")
+                return None
+            else:
+                logger.error(f"redeem_code: unexpected HTTP {resp.status_code}")
+                return None
     except Exception:
         logger.exception("redeem_code: request failed")
         return None

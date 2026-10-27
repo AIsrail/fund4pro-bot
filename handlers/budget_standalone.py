@@ -258,8 +258,25 @@ async def resume_after_budget_dev_payment(message: Message, state: FSMContext) -
 
 
 async def _begin_budget_standalone(message: Message, state: FSMContext) -> None:
+    # Сохраняем контекст Fundan перед очисткой (если есть)
+    data = await state.get_data()
+    fundan_context = data.get("_fundan_context")
     await state.clear()
     await state.update_data(ui_language="ru", flow="budget_standalone")
+    # Восстанавливаем контекст Fundan
+    if fundan_context:
+        await state.update_data(_fundan_context=fundan_context)
+        import telemetry
+        await telemetry.log_event(message.chat.id, "fundan_context_auto_start", flow="budget_standalone")
+        # Если контекст есть — пропускаем вопрос о доноре и переходим к размеру бюджета
+        await state.update_data(donor_analysis={}, donor_templates=[], donor_facts=[])
+        await state.set_state(S.ask_currency)
+        await message.answer(
+            "📊 Составим бюджет вместе на основе контекста из Fundan.\n\n"
+            "Бюджет в какой валюте? (USD, EUR, KGS…) или нажмите кнопку по умолчанию."
+        )
+        return
+
     await state.set_state(S.waiting_donor_info)
     await message.answer(
         "📊 Составим бюджет вместе.\n\n"
