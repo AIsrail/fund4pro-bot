@@ -156,3 +156,18 @@ BUDGET_DEV_PRICE_KGS = int(os.environ.get("BUDGET_DEV_PRICE_KGS", "200"))
 PRICE_USD = int(os.environ.get("PRICE_USD", "2"))
 PAID_BUDGET_DEV_PRICE_XTR = int(os.environ.get("PAID_BUDGET_DEV_PRICE_XTR", "115"))
 BOOK_FREE_TRANSFERS = int(os.environ.get("BOOK_FREE_TRANSFERS", "2"))
+
+# --- Платежи по конкурсам (28.10.2026, решение владельца) --------------------
+# Новая схема: первые 2 РАЗНЫХ конкурса финансирования (не обнуляются) —
+# бесплатно (под каждым до 5 разработок проекта), с 3-го конкурса — платный
+# доступ (500 сом), затем разработка (200 сом за проект).
+# Конкурс идентифицируется по названию + полному домену (не просто донор).
+# Не обнуляется в отличие от /code (но платные тарифы Fundan обходят лимит).
+FREE_CONTESTS = int(os.environ.get("FREE_CONTESTS", "2"))
+ENFORCE_PAID_CONTEST_ACCESS = os.environ.get("ENFORCE_PAID_CONTEST_ACCESS", "true").lower() == "true"
+PAID_CONTEST_ACCESS_PRICE_KGS = int(os.environ.get("PAID_CONTEST_ACCESS_PRICE_KGS", "500"))
+# 500 сом ≈ $5.7 при ~87.5 сом/$; по ориентиру (~115 Stars за 200 сом) ≈ 287 Stars.
+PAID_CONTEST_ACCESS_PRICE_XTR = int(os.environ.get("PAID_CONTEST_ACCESS_PRICE_XTR", "287"))
+
+# Квота разработок под одним конкурсом (дополнительные платные)
+PROJECTS_PER_CONTEST_FREE = int(os.environ.get("PROJECTS_PER_CONTEST_FREE", "5"))

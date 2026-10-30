@@ -226,3 +226,28 @@ def _extract_xlsx_text(content: bytes) -> str:
                 parts.append(" | ".join(cells))
     text = "\n".join(parts).strip()
     return text[:MAX_CHARS_PER_FILE]
+
+
+def make_contest_id(url: str, contest_name: str) -> str:
+    """Создаёт уникальный ID конкурса по названию + полный домен.
+
+    Конкурсы идентифицируются по названию (т.к. один фонд может иметь
+    несколько конкурсов/грантов с разными условиями) и полному домену
+    (включая path, т.к. разные конкурсы могут быть на разных поддоменах).
+
+    Пример:
+      url = "https://grants.example.com/kyrgyzstan/2026/round1"
+      contest_name = "Tech Innovation 2026"
+
+      Result: "tech_innovation_2026__grants.example.com"
+    """
+    import re
+    from urllib.parse import urlparse
+
+    domain = urlparse(url).netloc  # grants.example.com
+
+    # Нормализуем название: буквы, цифры, пробелы → подчёркивания
+    name_slug = re.sub(r'[^\w\s]', '', contest_name.lower())[:80]
+    name_slug = '_'.join(name_slug.split())
+
+    return f"{name_slug}__{domain}"

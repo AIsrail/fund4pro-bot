@@ -191,3 +191,152 @@ async def can_start_project(chat_id: int) -> bool:
 
 async def consume_project_start(chat_id: int) -> None:
     await consume(chat_id, "project")
+
+
+# --- Платежи по конкурсам (28.10.2026) -----------------------------------------------
+
+async def get_contest_count(chat_id: int) -> int:
+    """Сколько уникальных конкурсов уже использовал юзер?
+    Не обнуляется (отличие от месячного лимита /code)."""
+    client = _get_client()
+    if client is None:
+        return 0
+    key = f"{_KEY_PREFIX}donor_contests:{chat_id}"
+    try:
+        contests = await client.hgetall(key)
+        return len(contests)
+    except Exception:
+        logger.exception(f"billing.get_contest_count failed for {chat_id}")
+        return 0
+
+
+async def check_contest_quota(chat_id: int, contest_id: str) -> dict:
+    """Проверить квоту для конкретного конкурса.
+
+    Returns:
+      {
+        "contest_number": 1,      # На каком по счёту конкурсе находится
+        "is_paid_access": bool,   # Требует ли оплата доступа (3-й+ конкурс)?
+        "projects_used": int,     # Сколько проектов уже разработано под этим
+        "can_start": bool,        # Может ли юзер стартовать проект сейчас?
+        "reason": str,            # Если не может — почему
+      }
+    """
+    # Проверим, есть ли /code (платный тариф) — он обходит все лимиты
+    from code_access import get_code_status
+    code_status = await get_code_status(chat_id)
+    if code_status:
+        return {
+            "contest_number": 1,
+            "is_paid_access": False,
+            "projects_used": 0,
+            "can_start": True,
+            "reason": "code_access",
+        }
+
+    client = _get_client()
+    if client is None:
+        return {
+            "contest_number": 1,
+            "is_paid_access": False,
+            "projects_used": 0,
+            "can_start": True,
+            "reason": "redis_unavailable",
+        }
+
+    try:
+        # Считаем сколько всего конкурсов использовано
+        contests_key = f"{_KEY_PREFIX}donor_contests:{chat_id}"
+        contests = await client.hgetall(contests_key)
+        total_contests = len(contests)
+
+        # Номер конкурса (1-based)
+        if contest_id not in contests:
+            # Новый конкурс
+            contest_number = total_contests + 1
+            projects_used = 0
+        else:
+            # Конкурс уже был использован
+            contest_number = int(contests[contest_id].get("order", total_contests + 1))
+            projects_used = int(contests[contest_id].get("projects_count", 0))
+
+        # Требуется ли оплата доступа к конкурсу?
+        is_paid_access = contest_number > config.FREE_CONTESTS
+
+        # Проверяем платные концерты — оплачены ли они?
+        if is_paid_access:
+            paid_contests_key = f"{_KEY_PREFIX}paid_contests:{chat_id}"
+            paid_contests = await client.smembers(paid_contests_key)
+            if contest_id not in paid_contests:
+                return {
+                    "contest_number": contest_number,
+                    "is_paid_access": True,
+                    "projects_used": projects_used,
+                    "can_start": False,
+                    "reason": "paid_contest_access_required",
+                }
+
+        # Проверяем лимит проектов под этим конкурсом
+        can_start = projects_used < config.PROJECTS_PER_CONTEST_FREE
+        if not can_start and not is_paid_access:
+            can_start_reason = "projects_limit_exceeded"
+        elif not can_start:
+            can_start_reason = "projects_limit_exceeded_paid_contest"
+        else:
+            can_start_reason = "ok"
+
+        return {
+            "contest_number": contest_number,
+            "is_paid_access": is_paid_access,
+            "projects_used": projects_used,
+            "can_start": can_start,
+            "reason": can_start_reason,
+        }
+    except Exception:
+        logger.exception(f"billing.check_contest_quota failed for {chat_id}, {contest_id}")
+        return {
+            "contest_number": 1,
+            "is_paid_access": False,
+            "projects_used": 0,
+            "can_start": True,
+            "reason": "error_fallback_allow",
+        }
+
+
+async def register_contest_usage(chat_id: int, contest_id: str) -> None:
+    """Регистрирует использование конкурса и увеличивает счётчик проектов под ним."""
+    client = _get_client()
+    if client is None:
+        return
+
+    try:
+        contests_key = f"{_KEY_PREFIX}donor_contests:{chat_id}"
+        contests = await client.hgetall(contests_key)
+
+        if contest_id not in contests:
+            # Новый конкурс — записываем
+            contest_order = len(contests) + 1
+            await client.hset(contests_key, contest_id, json.dumps({
+                "order": contest_order,
+                "projects_count": 1,
+            }))
+        else:
+            # Увеличиваем счётчик проектов
+            existing = json.loads(contests[contest_id])
+            existing["projects_count"] = existing.get("projects_count", 0) + 1
+            await client.hset(contests_key, contest_id, json.dumps(existing))
+    except Exception:
+        logger.exception(f"billing.register_contest_usage failed for {chat_id}, {contest_id}")
+
+
+async def mark_contest_paid(chat_id: int, contest_id: str) -> None:
+    """Отмечает, что юзер оплатил доступ к конкурсу (#3+)."""
+    client = _get_client()
+    if client is None:
+        return
+
+    try:
+        paid_contests_key = f"{_KEY_PREFIX}paid_contests:{chat_id}"
+        await client.sadd(paid_contests_key, contest_id)
+    except Exception:
+        logger.exception(f"billing.mark_contest_paid failed for {chat_id}, {contest_id}")

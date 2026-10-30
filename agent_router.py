@@ -556,6 +556,60 @@ async def _paywall_or_consume(message: Message, state: FSMContext, pending: dict
                 )
                 return False
 
+    # Проверка квоты по конкурсам (28.10.2026): первые 2 конкурса бесплатно,
+    # с 3-го требуется платёж. Конкурс идентифицируется по названию + домену.
+    project_data = data.get("project_data", {})
+    donor_urls = project_data.get("donor_urls", [])
+    donor_info = project_data.get("donor_info", "")
+
+    if donor_urls and config.ENFORCE_PAID_CONTEST_ACCESS and config.PAYMENT_ENABLED:
+        import donor_scrape
+
+        url = donor_urls[0]  # Основной конкурс
+        # Извлекаем название конкурса из donor_info или используем домен
+        contest_name = donor_info.split("\n")[0][:80] if donor_info else "Unknown"
+        contest_id = donor_scrape.make_contest_id(url, contest_name)
+
+        quota = await billing.check_contest_quota(chat_id, contest_id)
+
+        if not quota["can_start"]:
+            if quota["reason"] == "paid_contest_access_required":
+                # Требуется оплата доступа к конкурсу #3+
+                await state.update_data(_pending_paid_start=pending)
+                await message.answer(
+                    f"🔒 Это ваш {quota['contest_number']}-й конкурс. Доступ к конкурсам с 3-го платный.\n\n"
+                    f"Разработка проекта под этим конкурсом стоит {config.PAID_CONTEST_ACCESS_PRICE_KGS} сом. "
+                    "Сейчас пришлю счёт для оплаты."
+                )
+                if config.PAYMENT_MODE == "receipt":
+                    await payments.send_invoice(
+                        message.bot, chat_id,
+                        amount_kgs=config.PAID_CONTEST_ACCESS_PRICE_KGS,
+                        amount_xtr=config.PAID_CONTEST_ACCESS_PRICE_XTR,
+                        title="Доступ к новому конкурсу",
+                        resource="contest_access",
+                        extra={"contest_id": contest_id},
+                    )
+                else:
+                    logger.warning("Paywall hit for contest_access but PAYMENT_MODE != receipt")
+                return False
+            elif quota["reason"] == "projects_limit_exceeded_paid_contest":
+                # Уже 5 проектов под этим конкурсом, требуется платёж за ещё один
+                await state.update_data(_pending_paid_start=pending)
+                await message.answer(
+                    f"🔒 Уже разработано {quota['projects_used']} проектов под этим конкурсом.\n\n"
+                    f"Следующий проект стоит {config.PROJECT_DEV_PRICE_KGS} сом. "
+                    "Сейчас пришлю счёт для оплаты."
+                )
+                if config.PAYMENT_MODE == "receipt":
+                    await payments.send_project_invoice(message.bot, chat_id)
+                else:
+                    logger.warning("Paywall hit for project_dev but PAYMENT_MODE != receipt")
+                return False
+
+        # Квота позволяет — регистрируем использование конкурса
+        await billing.register_contest_usage(chat_id, contest_id)
+
     if await billing.can_start_project(chat_id):
         await billing.consume_project_start(chat_id)
         return True
