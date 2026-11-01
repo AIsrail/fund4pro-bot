@@ -570,7 +570,9 @@ async def _paywall_or_consume(message: Message, state: FSMContext, pending: dict
         contest_name = donor_info.split("\n")[0][:80] if donor_info else "Unknown"
         contest_id = donor_scrape.make_contest_id(url, contest_name)
 
-        quota = await billing.check_contest_quota(chat_id, contest_id)
+        # Проверяем наличие /code доступа, который обходит все лимиты
+        has_code_access = bool(data.get("_code_access"))
+        quota = await billing.check_contest_quota(chat_id, contest_id, has_code_access=has_code_access)
 
         if not quota["can_start"]:
             if quota["reason"] == "paid_contest_access_required":

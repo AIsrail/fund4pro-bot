@@ -210,7 +210,7 @@ async def get_contest_count(chat_id: int) -> int:
         return 0
 
 
-async def check_contest_quota(chat_id: int, contest_id: str) -> dict:
+async def check_contest_quota(chat_id: int, contest_id: str, has_code_access: bool = False) -> dict:
     """Проверить квоту для конкретного конкурса.
 
     Returns:
@@ -222,10 +222,8 @@ async def check_contest_quota(chat_id: int, contest_id: str) -> dict:
         "reason": str,            # Если не может — почему
       }
     """
-    # Проверим, есть ли /code (платный тариф) — он обходит все лимиты
-    from code_access import get_code_status
-    code_status = await get_code_status(chat_id)
-    if code_status:
+    # /code (платный тариф) обходит все лимиты
+    if has_code_access:
         return {
             "contest_number": 1,
             "is_paid_access": False,
